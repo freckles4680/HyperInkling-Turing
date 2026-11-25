@@ -40,6 +40,7 @@ send the first `error:` lines.
 ## 2. Kernel tests on the card (no checkpoint)
 
 ```bash
+uv pip install --python venv/bin/python pytest   # only for a venv built before the build installed it
 venv/bin/python -m pytest -q -s tests/test_fp16.py tests/test_e4m3.py \
     tests/test_sconv_padding.py tests/test_sconv_state_manager.py tests/test_image_budget.py
 ```
