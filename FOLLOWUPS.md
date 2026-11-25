@@ -6,7 +6,7 @@ fetched with `hf download --include` only when chosen.
 
 | phase | items |
 |---|---|
-| T, Turing (sm75) | T1, T2, T3, T4 (fp16 in code) |
+| T, Turing (sm75) | T1, T2, T3, T4 (fp16 and shared memory in code) |
 | 2, the checkpoint (new files on HF) | 33 |
 | 3, context (best effort) | 18, 13, 55 |
 | 4, speed and upstream | 10, 7, 21, 22, 32 |
@@ -39,15 +39,20 @@ router, vision and Marlin's activations and INT4 scales follow it, the Triton ke
 the dtype from their pointers (bitwise the same code on bf16), `_situ` unpacks fp16 pairs,
 the vision rounding uses `cvt.rn.f16.f32`, and bf16 checkpoint tensors are cast at load,
 clamped at 65504 (logged). `start.sh` passes `--dtype float16` on that path and refuses
-DSpark. `tests/test_fp16.py` checks each changed kernel in fp16 (W8/W4/bgemv also ran in
-Triton's CPU interpreter). Nothing has run on a Turing GPU yet. Left:
+DSpark. `tests/test_fp16.py` checks each changed kernel in fp16 against fp32 (W8/W4/bgemv
+also ran in Triton's CPU interpreter). Shared memory (64 KB per block on Turing against
+Ampere's ~100 KB) is checked offline by `bench/sm75_compile.py`: the attention tiles
+(72-96 KB) and the W8 prefill tile (128 KB) were over and are smaller on sm75 (attention
+BLOCK_M <= 64 and BLOCK_N 64/32, W8 BN <= 128); every kernel now fits. Nothing has run on a
+Turing GPU yet. The bring-up on the card, step by step, is `docs/turing-bringup.md`. Left:
 
-T1. **KL of fp16 against bf16** on a 3090 (`HYPERINKLING_FP16=1 SPEC=off ./start.sh`, then
-    `bench/kl_eval.py`): overflow would show in the loop's residuals or the softcaps' inputs
-    (pre-cap infinities saturate cleanly; NaNs would not). Then the same on the 2080 Ti.
-T2. **Shared memory**: Turing allows 64 KB per block against Ampere's ~100 KB; tiles tuned
-    on the 3090 (W8 prefill 64x256, 3 stages; `linear.py`'s k-group tiles) may raise
-    Triton's OutOfResources there and need smaller tiles or fewer stages.
+T1. **fp16 on the card**: there is no bf16 GPU to compare against, so the check is fp16's
+    own range and the published scores. `HYPERINKLING_FP16_CHECK=1` (eager) logs each new
+    record of the residual stream's max |value| above 4096 and any non-finite value, by
+    layer and pass; `bench/quality_battery.py` against README "Task accuracy". If the
+    residual overflows, keep the residual blocks in fp32 in `Inkling2LoopModel.forward`.
+T2. **Tile speed on the card**: the tiles are the 3090's, shrunk only where shared memory
+    forced it; time them on the 2080 Ti (`bench/w8_gemv.py`, `bench/w4_gemv.py`).
 T3. **DSpark**: its draft KV goes through vLLM's FlashAttention backend (SM80+); with
     `HYPERINKLING_DRAFT_KV_FP8=1` the attention itself runs in `block_decode_attention`,
     so only the KV write may need a non-FA path.

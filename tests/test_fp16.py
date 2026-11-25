@@ -1,12 +1,11 @@
-"""The fp16 activation path (Turing, or HYPERINKLING_FP16=1) on synthetic data: each
-kernel the port changed, run with fp16 inputs against an fp32 reference, and (where the
-GPU has bf16 tensor cores) the same check in bf16 so the two can be compared. No
-checkpoint needed.
+"""The fp16 activation path (Turing) on synthetic data: each kernel the port changed,
+run with fp16 inputs against an fp32 reference (and in bf16 too on a GPU that has it).
+No checkpoint needed. Step 2 of docs/turing-bringup.md.
 
-    venv/bin/python -m pytest -q -s tests/test_fp16.py                       # Turing
-    HYPERINKLING_FP16=1 venv/bin/python -m pytest -q -s tests/test_fp16.py   # a 3090
+    venv/bin/python -m pytest -q -s tests/test_fp16.py
 
-The Marlin test needs the fp16 path on (`ops.act_dtype`): it is skipped otherwise.
+The Marlin test needs the fp16 path on (`ops.act_dtype`: always on Turing, else
+HYPERINKLING_FP16=1): it is skipped otherwise.
 """
 
 import os

@@ -1,4 +1,4 @@
-From af03ba600406cd6176c166caa336b9314ca5054e Mon Sep 17 00:00:00 2001
+From 5e2dd4ff150ffb30b6fb292c753b8d48edc32f7c Mon Sep 17 00:00:00 2001
 From: Pento95 <173375476+Pento95@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 05:39:42 +0100
 Subject: [PATCH] [hyperinkling] Inkling 2 Mini on Ampere (sm86)
@@ -82,6 +82,12 @@ gates PDL/TMA, e4m3 conversions and the native conv/mix kernels below SM90):
   are cast at load, clamped at fp16's range and logged; the sconv SWA cache
   takes fp16. Requires --dtype float16 and no speculative decoding (DSpark
   is bf16 only).
+- Turing's 64 KB of shared memory per block: relative attention takes
+  BLOCK_M <= 64 and BLOCK_N 64 (BLOCK_M <= 32) or 32 on sm75, the W8 linear
+  BN <= 128 (the sm86 tiles took 72-96 KB and 128 KB there).
+- HYPERINKLING_FP16_CHECK=1: Inkling2LoopModel.forward logs each new record
+  of the residual stream's max |value| above 4096, and any non-finite
+  value, by layer and pass (fp16 headroom on Turing; run eager).
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
@@ -94,20 +100,20 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/models/inkling/nvidia/sconv_swa_attn.py  | 147 +++++++++-
  vllm/models/inkling2/nvidia/attention.py      |  45 ++-
  vllm/models/inkling2/nvidia/dspark.py         | 164 ++++++++---
- vllm/models/inkling2/nvidia/loop.py           |  22 +-
+ vllm/models/inkling2/nvidia/loop.py           |  52 +++-
  vllm/models/inkling2/nvidia/model.py          | 123 +++++++-
  vllm/models/inkling2/nvidia/moe.py            | 110 ++++++-
  vllm/models/inkling2/nvidia/ops/__init__.py   |  65 +++++
  vllm/models/inkling2/nvidia/ops/activation.py |  17 +-
  vllm/models/inkling2/nvidia/ops/attention.py  |   8 +-
- .../inkling2/nvidia/ops/attention_sm90.py     |  21 +-
+ .../inkling2/nvidia/ops/attention_sm90.py     |  37 ++-
  vllm/models/inkling2/nvidia/ops/bgemv.py      | 183 ++++++++++++
  vllm/models/inkling2/nvidia/ops/conv_mix.py   |   2 +-
  vllm/models/inkling2/nvidia/ops/dspark.py     |  22 +-
  vllm/models/inkling2/nvidia/ops/e4m3.py       |  10 +
  vllm/models/inkling2/nvidia/ops/linear.py     |   2 +-
  vllm/models/inkling2/nvidia/ops/linear_w4.py  | 210 ++++++++++++++
- vllm/models/inkling2/nvidia/ops/linear_w8.py  | 139 +++++++++
+ vllm/models/inkling2/nvidia/ops/linear_w8.py  | 145 +++++++++
  .../inkling2/nvidia/ops/ll_gemm_sm120.py      |  25 +-
  vllm/models/inkling2/nvidia/ops/lookup.py     | 233 +++++++++++++++
  vllm/models/inkling2/nvidia/ops/loop.py       |   5 +-
@@ -128,7 +134,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/v1/engine/core.py                        |  84 ++++++
  vllm/v1/spec_decode/dynamic/adaptive_k.py     | 130 +++++++++
  vllm/v1/structured_output/backend_xgrammar.py |  41 ++-
- 43 files changed, 2251 insertions(+), 171 deletions(-)
+ 43 files changed, 2301 insertions(+), 173 deletions(-)
  create mode 100644 vllm/models/inkling2/nvidia/ops/bgemv.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/linear_w4.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/linear_w8.py
@@ -953,10 +959,26 @@ index 6e1755a18b..021ca02d30 100644
 +            )
 +        torch.cuda.empty_cache()
 diff --git a/vllm/models/inkling2/nvidia/loop.py b/vllm/models/inkling2/nvidia/loop.py
-index bee8058353..8be48afe15 100644
+index bee8058353..59e8eeb07d 100644
 --- a/vllm/models/inkling2/nvidia/loop.py
 +++ b/vllm/models/inkling2/nvidia/loop.py
-@@ -26,7 +26,10 @@ from .model import (
+@@ -12,12 +12,15 @@ controller. Each sublayer's short conv runs fused with the next AttnRes mix
+ (and small batches at TP > 1 with its all-reduce); without sequence parallel.
+ """
+ 
++import math
++import os
+ from collections.abc import Sequence
+ 
+ import torch
+ from torch import nn
+ 
+ from vllm.distributed import tensor_model_parallel_all_reduce
++from vllm.logger import init_logger
+ 
+ from ..configs import Inkling2ModelConfig
+ from ..quant_config import Inkling2QuantConfig
+@@ -26,12 +29,40 @@ from .model import (
      Inkling2ForConditionalGeneration,
      Inkling2Model,
  )
@@ -967,7 +989,37 @@ index bee8058353..8be48afe15 100644
  from .ops.linear import linear_k_groups
  from .ops.ll_gemm_sm120 import sm12x_bf16_ll_gemm, use_sm12x_bf16_ll_gemm
  from .ops.loop import blend_rms_norm, pair_rms_norm
-@@ -57,8 +60,8 @@ class Inkling2MessageController(nn.Module):
+ from .sconv import conv_metadata
+ 
++logger = init_logger(__name__)
++
++# HyperInkling: HYPERINKLING_FP16_CHECK=1 (with --enforce-eager: it syncs) logs
++# the residual stream's largest |value| after each layer visit whenever it sets
++# a new record above 4096, and any inf/NaN, with the layer and pass. fp16 tops
++# out at 65504: this is how the fp16 path (Turing) shows how close it runs.
++_FP16_CHECK = os.environ.get("HYPERINKLING_FP16_CHECK") == "1"
++_fp16_record = [4096.0]
++
++
++def _check_residual(x: torch.Tensor, layer: int, pass_idx: int) -> None:
++    amax = x.float().abs().amax().item() if x.numel() else 0.0
++    if not math.isfinite(amax) or not torch.isfinite(x).all():
++        logger.warning(
++            "fp16 check: non-finite residual after layer %d pass %d (%d tokens)",
++            layer, pass_idx, x.shape[0],
++        )  # fmt: skip
++    elif amax > _fp16_record[0]:
++        _fp16_record[0] = amax
++        logger.warning(
++            "fp16 check: residual max |x| %.0f after layer %d pass %d (fp16 max 65504)",
++            amax, layer, pass_idx,
++        )  # fmt: skip
++
++
+ LOOP_STREAMS = ("attn", "k", "v", "mlp")
+ 
+ 
+@@ -57,8 +88,8 @@ class Inkling2MessageController(nn.Module):
          """fp32 `(T, D)` `dest` and `message` -> fp32 `(T, D)`."""
          pair = torch.stack((dest, message), dim=1)
          pair = pair * torch.rsqrt(pair.square().mean(-1, keepdim=True) + 1e-6)
@@ -978,7 +1030,7 @@ index bee8058353..8be48afe15 100644
          gain = torch.mm(hidden, self.gain_weight.t(), out_dtype=torch.float32)
          forget = torch.mm(hidden, self.forget_weight.t(), out_dtype=torch.float32)
          return (1.0 - torch.tanh(forget)) * dest + torch.tanh(gain) * message
-@@ -81,15 +84,15 @@ class Inkling2LoopDecoderLayer(Inkling2DecoderLayer):
+@@ -81,15 +112,15 @@ class Inkling2LoopDecoderLayer(Inkling2DecoderLayer):
          assert config.loop_config is not None
          rank, width = config.loop_config["gate_rank"], config.hidden_size
          streams = len(LOOP_STREAMS)
@@ -997,7 +1049,7 @@ index bee8058353..8be48afe15 100644
              persistent=False,
          )
          self.controllers = nn.ModuleDict(
-@@ -122,6 +125,15 @@ class Inkling2LoopDecoderLayer(Inkling2DecoderLayer):
+@@ -122,6 +153,15 @@ class Inkling2LoopDecoderLayer(Inkling2DecoderLayer):
          broadcast over streams) and `message`, each output RMS-normalized
          with its row of `norm_weight` `(S, D)`: bf16 `(S, T, D)`."""
          pair = pair_rms_norm(dest, message)
@@ -1013,8 +1065,17 @@ index bee8058353..8be48afe15 100644
          down = self.controller_down[streams]
          up = self.controller_gain_forget[streams]
          if use_sm12x_bf16_ll_gemm(pair, down):
+@@ -394,6 +434,8 @@ class Inkling2LoopModel(Inkling2Model):
+                 tau,
+                 plan,
+             )
++            if _FP16_CHECK:
++                _check_residual(stack[num_blocks], i, pass_idx)
+         assert inputs is not None
+         out = inputs[0]
+         if self.aux_hidden_state_layers:
 diff --git a/vllm/models/inkling2/nvidia/model.py b/vllm/models/inkling2/nvidia/model.py
-index db9a9bc16b..c3be6e3fb0 100644
+index db9a9bc16b..b2ab689962 100644
 --- a/vllm/models/inkling2/nvidia/model.py
 +++ b/vllm/models/inkling2/nvidia/model.py
 @@ -25,6 +25,7 @@ from vllm.distributed import (
@@ -1100,8 +1161,8 @@ index db9a9bc16b..c3be6e3fb0 100644
 +                    "Inkling2 fp16 path: DSpark is not ported to fp16 yet (SPEC=off)"
 +                )
 +            logger.warning(
-+                "Inkling2 in fp16 (%s): a port of the bf16 model, check its KL "
-+                "against bf16 (bench/kl_eval.py) before trusting its outputs.",
++                "Inkling2 in fp16 (%s): a port of the bf16 model; HYPERINKLING_FP16_"
++                "CHECK=1 logs how close the residual stream runs to fp16's limit.",
 +                "Turing" if is_sm75() else "HYPERINKLING_FP16=1",
 +            )
          self.config = config
@@ -1568,14 +1629,15 @@ index c8bc213285..a1670a8cc2 100644
 +        launch_pdl=use_pdl(),
      )
 diff --git a/vllm/models/inkling2/nvidia/ops/attention_sm90.py b/vllm/models/inkling2/nvidia/ops/attention_sm90.py
-index 3cac9b9605..9ad1cfff0e 100644
+index 3cac9b9605..fa6dc91683 100644
 --- a/vllm/models/inkling2/nvidia/ops/attention_sm90.py
 +++ b/vllm/models/inkling2/nvidia/ops/attention_sm90.py
-@@ -18,7 +18,10 @@ import torch
+@@ -18,7 +18,11 @@ import torch
  
  from vllm.triton_utils import tl, triton
  
 -from .e4m3 import _NATIVE_E4M3, _e4m3_f16, e4m3_arg
++from . import is_sm75
 +from .e4m3 import _NATIVE_E4M3, _e4m3_f16, e4m3_arg, e4m3_f16_scaled
 +
 +# SM8x E4M3 KV loads come back scaled by 2^-8 (`e4m3_f16_scaled`).
@@ -1583,7 +1645,7 @@ index 3cac9b9605..9ad1cfff0e 100644
  
  # The query tile of tml_fa4 that shears the relative logits.
  _SHEAR_TILE = tl.constexpr(128)
-@@ -38,6 +41,15 @@ def _sigmoid(x):
+@@ -38,6 +42,15 @@ def _sigmoid(x):
  
  @triton.jit
  def _load_fp8_kv(ptr, offsets, mask, dtype: tl.constexpr, D: tl.constexpr):
@@ -1599,7 +1661,7 @@ index 3cac9b9605..9ad1cfff0e 100644
      # Load each E4M3 pair once, retaining 16-bit packing for BF16 MMA order.
      half = tl.arange(0, D // 2)
      pair = tl.load(
-@@ -151,6 +163,11 @@ def _rel_attention_kernel(
+@@ -151,6 +164,11 @@ def _rel_attention_kernel(
          rel_row = Rel + token * stride_rel_t + head * E_PAD - rel_base
  
      qk_scale = softmax_scale * LOG2E
@@ -1611,7 +1673,7 @@ index 3cac9b9605..9ad1cfff0e 100644
      m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
      l_i = tl.zeros([BLOCK_M], tl.float32)
      acc = tl.zeros([BLOCK_M, D], tl.float32)
-@@ -199,6 +216,8 @@ def _rel_attention_kernel(
+@@ -199,6 +217,8 @@ def _rel_attention_kernel(
          m_i = m_new
  
      empty = l_i == 0.0
@@ -1620,6 +1682,35 @@ index 3cac9b9605..9ad1cfff0e 100644
      o = acc / tl.where(empty, 1.0, l_i)[:, None]
      lse2 = tl.where(empty, float("-inf"), m_i + tl.log2(tl.where(empty, 1.0, l_i)))
      if MODE == 0:
+@@ -239,7 +259,18 @@ def _rel_attention_kernel(
+ 
+ def _block_m(max_query_len: int, group: int) -> int:
+     rows = max_query_len * group
+-    return 16 if rows <= 16 else 32 if rows <= 32 else 64 if rows <= 64 else 128
++    block_m = 16 if rows <= 16 else 32 if rows <= 32 else 64 if rows <= 64 else 128
++    # Turing: 64 KB of shared memory per block; a 128-row tile needs 80-128 KB.
++    return min(block_m, 64) if is_sm75() else block_m
++
++
++def _block_n(block_m: int) -> int:
++    if is_sm75():
++        # Shared memory of the tile with D = 128 on sm75 (Triton, measured
++        # offline): 16x64 40 KB, 32x64 48 KB, 64x32 48 KB (64x64: 64 KB,
++        # 16x128: 72 KB, over the limit).
++        return 64 if block_m <= 32 else 32
++    return 64 if block_m >= 128 else 128 if block_m <= 32 else 64
+ 
+ 
+ def rel_attention(
+@@ -343,7 +374,7 @@ def rel_attention(
+         DRAFT=draft,
+         MODE=mode,
+         BLOCK_M=block_m,
+-        BLOCK_N=64 if block_m >= 128 else 128 if block_m <= 32 else 64,
++        BLOCK_N=_block_n(block_m),
+         num_warps=8 if block_m >= 128 else 4,
+         num_stages=2,
+     )
 diff --git a/vllm/models/inkling2/nvidia/ops/bgemv.py b/vllm/models/inkling2/nvidia/ops/bgemv.py
 new file mode 100644
 index 0000000000..daa621c400
@@ -2148,10 +2239,10 @@ index 0000000000..8bcd77f4da
 +        return w4_matmul(x.contiguous(), self.packed, self.scale, self.zero, out)
 diff --git a/vllm/models/inkling2/nvidia/ops/linear_w8.py b/vllm/models/inkling2/nvidia/ops/linear_w8.py
 new file mode 100644
-index 0000000000..425880ad77
+index 0000000000..24974d6c6b
 --- /dev/null
 +++ b/vllm/models/inkling2/nvidia/ops/linear_w8.py
-@@ -0,0 +1,139 @@
+@@ -0,0 +1,145 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""HyperInkling W8A16 linears: bf16 weights quantized at load time to int8
@@ -2171,6 +2262,8 @@ index 0000000000..425880ad77
 +import torch
 +
 +from vllm.triton_utils import tl, triton
++
++from . import is_sm75
 +
 +GROUP = 128
 +
@@ -2253,6 +2346,10 @@ index 0000000000..425880ad77
 +    else:
 +        tiles = ((64, 256, 8, 3),) * 4
 +    bm, bn, warps, stages = tiles[size]
++    if is_sm75() and bn > 128:
++        # Turing has 64 KB of shared memory per block: a 256-wide int8 tile
++        # takes 128 KB there (Triton for sm75, measured offline), 128 wide 64 KB.
++        bn = 128
 +    grid = (triton.cdiv(n, bn), triton.cdiv(m, bm))
 +    _w8_kernel[grid](
 +        x, q, scale, out, m, n, k,

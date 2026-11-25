@@ -2,7 +2,7 @@
 
 Padding rows must not hide the cache taps of the real tokens that share their tile:
 each real row is compared against the same requests run unpadded, at most 256 tokens
-at a time (the path without the skip).
+at a time (the path without the skip). In the activation dtype: fp16 on Turing, bf16 otherwise.
 
     venv/bin/python -m pytest -q tests/test_sconv_padding.py
 """
@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from vllm.models.inkling.nvidia.ops.sconv import sconv_seq_metadata
+from vllm.models.inkling2.nvidia.ops import act_dtype
 from vllm.models.inkling2.nvidia.ops.sconv import short_conv
 
 H, WS, W, N = 8, 128, 4, 16  # heads, stream width, taps, cache block size
@@ -48,9 +49,9 @@ def test_padded_decode_over_256(q):
     reqs, blocks_per_req, pad = 95, 4, 13  # real tokens not a multiple of the tile
     lens = [q] * reqs
     ctx = torch.randint(W, blocks_per_req * N - q, (reqs,)).tolist()
-    cache = torch.randn(1 + reqs * blocks_per_req, H, N, WS, device="cuda").to(torch.bfloat16)
-    weight = (torch.randn(H * WS, W, device="cuda") * 0.5).to(torch.bfloat16)
-    x = torch.randn(reqs * q, H * WS, device="cuda").to(torch.bfloat16)
+    cache = torch.randn(1 + reqs * blocks_per_req, H, N, WS, device="cuda").to(act_dtype())
+    weight = (torch.randn(H * WS, W, device="cuda") * 0.5).to(act_dtype())
+    x = torch.randn(reqs * q, H * WS, device="cuda").to(act_dtype())
     assert reqs * q + pad > 256
 
     xp = torch.cat([x, torch.zeros(pad, H * WS, device="cuda", dtype=x.dtype)])

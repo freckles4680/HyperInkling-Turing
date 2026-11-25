@@ -16,7 +16,10 @@ cd vllm
 uv pip install -r requirements/build/cuda.txt
 uv pip install -r requirements/cuda.txt
 export TORCH_CUDA_ARCH_LIST="${ARCH:-8.6}" MAX_JOBS="${MAX_JOBS:-16}" NVCC_THREADS=2 CUDA_HOME=/usr/local/cuda
-# nvcc 13.3 rejects gcc 16 (the Fedora 44 default); gcc-15 is installed alongside.
-export CC=gcc-15 CXX=g++-15 CUDAHOSTCXX=g++-15 NVCC_CCBIN=g++-15
+# nvcc 13.3 rejects gcc 16 (the Fedora 44 default): gcc-15 where it is installed alongside,
+# else the system compiler.
+if command -v gcc-15 > /dev/null && command -v g++-15 > /dev/null; then
+	export CC=gcc-15 CXX=g++-15 CUDAHOSTCXX=g++-15 NVCC_CCBIN=g++-15
+fi
 uv pip install -e . --no-build-isolation -v
 python -c "import vllm, torch; print('vllm', vllm.__version__, 'torch', torch.__version__, torch.cuda.get_device_capability())"

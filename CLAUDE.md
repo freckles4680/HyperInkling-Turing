@@ -56,9 +56,12 @@ Key mechanisms of the port (spread across several files):
   default on): `ops/lookup.py`.
 - Images over the profiled page are scaled down in `processing.py` (`fit_to_budget`);
   `HYPERINKLING_VISION_HOST=1` streams the vision tower from host RAM per layer (`model.py`).
-- fp16 activations for Turing (`ops.use_fp16`, `ops.act_dtype`; `HYPERINKLING_FP16=1` runs
-  the same path on Ampere to compare with bf16): kernels take their dtype from their
-  pointers, so the bf16 path is the same code. DSpark is bf16 only.
+- Turing (sm75, a 22 GB 2080 Ti): fp16 activations (`ops.use_fp16`, `ops.act_dtype`;
+  `HYPERINKLING_FP16=1` forces the path elsewhere). Kernels take their dtype from their
+  pointers, so the bf16 path is the same code. DSpark is bf16 only. Tiles over Turing's
+  64 KB of shared memory per block are smaller under `is_sm75()`; `bench/sm75_compile.py`
+  checks every kernel offline (no GPU). `HYPERINKLING_FP16_CHECK=1` logs the residual
+  stream's fp16 headroom. Bring-up on the card: `docs/turing-bringup.md`.
 - The small loop kernels carry the reference numerics (fixed summation orders, no FMA
   contraction): any fusion must be checked bitwise against the unfused path.
 

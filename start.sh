@@ -26,7 +26,7 @@ fi
 
 # The GPU's compute capability (nvidia-smi; GPU_CC=7.5 forces it). Turing (sm75: RTX 20xx,
 # 2080 Ti 22 GB mods) has no bf16 tensor cores: the model runs in fp16 there
-# (HYPERINKLING_FP16=1, which also runs the fp16 path on a 3090 to compare it with bf16).
+# (HYPERINKLING_FP16=1 forces that path on any GPU). docs/turing-bringup.md: how to check it.
 # DSpark is not ported to fp16: off on that path.
 GPU_CC=${GPU_CC:-$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 || true)}
 [ "$GPU_CC" = 7.5 ] && export HYPERINKLING_FP16=1
@@ -36,7 +36,7 @@ if [ "$HYPERINKLING_FP16" = 1 ]; then
 	DTYPE=float16
 	SPEC=${SPEC:-off}
 	[ "$SPEC" = off ] || { echo "SPEC=$SPEC: DSpark is not ported to fp16 yet" >&2; exit 1; }
-	echo "fp16 activations (GPU ${GPU_CC:-?}): a port of the bf16 model, check its KL" >&2
+	echo "fp16 activations (GPU ${GPU_CC:-?}): validate it as docs/turing-bringup.md says" >&2
 fi
 
 MODEL=${MODEL:-$REPO/models/Inkling-2-Mini-W4A16-g128-gptq}
@@ -167,6 +167,9 @@ if [ "$HOST" != 127.0.0.1 ] && [ "$HOST" != localhost ] && [ -z "${VLLM_API_KEY:
 fi
 [ "$LONG_PREFILL" != 0 ] && args+=(--long-prefill-token-threshold "$LONG_PREFILL")
 [ "$ASYNC" = 0 ] && args+=(--no-async-scheduling)
+# HYPERINKLING_FP16_CHECK=1: log how close the fp16 residual stream runs to fp16's limit
+# (loop.py); it syncs after every layer visit, so no CUDA graphs. Diagnostics only.
+[ "${HYPERINKLING_FP16_CHECK:-0}" = 1 ] && args+=(--enforce-eager)
 # Decode CUDA graphs by request count: every count up to 8, then coarser steps up to
 # MAX_SEQS (a batch runs in the next larger graph; one without a graph runs eagerly).
 if [ -z "${GRAPH_SIZES:-}" ]; then
