@@ -119,7 +119,12 @@ precision somewhere: run step 3's check on a failing prompt and send its lines.
 ```bash
 bench/memory_matrix.sh .local/memory_matrix_22g.tsv     # one boot per combination, ~2 min each
 bench/context_bench.sh turing                           # the README speed table, on this card
+venv/bin/python bench/sm75_w8_gemv.py                   # W8 GEMV tiles on this card (no server)
+MAX_LEN=8192 bench/profile_spec.sh t4 1 128             # kernel time per decode step
 ```
+
+`HYPERINKLING_SM75_CUBLAS=0` puts the K-group linears and the loop controllers back on their
+Triton kernels, to compare.
 
 The matrix rows carry `gpu_gib` 22. Append them to `docs/memory_matrix.tsv`, and the
 wizard then uses them in place of the 24 GiB estimate.

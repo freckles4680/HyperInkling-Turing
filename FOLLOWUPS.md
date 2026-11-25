@@ -57,9 +57,13 @@ T2. **Speed on the card**: Triton emits no tensor-core MMA for sm75, so every `t
     runs as FMA. First profile (2080 Ti, DSpark, 1 request): 275 ms a step, 218 ms in
     `_w8_kernel` and 39 ms in the drafter's W4 kernels. W8 now has a dot-free GEMV (<= 64
     rows) and cuBLAS above; on Turing the drafter runs fp16 on cuBLAS
-    (`HYPERINKLING_DRAFT_W4=0`, `HYPERINKLING_DSPARK_FOLD=bf16`). Next in line by that
-    profile: `_k_group_kernel`, the controller GEMVs and `_rel_attention_kernel`
-    (~7 ms together).
+    (`HYPERINKLING_DRAFT_W4=0`, `HYPERINKLING_DSPARK_FOLD=bf16`). Third profile: 37 ms a
+    step, 50.5 tok/s (1 request, 8k, DSpark), of which `_w8_gemv_kernel` 13.8 ms (138 us a
+    call against ~10 us at the bandwidth bound), Marlin 8.3, `_k_group_kernel` 2.9, the
+    controller GEMVs 2.8, `_rel_attention_kernel` 1.5. Since: a 3D-tile W8 GEMV whose tile
+    comes from `sm75_gemv_tile` (`bench/sm75_w8_gemv.py` grid-searches it on the card), and
+    `linear_k_groups` and the controllers on cuBLAS (`HYPERINKLING_SM75_CUBLAS=0` for the
+    Triton kernels). Target: 70 tok/s at 1 request (~26 ms a step) with 90k+ context.
 T3. **DSpark on the card** (in code): the draft's attention runs in `block_decode_attention`
     (Triton `rel_attention` on sm75, compiled in `bench/sm75_compile.py`). Its KV write is
     vLLM's `reshape_and_cache_flash` (core op, no FlashAttention kernel), and its RMSNorms

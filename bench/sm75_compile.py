@@ -118,6 +118,8 @@ def _setup():
         is_sm8x=lambda: False, is_sm75_or_sm8x=lambda: True, use_pdl=lambda: False,
         use_sm12x_path=lambda: True, use_sm100_kernels=lambda: False,
         use_native_e4m3=lambda: False, use_native_conv_mix=lambda: False,
+        # The Triton kernels HYPERINKLING_SM75_CUBLAS=0 keeps on Turing.
+        sm75_cublas=lambda: False,
     )
     for name, value in switches.items():
         setattr(pkg, name, value)
