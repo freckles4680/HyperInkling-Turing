@@ -7,7 +7,10 @@
 // cache: a block owns the 16 rows (tokens x GQA group) of one request and KV head and one
 // KV split, and writes fp32 partials and log2 LSEs for `_rel_decode_combine_kernel`.
 //
-// One warp per block, 32 keys per iteration (one per lane). Everything the lanes exchange
+// One warp per block, 32 keys per iteration. A key's 128 bytes are read by the whole warp
+// (lane `l` takes word `l`): one contiguous transaction a key. A lane reading its own key
+// instead scatters every load over 32 rows 2 KB apart (85 GB/s on a 2080 Ti, measured).
+// Everything the lanes exchange
 // goes through shared memory between `PHASE`s, and tensor-core fragments only move to and
 // from shared memory, so the same phases run on the CPU (HOST_EMU, one lane after the
 // other) against the Triton kernel: tests/test_sm75_attention.py.
@@ -46,7 +49,7 @@ static DEV uint16_t float_to_half_bits(float x) {
 
 #define D 128      // head dim
 #define ROWS 16    // tokens x GQA group of a block
-#define BN 32      // keys per iteration, one per lane
+#define BN 32      // keys per iteration
 #define DT (D / 16)
 #define NT (BN / 16)
 #define LOG2E 1.4426950408889634f
@@ -74,7 +77,8 @@ struct HiSm75AttnArgs {
   int32_t num_heads;
   int32_t group;
   int32_t extent;           // E
-  int32_t page;
+  int32_t page;             // a power of two
+  int32_t page_shift;
   int32_t draft;
 };
 typedef struct HiSm75AttnArgs Args;
@@ -95,7 +99,7 @@ struct alignas(32) Shared {
 
 // Per-lane registers.
 struct Lane {
-  uint32_t vraw[D / 4];     // this lane's key: the V bytes, decoded after the QK product
+  uint32_t vraw[BN];        // word `lane` of each key's V bytes, decoded after the QK product
 };
 
 #ifdef HOST_EMU
@@ -216,12 +220,11 @@ static DEV uint32_t decode2(uint32_t two_bytes) {
   return ((x & 0x007F007Fu) << 7) | ((x & 0x00800080u) << 8);
 }
 
-static DEV void store_decoded(uint16_t* dst, const uint32_t* words) {
-  uint32_t* out = (uint32_t*)dst;
-  for (int w = 0; w < D / 4; w++) {
-    out[2 * w] = decode2(words[w] & 0xFFFFu);
-    out[2 * w + 1] = decode2(words[w] >> 16);
-  }
+// Word `lane` of key row `j` (4 bytes) as 4 fp16 in `kv`.
+static DEV void store_decoded(uint16_t* kv, int j, int lane, uint32_t word) {
+  uint32_t* out = (uint32_t*)(kv + j * D) + 2 * lane;
+  out[0] = decode2(word & 0xFFFFu);
+  out[1] = decode2(word >> 16);
 }
 
 // Q of the block's rows into `kv` (zero for rows past the request's tokens).
@@ -243,23 +246,22 @@ static DEV void phase_q_frags(Shared& sm, Frags& f, int lane) {
   }
 }
 
-// Lane `lane` loads key `n * BN + lane`: K decoded into `kv`, V kept as bytes.
+// The warp loads keys `n * BN ..`, a key at a time: K decoded into `kv`, V kept as bytes.
 static DEV void phase_load(const Args& a, const Block& b, Shared& sm, Lane& ln, int n, int lane) {
-  int32_t key = n * BN + lane;
-  uint32_t kraw[D / 4];
-  if (key < b.seqlen_k) {
-    int32_t page = a.block_table[(int64_t)b.req * a.stride_bt + key / a.page];
-    int64_t off = (int64_t)page * a.stride_kv_blk + (int64_t)(key % a.page) * a.stride_kv_slot +
-                  (int64_t)b.kv_head * a.stride_kv_h;
-    const uint32_t* kp = (const uint32_t*)(a.k + off);
-    const uint32_t* vp = (const uint32_t*)(a.v + off);
-    for (int w = 0; w < D / 4; w++) kraw[w] = kp[w];
-    for (int w = 0; w < D / 4; w++) ln.vraw[w] = vp[w];
-  } else {
-    for (int w = 0; w < D / 4; w++) kraw[w] = 0;
-    for (int w = 0; w < D / 4; w++) ln.vraw[w] = 0;
+  for (int j = 0; j < BN; j++) {
+    int32_t key = n * BN + j;
+    uint32_t kw = 0, vw = 0;
+    if (key < b.seqlen_k) {
+      int32_t page = a.block_table[(int64_t)b.req * a.stride_bt + (key >> a.page_shift)];
+      int64_t off = (int64_t)page * a.stride_kv_blk +
+                    (int64_t)(key & (a.page - 1)) * a.stride_kv_slot +
+                    (int64_t)b.kv_head * a.stride_kv_h;
+      kw = ((const uint32_t*)(a.k + off))[lane];
+      vw = ((const uint32_t*)(a.v + off))[lane];
+    }
+    store_decoded(sm.kv, j, lane, kw);
+    ln.vraw[j] = vw;
   }
-  store_decoded(sm.kv + lane * D, kraw);
 }
 
 // S = Q K^T for the 32 keys.
@@ -275,7 +277,7 @@ static DEV void phase_qk(Shared& sm, Frags& f, int lane) {
 // V replaces K in `kv`; the lane's 16 logits of its row get scale, bias and mask.
 static DEV void phase_logits(const Args& a, const Block& b, Shared& sm, const Lane& ln, int n,
                              int lane) {
-  store_decoded(sm.kv + lane * D, ln.vraw);
+  for (int j = 0; j < BN; j++) store_decoded(sm.kv, j, lane, ln.vraw[j]);
   int r = lane % ROWS, c0 = (lane / ROWS) * 16;
   Row row = row_of(a, b, r);
   int32_t pos = a.draft ? b.seqlen_k - 1 : b.past + row.tok;
@@ -422,5 +424,5 @@ int hi_sm75_rel_attention(const Args* a, int num_reqs, void* stream) {
   return (int)cudaGetLastError();
 }
 #endif
-int hi_sm75_abi(void) { return 1; }
+int hi_sm75_abi(void) { return 2; }
 }

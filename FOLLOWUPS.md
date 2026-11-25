@@ -77,7 +77,10 @@ T2. **Speed on the card**: Triton emits no tensor-core MMA for sm75, so every `t
     visits and the draft's) read 1.6 GB of KV at 90k, ~3 ms at the card's bandwidth, and
     take ~43 ms on Triton's FMA dots. Since: `kernels/sm75/rel_attention.cu`, the split
     decode attention on `wmma` (one-warp blocks, 32 keys an iteration, 4 blocks per SM),
-    checked on the CPU against the Triton kernel; not yet timed on the card. Prefill
+    checked on the CPU against the Triton kernel. On the card its tests pass; first timing
+    2.2 ms a call at 90k (85 GB/s) against Triton's 3.5-5.2 ms, decode at 90k 41 tok/s: each
+    lane read its own key, 32 scattered rows a load. Now the warp reads a key row at a time
+    (one contiguous transaction), not yet timed. Prefill
     attention is still Triton. Target: 70 tok/s at 1 request (~26 ms a step) with 90k+ context.
 T3. **DSpark on the card** (in code): the draft's attention runs in `block_decode_attention`
     (Triton `rel_attention` on sm75, compiled in `bench/sm75_compile.py`). Its KV write is

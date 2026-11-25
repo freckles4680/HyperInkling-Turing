@@ -1,4 +1,4 @@
-From ae32a7053b4dcdee4891a95a737eeef2d996a02a Mon Sep 17 00:00:00 2001
+From 6ef19691a940bfd4196a9129a4fb343cf73ae4c7 Mon Sep 17 00:00:00 2001
 From: Pento95 <173375476+Pento95@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 05:39:42 +0100
 Subject: [PATCH] [hyperinkling] Inkling 2 Mini on Ampere (sm86)
@@ -135,7 +135,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/models/inkling2/nvidia/ops/__init__.py   |  72 +++++
  vllm/models/inkling2/nvidia/ops/activation.py |  17 +-
  vllm/models/inkling2/nvidia/ops/attention.py  |  42 ++-
- .../inkling2/nvidia/ops/attention_sm75.py     | 198 ++++++++++++
+ .../inkling2/nvidia/ops/attention_sm75.py     | 200 ++++++++++++
  .../inkling2/nvidia/ops/attention_sm90.py     |  37 ++-
  vllm/models/inkling2/nvidia/ops/bgemv.py      | 183 +++++++++++
  vllm/models/inkling2/nvidia/ops/conv_mix.py   |   2 +-
@@ -164,7 +164,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/v1/engine/core.py                        |  84 +++++
  vllm/v1/spec_decode/dynamic/adaptive_k.py     | 130 ++++++++
  vllm/v1/structured_output/backend_xgrammar.py |  41 ++-
- 44 files changed, 2781 insertions(+), 193 deletions(-)
+ 44 files changed, 2783 insertions(+), 193 deletions(-)
  create mode 100644 vllm/models/inkling2/nvidia/ops/attention_sm75.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/bgemv.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/linear_w4.py
@@ -1782,10 +1782,10 @@ index c8bc213285..512458cdd1 100644
      )
 diff --git a/vllm/models/inkling2/nvidia/ops/attention_sm75.py b/vllm/models/inkling2/nvidia/ops/attention_sm75.py
 new file mode 100644
-index 0000000000..1c9eb2f066
+index 0000000000..0d784249f0
 --- /dev/null
 +++ b/vllm/models/inkling2/nvidia/ops/attention_sm75.py
-@@ -0,0 +1,198 @@
+@@ -0,0 +1,200 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""HyperInkling, Turing (sm75): the full layers' split decode/verify attention
@@ -1812,7 +1812,7 @@ index 0000000000..1c9eb2f066
 +
 +ROWS = 16
 +HEAD_DIM = 128
-+_ABI = 1
++_ABI = 2
 +
 +
 +class _Args(ctypes.Structure):
@@ -1840,6 +1840,7 @@ index 0000000000..1c9eb2f066
 +        ("group", ctypes.c_int32),
 +        ("extent", ctypes.c_int32),
 +        ("page", ctypes.c_int32),
++        ("page_shift", ctypes.c_int32),
 +        ("draft", ctypes.c_int32),
 +    ]
 +
@@ -1932,7 +1933,7 @@ index 0000000000..1c9eb2f066
 +    assert head_dim == HEAD_DIM and q.dtype == torch.float16
 +    assert q.stride(1) == head_dim and q.stride(2) == 1
 +    assert key_cache.stride() == value_cache.stride() and key_cache.stride(3) == 1
-+    assert key_cache.element_size() == 1
++    assert key_cache.element_size() == 1 and page & (page - 1) == 0
 +    # The kernel reads the cache in 32-bit words.
 +    assert key_cache.data_ptr() % 4 == 0 and value_cache.data_ptr() % 4 == 0
 +    assert all(stride % 4 == 0 for stride in key_cache.stride()[:3])
@@ -1976,6 +1977,7 @@ index 0000000000..1c9eb2f066
 +        group=num_heads // num_kv_heads,
 +        extent=extent,
 +        page=page,
++        page_shift=page.bit_length() - 1,
 +        draft=rel_logits is None,
 +    )
 +    stream = torch.cuda.current_stream(q.device).cuda_stream if q.is_cuda else 0
