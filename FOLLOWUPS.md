@@ -71,7 +71,14 @@ T2. **Speed on the card**: Triton emits no tensor-core MMA for sm75, so every `t
     GEMV (batched, the down projection in 8 K slices), the fold in INT8 on Turing. Sixth:
     31.7 ms, 64.6 tok/s (GEMV 13.0 ms over 250 calls, Marlin 9.5). All of these are at a
     128-token context: decode at 90k (attention over the whole KV, `tl.dot` on FMA) is not
-    measured yet (`CONTEXTS="8192 90000"` on `bench/context_bench.sh`). Target: 70 tok/s at 1 request (~26 ms a step) with 90k+ context.
+    measured yet (`CONTEXTS="8192 90000"` on `bench/context_bench.sh`). Measured then (one
+    request, DSpark, prompts of code): 97.5k tokens fit; decode 85 tok/s at 8k and 35 at
+    90k, prefill 692 and 159 tok/s. The 9 full-attention launches of a step (8 global layer
+    visits and the draft's) read 1.6 GB of KV at 90k, ~3 ms at the card's bandwidth, and
+    take ~43 ms on Triton's FMA dots. Since: `kernels/sm75/rel_attention.cu`, the split
+    decode attention on `wmma` (one-warp blocks, 32 keys an iteration, 4 blocks per SM),
+    checked on the CPU against the Triton kernel; not yet timed on the card. Prefill
+    attention is still Triton. Target: 70 tok/s at 1 request (~26 ms a step) with 90k+ context.
 T3. **DSpark on the card** (in code): the draft's attention runs in `block_decode_attention`
     (Triton `rel_attention` on sm75, compiled in `bench/sm75_compile.py`). Its KV write is
     vLLM's `reshape_and_cache_flash` (core op, no FlashAttention kernel), and its RMSNorms

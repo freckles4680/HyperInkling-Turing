@@ -35,6 +35,12 @@ if [ "$GPU_CC" = 7.5 ]; then
 	# ~40 ms a step on a 2080 Ti. fp16 weights on cuBLAS instead (~0.4 GB more), and
 	# the Markov fold in INT8 on the dot-free GEMV (half the bytes of fp16).
 	: "${HYPERINKLING_DRAFT_W4:=0}" "${HYPERINKLING_DSPARK_FOLD:=w8}"
+	# The full layers' decode attention on the fp16 tensor cores, when
+	# scripts/build-sm75-kernels.sh has built it (HYPERINKLING_SM75_LIB= for the
+	# Triton kernel: ~43 ms a step at 90k tokens on a 2080 Ti).
+	if [ -z "${HYPERINKLING_SM75_LIB+x}" ] && [ -f "$REPO/venv/hyperinkling_sm75.so" ]; then
+		export HYPERINKLING_SM75_LIB=$REPO/venv/hyperinkling_sm75.so
+	fi
 fi
 export HYPERINKLING_FP16=${HYPERINKLING_FP16:-0}
 DTYPE=auto
@@ -209,6 +215,7 @@ else verify="by batch size $SPEC_K"; fi
 echo "Speculation: $SPEC$([ "$SPEC" = dspark ] && echo ", $SPEC_DRAFT drafts, verify k $verify, context lookup $HYPERINKLING_LOOKUP")"
 echo "INT8: attention=$HYPERINKLING_ATTN_W8 head=$HYPERINKLING_HEAD_W8" \
 	"embed=$HYPERINKLING_EMBED_W8 (host RAM: $HYPERINKLING_EMBED_UVA)"
+[ "$GPU_CC" = 7.5 ] && echo "Turing: fp16, tensor-core decode attention ${HYPERINKLING_SM75_LIB:-not built (scripts/build-sm75-kernels.sh)}"
 echo "Images: up to $IMAGES/request, ${IMAGE_MAX_W}x${IMAGE_MAX_H} profiled, larger ones scaled to $HYPERINKLING_IMAGE_MAX_CELLS cells, vision tower $([ "$HYPERINKLING_VISION_HOST" = 1 ] && echo 'in host RAM' || echo 'on the GPU')"
 echo "=================================================="
 

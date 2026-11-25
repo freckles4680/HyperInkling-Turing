@@ -30,7 +30,15 @@ those are now smaller on sm75.
 ```bash
 scripts/setup-vllm.sh                 # vllm/ at patches/BASE + the patch
 ARCH=7.5 scripts/build-vllm.sh        # into venv/, sm75 only (30-60 min); CUDA_HOME=... for a side toolkit
+scripts/build-sm75-kernels.sh         # venv/hyperinkling_sm75.so, about a minute
 ```
+
+The second build is the long-context decode attention on the fp16 tensor cores (Triton
+cannot emit them for Turing). Run it again after a `git pull` that changes `kernels/sm75/`.
+`start.sh` uses the library when it is there and says so in its banner;
+`HYPERINKLING_SM75_LIB= ./start.sh` serves with the Triton kernel instead.
+`venv/bin/python -m pytest -q -s tests/test_sm75_attention.py` checks it against the Triton
+kernel and times both at 90k tokens.
 
 The last line prints the GPU's capability, which should be `(7, 5)`. The build records its
 CUDA toolkit in `venv/cuda_home`, and `start.sh` serves with that toolkit. FlashInfer
