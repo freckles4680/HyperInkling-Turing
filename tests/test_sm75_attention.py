@@ -9,7 +9,7 @@ the Triton kernel it replaces, on random paged E4M3 caches.
   one lane after the other) against Triton. If this passes and test_device fails, the fault
   is in what only the GPU build has (tensor-core fragments, warp timing), not in the math.
 - test_speed (-s): both kernels for decode at 90k tokens (and blocks per SM for the new
-  one), and for a prefill chunk.
+  one), for a local layer of a decode step, and for a prefill chunk.
 
 The two kernels cut the keys into different blocks (32 against 64 keys), so the split
 partials differ: the merged output and LSE are compared, as the combine kernel merges them.
@@ -184,6 +184,12 @@ def test_speed():
             us = _time(lambda: _sm75(x, splits, False, lib))
             line += f" | {per_sm}/SM {us:6.0f} us {megabytes / us * 1e3:4.0f} GB/s"
         print(line)
+    # A local layer of a decode step (40 of them): 9 splits over the window.
+    for q_len in (1, 3, 8):
+        x = _device(_inputs(4, [q_len], [8192], 1024))
+        old = _time(lambda: _triton(x, 9, False, 1024))
+        new = _time(lambda: _sm75(x, 9, False, lib, 1024))
+        print(f"local layer, {q_len} tokens: Triton {old:6.0f} us, tensor cores {new:6.0f} us")
     print("prefill, a 2048-token chunk:")
     for seq in (8192, 32768):
         x = _device(_inputs(3, [2048], [seq], 1024))

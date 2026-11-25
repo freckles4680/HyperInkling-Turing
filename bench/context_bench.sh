@@ -23,6 +23,7 @@ for spec in $SPECS; do
 		echo "server failed: $log"
 	fi
 	stop_server
+	grep -ho "HyperInkling: sm75.*\|^Turing:.*" "$log" | sort -u
 done
 # shellcheck disable=SC2046
 venv/bin/python bench/context_bench.py table $(for spec in $SPECS; do echo "$name-$spec"; done)

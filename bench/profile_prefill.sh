@@ -29,6 +29,7 @@ curl -s -X POST "localhost:$PORT/start_profile"
 read -r n seconds < <(prefill 2)
 curl -s -X POST --max-time 600 "localhost:$PORT/stop_profile"
 stop_server
+grep -ho "HyperInkling: sm75.*\|^Turing:.*" "$log" | sort -u
 nsys stats -q --report cuda_gpu_kern_sum --format csv ".local/prof/$name.nsys-rep" 2> /dev/null | python3 -c "
 import csv, sys
 rows = list(csv.DictReader(sys.stdin)); k = $n / 1000

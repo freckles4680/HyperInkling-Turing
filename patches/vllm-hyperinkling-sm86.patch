@@ -1,4 +1,4 @@
-From 30427cfcde14afd049251e31d6db592282ef34db Mon Sep 17 00:00:00 2001
+From 167238be579d539fe370e5473b761d4b0a058e0c Mon Sep 17 00:00:00 2001
 From: Pento95 <173375476+Pento95@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 05:39:42 +0100
 Subject: [PATCH] [hyperinkling] Inkling 2 Mini on Ampere (sm86)
@@ -106,9 +106,11 @@ gates PDL/TMA, e4m3 conversions and the native conv/mix kernels below SM90):
   (bgemv_sm75): the decode-size loop controllers run on it on sm75
   (controller_gemv_sm75, the rank-R down projection in 8 K slices, which
   the up projection sums in fp32, in order, as it loads them).
-- Attention on sm75 (ops/attention_sm75.py): prefill (MODE_OUT_LSE) and
-  the split decode partials (MODE_PARTIAL, at most 64 rows), full and
-  sliding-window layers over the E4M3 byte cache, from a CUDA wmma kernel
+- Attention on sm75 (ops/attention_sm75.py): prefill (MODE_OUT_LSE, full
+  and sliding-window layers) and the full layers' split decode partials
+  (MODE_PARTIAL, at most 64 rows; the local layers' short launches stay on
+  Triton, and the first launch of each kind logs which kernel serves and
+  why) over the E4M3 byte cache, from a CUDA wmma kernel
   of the HyperInkling repository (kernels/sm75, loaded through ctypes
   from HYPERINKLING_SM75_LIB, launched on torch's stream), as the Triton
   kernel's dots run on FMA there (74% of an 8k prefill and ~43 ms of a
@@ -137,8 +139,8 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/models/inkling2/nvidia/moe.py            | 110 ++++++-
  vllm/models/inkling2/nvidia/ops/__init__.py   |  72 +++++
  vllm/models/inkling2/nvidia/ops/activation.py |  17 +-
- vllm/models/inkling2/nvidia/ops/attention.py  |  41 ++-
- .../inkling2/nvidia/ops/attention_sm75.py     | 241 +++++++++++++++
+ vllm/models/inkling2/nvidia/ops/attention.py  |  47 ++-
+ .../inkling2/nvidia/ops/attention_sm75.py     | 267 ++++++++++++++++
  .../inkling2/nvidia/ops/attention_sm90.py     |  37 ++-
  vllm/models/inkling2/nvidia/ops/bgemv.py      | 183 +++++++++++
  vllm/models/inkling2/nvidia/ops/conv_mix.py   |   2 +-
@@ -167,7 +169,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/v1/engine/core.py                        |  84 +++++
  vllm/v1/spec_decode/dynamic/adaptive_k.py     | 130 ++++++++
  vllm/v1/structured_output/backend_xgrammar.py |  41 ++-
- 44 files changed, 2852 insertions(+), 193 deletions(-)
+ 44 files changed, 2884 insertions(+), 193 deletions(-)
  create mode 100644 vllm/models/inkling2/nvidia/ops/attention_sm75.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/bgemv.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/linear_w4.py
@@ -1740,7 +1742,7 @@ index 9c78f1fa49..c8f8ad1928 100644
  
  @triton.jit
 diff --git a/vllm/models/inkling2/nvidia/ops/attention.py b/vllm/models/inkling2/nvidia/ops/attention.py
-index c8bc213285..8ee902a037 100644
+index c8bc213285..f2afe5d4bd 100644
 --- a/vllm/models/inkling2/nvidia/ops/attention.py
 +++ b/vllm/models/inkling2/nvidia/ops/attention.py
 @@ -20,8 +20,9 @@ from vllm.triton_utils import gl, gluon, tl, tldevice, triton
@@ -1778,20 +1780,26 @@ index c8bc213285..8ee902a037 100644
  
  
  _EX2_ASM = tl.constexpr("ex2.approx.ftz.f32 $0, $1;")
-@@ -1251,6 +1258,32 @@ def _decode_attention(
+@@ -1251,6 +1258,38 @@ def _decode_attention(
              num_splits,
              draft,
          )
-+    elif not fuse_gate and attention_sm75.supports(
-+        q,
-+        e4m3_arg(key_cache),
-+        max_query_len,
-+        block_table,
-+        cache_seqlens,
-+        cu_seqlens_q,
-+        partial=True,
++    elif (
++        not fuse_gate
++        and window == 0
++        and attention_sm75.supports(
++            q,
++            e4m3_arg(key_cache),
++            max_query_len,
++            block_table,
++            cache_seqlens,
++            cu_seqlens_q,
++            partial=True,
++        )
 +    ):
-+        # HyperInkling, Turing: the split partials on the fp16 tensor cores.
++        # HyperInkling, Turing: the full layers' split partials on the fp16 tensor
++        # cores. The local layers (40 short launches a step) stay on the Triton
++        # kernel: with them here, decode at 8k went from 86 to 63 tok/s (2080 Ti).
 +        attention_sm75.rel_attention_sm75(
 +            q,
 +            e4m3_arg(key_cache),
@@ -1811,7 +1819,7 @@ index c8bc213285..8ee902a037 100644
      else:
          rel_attention(
              q,
-@@ -1378,5 +1411,5 @@ def _launch_rel_verify(
+@@ -1378,5 +1417,5 @@ def _launch_rel_verify(
          DRAFT=draft,
          WINDOW=window,
          num_warps=4,
@@ -1820,10 +1828,10 @@ index c8bc213285..8ee902a037 100644
      )
 diff --git a/vllm/models/inkling2/nvidia/ops/attention_sm75.py b/vllm/models/inkling2/nvidia/ops/attention_sm75.py
 new file mode 100644
-index 0000000000..dba458cb0a
+index 0000000000..0dd42083cc
 --- /dev/null
 +++ b/vllm/models/inkling2/nvidia/ops/attention_sm75.py
-@@ -0,0 +1,241 @@
+@@ -0,0 +1,267 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""HyperInkling, Turing (sm75): relative-bias paged attention on the fp16
@@ -1846,6 +1854,8 @@ index 0000000000..dba458cb0a
 +import torch
 +
 +from vllm.logger import init_logger
++
++from . import is_sm75
 +
 +logger = init_logger(__name__)
 +
@@ -1934,6 +1944,41 @@ index 0000000000..dba458cb0a
 +    return int(os.environ.get("HYPERINKLING_SM75_ATTN_CTAS", "4"))
 +
 +
++def _refusal(
++    q: torch.Tensor,
++    key_cache: torch.Tensor,
++    max_query_len: int,
++    index: tuple[torch.Tensor, ...],
++    partial: bool,
++) -> str | None:
++    """Why `rel_attention_sm75` does not take this launch, or None if it does."""
++    if not available():
++        return "HYPERINKLING_SM75_LIB is not set (scripts/build-sm75-kernels.sh)"
++    num_heads, head_dim = q.shape[1:]
++    group = num_heads // key_cache.shape[2]
++    if head_dim != HEAD_DIM or group & (group - 1) or group > ROWS:
++        return f"head dim {head_dim}, {group} heads per KV head"
++    if partial and max_query_len * group > MAX_ROWS:
++        return f"{max_query_len} tokens per request"
++    if q.dtype != torch.float16 or q.stride()[1:] != (head_dim, 1):
++        return f"queries {q.dtype}, strides {tuple(q.stride())}"
++    if key_cache.dtype != torch.uint8:
++        return f"KV cache {key_cache.dtype}"
++    if any(tensor.dtype != torch.int32 for tensor in index):
++        return f"index tensors {[tensor.dtype for tensor in index]}"
++    return None
++
++
++@functools.cache
++def _log_route(partial: bool, refusal: str | None) -> None:
++    if refusal is None or available() or is_sm75():
++        logger.info(
++            "HyperInkling: sm75 attention, %s: %s",
++            "decode partials" if partial else "prefill",
++            "tensor cores" if refusal is None else f"Triton kernel ({refusal})",
++        )
++
++
 +def supports(
 +    q: torch.Tensor,
 +    key_cache: torch.Tensor,
@@ -1944,22 +1989,11 @@ index 0000000000..dba458cb0a
 +    """Whether `rel_attention_sm75` takes this launch (else the Triton kernel):
 +    fp16 queries over an E4M3 byte cache with int32 `index` tensors (block
 +    table, lengths); split partials (`partial`) of at most 64 rows a request
-+    and KV head, or the single-split output and LSE of any number of rows."""
-+    num_heads, head_dim = q.shape[1:]
-+    num_kv_heads = key_cache.shape[2]
-+    group = num_heads // num_kv_heads
-+    return (
-+        available()
-+        and head_dim == HEAD_DIM
-+        and group & (group - 1) == 0
-+        and group <= ROWS
-+        and (not partial or max_query_len * group <= MAX_ROWS)
-+        and q.dtype == torch.float16
-+        and q.stride(1) == head_dim
-+        and q.stride(2) == 1
-+        and key_cache.dtype == torch.uint8
-+        and all(tensor.dtype == torch.int32 for tensor in index)
-+    )
++    and KV head, or the single-split output and LSE of any number of rows.
++    The first launch of each kind and outcome is logged."""
++    refusal = _refusal(q, key_cache, max_query_len, index, partial)
++    _log_route(partial, refusal)
++    return refusal is None
 +
 +
 +def rel_attention_sm75(
