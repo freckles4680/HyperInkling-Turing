@@ -54,8 +54,12 @@ and bf16, so leave them out.
 
 ```bash
 hf download Pentium95/Inkling-2-Mini-W4A16-g128-gptq --local-dir models/Inkling-2-Mini-W4A16-g128-gptq
+mkdir -p .local          # not in git: tee cannot create the log without it
 HYPERINKLING_FP16_CHECK=1 SPEC=off MAX_LEN=8192 WARMUP=0 ./start.sh 2>&1 | tee .local/fp16-first.log
 ```
+
+`start.sh` is the server, so it runs in the foreground until Ctrl-C. The log fills while it
+runs, so use a second shell for the rest.
 
 `start.sh` sees compute capability 7.5. It turns on fp16 and passes `--dtype float16`.
 This first boot leaves DSpark off (`SPEC=off`) so that only the target model is checked.
