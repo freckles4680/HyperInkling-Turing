@@ -1,4 +1,4 @@
-From 8e85c11e6ca2698d856728c9a6da74a5176846cc Mon Sep 17 00:00:00 2001
+From 8d48783e371a88ea656146cad9082c5ffc40caad Mon Sep 17 00:00:00 2001
 From: Pento95 <173375476+Pento95@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 05:39:42 +0100
 Subject: [PATCH] [hyperinkling] Inkling 2 Mini on Ampere (sm86)
@@ -92,8 +92,12 @@ gates PDL/TMA, e4m3 conversions and the native conv/mix kernels below SM90):
   saturating cast by 16M values; results unchanged): the fp32 temporaries
   of the 201k-row LM head and embeddings no longer overflow a 22 GB card.
 - Turing's 64 KB of shared memory per block: relative attention takes
-  BLOCK_M <= 64 and BLOCK_N 64 (BLOCK_M <= 32) or 32 on sm75, the W8 linear
-  BN <= 128 (the sm86 tiles took 72-96 KB and 128 KB there).
+  BLOCK_M <= 64 and BLOCK_N 64 (BLOCK_M <= 32) or 32 on sm75 (the sm86
+  tiles took 72-96 KB there).
+- W8 linears on sm75: Triton emits no tensor-core MMA there and tl.dot ran
+  as FMA through shared memory (80% of a 2080 Ti decode step, ~2 ms a
+  call). Up to 64 rows: _w8_gemv_kernel (broadcast products and sums, one
+  weight read per 16 rows); above: dequantized 8192-row blocks on cuBLAS.
 - HYPERINKLING_FP16_CHECK=1: Inkling2LoopModel.forward logs each new record
   of the residual stream's max |value| above 4096, and any non-finite
   value, by layer and pass (fp16 headroom on Turing; run eager).
@@ -122,7 +126,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/models/inkling2/nvidia/ops/e4m3.py       |  10 +
  vllm/models/inkling2/nvidia/ops/linear.py     |   2 +-
  vllm/models/inkling2/nvidia/ops/linear_w4.py  | 210 ++++++++++++++
- vllm/models/inkling2/nvidia/ops/linear_w8.py  | 154 ++++++++++
+ vllm/models/inkling2/nvidia/ops/linear_w8.py  | 213 ++++++++++++++
  .../inkling2/nvidia/ops/ll_gemm_sm120.py      |  25 +-
  vllm/models/inkling2/nvidia/ops/lookup.py     | 233 +++++++++++++++
  vllm/models/inkling2/nvidia/ops/loop.py       |   5 +-
@@ -143,7 +147,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/v1/engine/core.py                        |  84 ++++++
  vllm/v1/spec_decode/dynamic/adaptive_k.py     | 130 +++++++++
  vllm/v1/structured_output/backend_xgrammar.py |  41 ++-
- 43 files changed, 2399 insertions(+), 191 deletions(-)
+ 43 files changed, 2458 insertions(+), 191 deletions(-)
  create mode 100644 vllm/models/inkling2/nvidia/ops/bgemv.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/linear_w4.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/linear_w8.py
@@ -2429,10 +2433,10 @@ index 0000000000..8bcd77f4da
 +        return w4_matmul(x.contiguous(), self.packed, self.scale, self.zero, out)
 diff --git a/vllm/models/inkling2/nvidia/ops/linear_w8.py b/vllm/models/inkling2/nvidia/ops/linear_w8.py
 new file mode 100644
-index 0000000000..6dedf9e4f5
+index 0000000000..aa3a572c40
 --- /dev/null
 +++ b/vllm/models/inkling2/nvidia/ops/linear_w8.py
-@@ -0,0 +1,154 @@
+@@ -0,0 +1,213 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""HyperInkling W8A16 linears: bf16 weights quantized at load time to int8
@@ -2511,6 +2515,67 @@ index 0000000000..6dedf9e4f5
 +    )
 +
 +
++@triton.jit
++def _w8_gemv_kernel(
++    X, W, S, Y, M, N, K, SX, SW, SS, SY,
++    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
++):  # fmt: skip
++    """Turing: Triton emits no tensor-core MMA for sm75, and `tl.dot` there runs
++    as FMA through shared memory (~2 ms per call, measured). Small row counts
++    as broadcast products and sums instead: each weight tile is read once per
++    `BM` rows, so the kernel stays bound by the int8 weight reads."""
++    pid_n = tl.program_id(0)
++    pid_m = tl.program_id(1)
++    rows = pid_m * BM + tl.arange(0, BM)
++    cols = pid_n * BN + tl.arange(0, BN)
++    col_ok = cols < N
++    row_ok = rows < M
++    acc = tl.zeros((BM, BN), tl.float32)
++    for g in range(0, tl.cdiv(K, BK)):
++        ks = g * BK + tl.arange(0, BK)
++        w = tl.load(
++            W + cols[:, None].to(tl.int64) * SW + ks[None, :], col_ok[:, None], other=0
++        ).to(tl.float32)
++        x = tl.load(
++            X + rows[:, None].to(tl.int64) * SX + ks[None, :], row_ok[:, None], other=0
++        ).to(tl.float32)
++        s = tl.load(S + cols.to(tl.int64) * SS + g, col_ok, other=0).to(tl.float32)
++        acc += tl.sum(x[:, None, :] * w[None, :, :], axis=2) * s[None, :]
++    tl.store(
++        Y + rows[:, None].to(tl.int64) * SY + cols[None, :],
++        acc.to(Y.dtype.element_ty),
++        row_ok[:, None] & col_ok[None, :],
++    )
++
++
++# Turing: up to this many rows on `_w8_gemv_kernel`; above, dequantized blocks of
++# rows on cuBLAS (fp16 tensor cores).
++SM75_GEMV_MAX_M = 64
++
++
++def _w8_matmul_sm75(x, q, scale, out):
++    m, k = x.shape
++    n = q.shape[0]
++    if m <= SM75_GEMV_MAX_M:
++        bm = min(triton.next_power_of_2(m), 16)
++        # bm * bn * 128 products per program; narrow enough for ~256 programs.
++        bn = max(8, min(128 // bm, triton.next_power_of_2(max(n // 512, 1))))
++        grid = (triton.cdiv(n, bn), triton.cdiv(m, bm))
++        _w8_gemv_kernel[grid](
++            x, q, scale, out, m, n, k,
++            x.stride(0), q.stride(0), scale.stride(0), out.stride(0),
++            BM=bm, BN=bn, BK=GROUP, num_warps=8 if bm >= 4 else 4, num_stages=1,
++        )  # fmt: skip
++        return out
++    for start in range(0, n, 8192):
++        rows = slice(start, start + 8192)
++        w = (
++            q[rows].to(x.dtype).unflatten(1, (-1, GROUP)) * scale[rows].to(x.dtype)[..., None]
++        ).flatten(1)
++        out[:, rows] = x @ w.T
++    return out
++
++
 +def w8_matmul(
 +    x: torch.Tensor,
 +    q: torch.Tensor,
@@ -2525,6 +2590,8 @@ index 0000000000..6dedf9e4f5
 +        out = torch.empty((m, n), dtype=x.dtype, device=x.device)
 +    if m == 0:
 +        return out
++    if is_sm75():
++        return _w8_matmul_sm75(x, q, scale, out)
 +    # Tiles tuned on an RTX 3090 Ti (L2-cold weights, bench/w8_gemv.py;
 +    # tests/test_linear_w8.py covers every branch). Decode: one row tile, column
 +    # tiles narrow enough to spread the weight over every SM. Verify steps
@@ -2545,10 +2612,6 @@ index 0000000000..6dedf9e4f5
 +    else:
 +        tiles = ((64, 256, 8, 3),) * 4
 +    bm, bn, warps, stages = tiles[size]
-+    if is_sm75() and bn > 128:
-+        # Turing has 64 KB of shared memory per block: a 256-wide int8 tile
-+        # takes 128 KB there (Triton for sm75, measured offline), 128 wide 64 KB.
-+        bn = 128
 +    grid = (triton.cdiv(n, bn), triton.cdiv(m, bm))
 +    _w8_kernel[grid](
 +        x, q, scale, out, m, n, k,

@@ -29,7 +29,12 @@ fi
 # (HYPERINKLING_FP16=1 forces that path on any GPU). docs/turing-bringup.md: how to check it.
 # DSpark runs in fp16 there too (its bf16 weights cast at load, as the target's).
 GPU_CC=${GPU_CC:-$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 || true)}
-[ "$GPU_CC" = 7.5 ] && export HYPERINKLING_FP16=1
+if [ "$GPU_CC" = 7.5 ]; then
+	export HYPERINKLING_FP16=1
+	# Triton has no tensor-core MMA on sm75: the drafter's INT4 Triton linears took
+	# ~40 ms a step on a 2080 Ti. fp16 weights on cuBLAS instead (~0.4 GB more).
+	: "${HYPERINKLING_DRAFT_W4:=0}" "${HYPERINKLING_DSPARK_FOLD:=bf16}"
+fi
 export HYPERINKLING_FP16=${HYPERINKLING_FP16:-0}
 DTYPE=auto
 if [ "$HYPERINKLING_FP16" = 1 ]; then

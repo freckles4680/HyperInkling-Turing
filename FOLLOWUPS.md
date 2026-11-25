@@ -53,8 +53,13 @@ T1. **fp16 on the card**: there is no bf16 GPU to compare against, so the check 
     record of the residual stream's max |value| above 4096 and any non-finite value, by
     layer and pass; `bench/quality_battery.py` against README "Task accuracy". If the
     residual overflows, keep the residual blocks in fp32 in `Inkling2LoopModel.forward`.
-T2. **Tile speed on the card**: the tiles are the 3090's, shrunk only where shared memory
-    forced it; time them on the 2080 Ti (`bench/w8_gemv.py`, `bench/w4_gemv.py`).
+T2. **Speed on the card**: Triton emits no tensor-core MMA for sm75, so every `tl.dot`
+    runs as FMA. First profile (2080 Ti, DSpark, 1 request): 275 ms a step, 218 ms in
+    `_w8_kernel` and 39 ms in the drafter's W4 kernels. W8 now has a dot-free GEMV (<= 64
+    rows) and cuBLAS above; on Turing the drafter runs fp16 on cuBLAS
+    (`HYPERINKLING_DRAFT_W4=0`, `HYPERINKLING_DSPARK_FOLD=bf16`). Next in line by that
+    profile: `_k_group_kernel`, the controller GEMVs and `_rel_attention_kernel`
+    (~7 ms together).
 T3. **DSpark on the card** (in code): the draft's attention runs in `block_decode_attention`
     (Triton `rel_attention` on sm75, compiled in `bench/sm75_compile.py`). Its KV write is
     vLLM's `reshape_and_cache_flash` (core op, no FlashAttention kernel), and its RMSNorms
