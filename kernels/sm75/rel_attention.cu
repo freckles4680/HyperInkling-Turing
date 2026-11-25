@@ -10,8 +10,9 @@
 // - MODE_OUT_LSE: the fp32 output and natural-log LSE (prefill, a single split).
 // Full and sliding-window layers, with the sheared relative logits or without (the draft).
 //
-// A block owns `NW * 16` rows (tokens x GQA group) of one request and KV head: one warp
-// for decode, four for prefill, so a prefill tile reads its keys once for 64 rows. Each
+// A block owns the whole tokens that fit in `NW * 16` rows (tokens x GQA group: 5, 10 or
+// 21 tokens of the model's 3 heads per KV head) of one request and KV head: one or two
+// warps for decode, four for prefill, so a prefill tile reads its keys once for 64 rows. Each
 // warp keeps its 16 rows' Q and output accumulators in tensor-core fragments; the block
 // shares the decoded keys and values, 32 keys an iteration. A key's 128 bytes are read by
 // a whole warp (lane `l` takes word `l`): one contiguous transaction a key. (A lane
@@ -90,7 +91,7 @@ struct HiSm75AttnArgs {
   int32_t num_splits;
   int32_t num_kv_heads;
   int32_t num_heads;
-  int32_t group_shift;      // GQA group, a power of two
+  int32_t group;            // GQA group: heads per KV head, at most 16
   int32_t extent;           // E
   int32_t page;             // a power of two
   int32_t page_shift;
@@ -193,6 +194,7 @@ struct Frags {
 // What a block derives from its ids; the same in every thread.
 struct Block {
   int32_t kv_head, split, req;
+  int32_t group_inv;        // row / group == row * group_inv >> 16 for a block's rows
   int32_t q_start, q_len, seqlen_k, past, first_tok, tokens;
   int32_t n_lo, num_iters;
   float qk_scale;
@@ -204,7 +206,8 @@ static DEV bool block_init(const Args& a, int nw, int bx, int by, int bz, Block&
   b.req = bz;
   b.q_start = a.cu_seqlens_q[bz];
   b.q_len = a.cu_seqlens_q[bz + 1] - b.q_start;
-  b.tokens = (nw * ROWS) >> a.group_shift;
+  b.group_inv = (65536 + a.group - 1) / a.group;
+  b.tokens = (nw * ROWS) / a.group;
   b.first_tok = bx * b.tokens;
   if (b.first_tok >= b.q_len) return false;
   b.seqlen_k = a.seq_lens[bz];
@@ -233,9 +236,10 @@ struct Row {
 static DEV Row row_of(const Args& a, const Block& b, int w, int r) {
   int row_in_block = w * ROWS + r;
   Row row;
-  row.tok = b.first_tok + (row_in_block >> a.group_shift);
-  row.valid = row_in_block < (b.tokens << a.group_shift) && row.tok < b.q_len;
-  row.head = (b.kv_head << a.group_shift) + (row_in_block & ((1 << a.group_shift) - 1));
+  int tok_in_block = (row_in_block * b.group_inv) >> 16;
+  row.tok = b.first_tok + tok_in_block;
+  row.valid = tok_in_block < b.tokens && row.tok < b.q_len;
+  row.head = b.kv_head * a.group + (row_in_block - tok_in_block * a.group);
   row.token = (int64_t)b.q_start + row.tok;
   return row;
 }
@@ -488,13 +492,14 @@ KERNEL_HEAD {
 }
 
 extern "C" {
-// `tiles`: blocks along the query tokens (`warps * 16 / group` tokens each); `warps` 1 or 4.
+// `tiles`: blocks along the query tokens (`warps * 16 / group` tokens each); `warps` 1, 2 or 4.
 #ifdef HOST_EMU
 int hi_sm75_rel_attention(const Args* a, int num_reqs, int tiles, int warps, void*) {
   for (int bz = 0; bz < num_reqs; bz++)
     for (int by = 0; by < a->num_kv_heads * a->num_splits; by++)
       for (int bx = 0; bx < tiles; bx++) {
         if (warps == 1) run_block<1>(*a, bx, by, bz);
+        else if (warps == 2) run_block<2>(*a, bx, by, bz);
         else run_block<MAX_NW>(*a, bx, by, bz);
       }
   return 0;
@@ -504,10 +509,12 @@ int hi_sm75_rel_attention(const Args* a, int num_reqs, int tiles, int warps, voi
   dim3 grid(tiles, a->num_kv_heads * a->num_splits, num_reqs);
   if (warps == 1)
     rel_attention_kernel<1><<<grid, 32, 0, (cudaStream_t)stream>>>(*a);
+  else if (warps == 2)
+    rel_attention_kernel<2><<<grid, 64, 0, (cudaStream_t)stream>>>(*a);
   else
     rel_attention_kernel<MAX_NW><<<grid, MAX_NW * 32, 0, (cudaStream_t)stream>>>(*a);
   return (int)cudaGetLastError();
 }
 #endif
-int hi_sm75_abi(void) { return 3; }
+int hi_sm75_abi(void) { return 4; }
 }
