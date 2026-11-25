@@ -72,6 +72,46 @@ python3 scripts/wizard.py         # the same questions, writes .env
 Tested on Fedora 44 (gcc 15 next to the default gcc 16, CUDA 13.3). Other distributions
 should work where CUDA 13 and a gcc it accepts are installed; that is best effort.
 
+### Next to an existing CUDA setup (llama.cpp and others)
+
+HyperInkling can be installed without touching an existing CUDA toolkit, Python or
+llama.cpp build. The one thing it shares with them is the NVIDIA driver, which must be 580
+or newer. A newer driver still runs programs built for older CUDA versions, so llama.cpp
+builds against CUDA 12 keep working after the update. Both engines cannot hold the GPU at
+the same time: stop one before starting the other.
+
+**In a container (the most isolated).** CUDA 13, Python and vLLM all live in the image. The
+host needs only the driver and the
+[NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
+On Windows, use Docker Desktop with the WSL2 backend and the Windows NVIDIA driver; don't
+install a Linux driver inside WSL. The published image is built for sm86. On a Turing card
+(RTX 20xx, 2080 Ti), build an sm75 image once, which takes about an hour:
+
+```bash
+scripts/setup-vllm.sh
+ARCH=7.5 scripts/build-image.sh hyperinkling:sm75   # vLLM's Dockerfile, CUDA 13 inside
+python3 scripts/wizard.py                            # on Turing it writes IMAGE=hyperinkling:sm75
+docker compose up -d
+```
+
+To remove it, run `docker compose down`, then `docker image rm hyperinkling:sm75 hyperinkling-vllm:sm75`.
+
+**In a uv environment (native).** `scripts/build-vllm.sh` builds everything into `./venv`
+with [uv](https://docs.astral.sh/uv/). uv fetches its own Python 3.14, so the system Python is
+not used. The torch wheels bring their own CUDA runtime, and `start.sh` activates the venv
+only in its own process. Building vLLM still needs a CUDA 13 `nvcc`. If the system toolkit
+is another version, install CUDA 13 beside it and point the build at it:
+
+```bash
+# NVIDIA's runfile, toolkit only, in its own directory (no driver, system toolkit untouched)
+sh cuda_13.2.1_*_linux.run --silent --toolkit --toolkitpath=$HOME/cuda-13.2
+CUDA_HOME=$HOME/cuda-13.2 ARCH=7.5 scripts/build-vllm.sh   # ARCH=7.5 on Turing, default 8.6
+./start.sh
+```
+
+Afterwards, check that `/usr/local/cuda` still points where it did. The build refuses an
+`nvcc` that is not CUDA 13. To remove everything, run `rm -rf venv vllm $HOME/cuda-13.2`.
+
 ## Speed
 
 RTX 3090 Ti undervolted to 350 W with [gpu-unlock](https://github.com/zagitta/gpu-unlock)

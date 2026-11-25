@@ -235,6 +235,41 @@ def _short_conv():
                          addend=_r(t, heads * width), residual=_r(t, heads * width))
 
 
+def _dspark():
+    """The DSpark drafter's own kernels (fp16 on Turing) and its block attention
+    (`block_decode_attention` runs `rel_attention` in draft mode on sm75)."""
+    ds, att = load("dspark"), load("attention_sm90")
+    hq, hkv, d, block, page = 16, 4, 128, 8, 16
+    for reqs in (1, 6):
+        t = reqs * block
+        ds.mix_rmsnorm(_r(t, 4, HID), torch.rand(4), _r(HID), 1e-6)
+        qkv = _r(t, (hq + 2 * hkv) * d)
+        inv_freq = torch.rand(d // 2)
+        pos = torch.arange(t)
+        ds.qk_norm_rope_(qkv, pos, _r(d), _r(d), inv_freq, hq, hkv, 1e-6)
+        ds.rope_(_r(t, hkv, d), pos, inv_freq)
+        ds.silu_and_mul(_r(t, 2 * 4608))
+        ds.add_softcap(_r(t, 201024), _r(t, 201024), 30.0)
+        ds.markov_gate(torch.randn(t, 3 * 256), _r(t, 256))
+        blocks = 40
+        cache = torch.zeros((1 + reqs * blocks, page, hkv, d), dtype=torch.uint8)
+        for window, splits in ((0, 1), (0, 4), (520, 1)):
+            out = _r(t, hq * d)
+            if splits == 1:
+                o, lse, mode = out, None, att.MODE_GATED
+            else:
+                o, lse = torch.empty(splits, t, hq, d), torch.empty(splits, t, hq)
+                mode = att.MODE_PARTIAL
+            att.rel_attention(
+                _r(t, hq, d), cache, cache.clone(), o, lse, None, out, out,
+                block_table=torch.zeros((reqs, blocks), dtype=torch.int32),
+                cache_seqlens=torch.full((reqs,), 600, dtype=torch.int32),
+                cu_seqlens_q=torch.arange(reqs + 1, dtype=torch.int32) * block,
+                max_query_len=block, softmax_scale=d**-0.5, window=window,
+                num_splits=splits, mode=mode,
+            )
+
+
 def _prologue():
     sconv = load("sconv")
     page, d_rel, extent = 16, 16, 1024
@@ -257,7 +292,7 @@ def main():
     _setup()
     failed = []
     for step in (_w8, _k_groups, _controllers, _norms, _swiglu, _vision, _attention,
-                 _prologue, _short_conv):
+                 _prologue, _short_conv, _dspark):
         try:
             step()
         except Exception:

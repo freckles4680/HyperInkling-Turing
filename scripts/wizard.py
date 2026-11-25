@@ -194,8 +194,8 @@ def main():
     rows, measured_gib = pick_table(tables, gpu_gib)
     if turing:
         print("\nTuring (sm75) runs the model in fp16 (no bf16 tensor cores): ported but not "
-              "yet run on a Turing GPU.\nDSpark is not ported to fp16, so answer no to it. "
-              "Speeds below are 3090 Ti numbers.")
+              "yet run on a Turing GPU.\nDSpark runs in fp16 too. Speeds below are 3090 Ti "
+              "numbers.")
     if round(gpu_gib) != measured_gib:
         print(f"\nContext below: measured at {measured_gib} GiB, scaled to {gpu_gib:g} GiB.")
     print()
@@ -233,10 +233,7 @@ def main():
           f"~{DECODE_1['off']} (more on code and structured output, less on free prose); "
           f"longest request {ctx(vision, 'dspark', True, seqs, 2048)}")
     print(f"   n) no: longest request {ctx(vision, 'off', True, seqs, 2048)}")
-    spec = "dspark" if ask("   choice", "yn", "n" if turing else "y") == "y" else "off"
-    if turing and spec == "dspark":
-        print("   DSpark is not ported to fp16: start.sh refuses SPEC=dspark on Turing.")
-        spec = "off"
+    spec = "dspark" if ask("   choice", "yn", "y") == "y" else "off"
 
     adaptive = "n"
     if spec == "dspark":
@@ -335,6 +332,8 @@ def main():
         env["SHM_GB"] = tier + 12
     if hasattr(os, "getuid"):  # compose's prepare writes ./models as this user
         env["UID"], env["GID"] = os.getuid(), os.getgid()
+    if turing:  # the published image is built for sm86 only
+        env["IMAGE"] = "hyperinkling:sm75"
     if expose == "y":
         env["BIND"] = "0.0.0.0"  # Docker: the published port
         env["HOST"] = "0.0.0.0"  # native start.sh
@@ -354,11 +353,15 @@ def main():
             # Docker would create a missing bind-mount source as root.
             (REPO / "models").mkdir(exist_ok=True)
             print(f"Written {dest}")
+    if turing:
+        print("\nBuild the Turing image once (~1 hour): scripts/setup-vllm.sh && "
+              "ARCH=7.5 scripts/build-image.sh hyperinkling:sm75")
     print("\nStart it:  docker compose up -d     (logs: docker compose logs -f; the first start"
           " downloads the checkpoint)")
     print(f"Native:    hf download {repo} --local-dir models/{local}   (once)")
     exports = " ".join(f"{k}={v}" for k, v in env.items()
-                       if k not in ("UID", "GID", "SHM_GB", "BIND", "HF_REPO", "CHECKPOINT"))
+                       if k not in ("UID", "GID", "SHM_GB", "BIND", "HF_REPO", "CHECKPOINT",
+                                    "IMAGE"))
     print(f"Native:    {exports} ./start.sh")
 
 

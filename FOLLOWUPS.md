@@ -38,8 +38,10 @@ and `scripts/build-image.sh`, and the wizard scales the context to the card's me
 router, vision and Marlin's activations and INT4 scales follow it, the Triton kernels take
 the dtype from their pointers (bitwise the same code on bf16), `_situ` unpacks fp16 pairs,
 the vision rounding uses `cvt.rn.f16.f32`, and bf16 checkpoint tensors are cast at load,
-clamped at 65504 (logged). `start.sh` passes `--dtype float16` on that path and refuses
-DSpark. `tests/test_fp16.py` checks each changed kernel in fp16 against fp32 (W8/W4/bgemv
+clamped at 65504 (logged). `start.sh` passes `--dtype float16` on that path. DSpark runs in fp16
+too: its bf16 weights cast at load, its kernels storing in the activation dtype (the Markov
+gate keeps the reference's bf16 roundings, as bit operations). Unsloth's llama.cpp DSpark
+GGUFs run the same drafter on RTX 20xx in F16/F32 math. `tests/test_fp16.py` checks each changed kernel in fp16 against fp32 (W8/W4/bgemv
 also ran in Triton's CPU interpreter). Shared memory (64 KB per block on Turing against
 Ampere's ~100 KB) is checked offline by `bench/sm75_compile.py`: the attention tiles
 (72-96 KB) and the W8 prefill tile (128 KB) were over and are smaller on sm75 (attention
@@ -53,9 +55,11 @@ T1. **fp16 on the card**: there is no bf16 GPU to compare against, so the check 
     residual overflows, keep the residual blocks in fp32 in `Inkling2LoopModel.forward`.
 T2. **Tile speed on the card**: the tiles are the 3090's, shrunk only where shared memory
     forced it; time them on the 2080 Ti (`bench/w8_gemv.py`, `bench/w4_gemv.py`).
-T3. **DSpark**: its draft KV goes through vLLM's FlashAttention backend (SM80+); with
-    `HYPERINKLING_DRAFT_KV_FP8=1` the attention itself runs in `block_decode_attention`,
-    so only the KV write may need a non-FA path.
+T3. **DSpark on the card** (in code): the draft's attention runs in `block_decode_attention`
+    (Triton `rel_attention` on sm75, compiled in `bench/sm75_compile.py`). Its KV write is
+    vLLM's `reshape_and_cache_flash` (core op, no FlashAttention kernel), and its RMSNorms
+    are flashinfer's (sm75 supported upstream). Left: acceptance on the card
+    (`bench/spec_bench.py`, `docs/turing-bringup.md` step 4).
 T4. **A 22 GiB memory matrix**: `bench/memory_matrix.sh` on the card replaces the scaled
     estimate (it writes `gpu_gib`).
 

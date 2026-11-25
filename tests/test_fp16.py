@@ -1,4 +1,5 @@
-"""The fp16 activation path (Turing) on synthetic data: each kernel the port changed,
+"""The fp16 activation path (Turing) on synthetic data: each kernel the port changed
+(the DSpark drafter's included),
 run with fp16 inputs against an fp32 reference (and in bf16 too on a GPU that has it).
 No checkpoint needed. Step 2 of docs/turing-bringup.md.
 
@@ -163,3 +164,58 @@ def test_marlin_int4_fp16(tokens):
     rel = _rel(got, want)
     print(f"marlin int4 fp16 x {tokens}: {rel:.1e}")
     assert rel < 2e-2
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_dspark_kernels(dtype):
+    """The DSpark drafter's kernels in `dtype` against fp32 math."""
+    from vllm.models.inkling2.nvidia.ops.dspark import (
+        add_softcap,
+        markov_gate,
+        mix_rmsnorm,
+        qk_norm_rope_,
+        silu_and_mul,
+    )
+
+    torch.manual_seed(0)
+    rows, taps, d, hq, hk, rank = 16, 4, 128, 16, 4, 256
+    targets = torch.randn(rows, taps, HIDDEN, device="cuda").to(dtype)
+    alpha = torch.softmax(torch.randn(taps, device="cuda"), 0)
+    weight = (torch.rand(HIDDEN, device="cuda") + 0.5).to(dtype)
+    mixed = (targets.float() * alpha[:, None]).sum(1)
+    want = mixed * torch.rsqrt(mixed.square().mean(-1, keepdim=True) + 1e-6) * weight.float()
+    assert _rel(mix_rmsnorm(targets, alpha, weight, 1e-6), want) < 1e-2
+
+    qkv = torch.randn(rows, (hq + 2 * hk) * d, device="cuda").to(dtype)
+    q_w = (torch.rand(d, device="cuda") + 0.5).to(dtype)
+    k_w = (torch.rand(d, device="cuda") + 0.5).to(dtype)
+    inv_freq = 1.0 / 10000 ** (torch.arange(0, d, 2, device="cuda").float() / d)
+    pos = torch.arange(rows, device="cuda") * 37
+    heads = qkv.float()[:, : (hq + hk) * d].view(rows, hq + hk, d)
+    w = torch.cat([q_w.float().expand(hq, d), k_w.float().expand(hk, d)])
+    normed = heads * torch.rsqrt(heads.square().mean(-1, keepdim=True) + 1e-6) * w
+    ang = pos[:, None].float() * inv_freq
+    cos, sin = ang.cos()[:, None], ang.sin()[:, None]
+    x1, x2 = normed[..., : d // 2], normed[..., d // 2 :]
+    want = torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], -1)
+    qk_norm_rope_(qkv, pos, q_w, k_w, inv_freq, hq, hk, 1e-6)
+    assert _rel(qkv[:, : (hq + hk) * d].view(rows, hq + hk, d), want) < 1e-2
+
+    gate_up = torch.randn(rows, 2 * 1024, device="cuda").to(dtype)
+    g, u = gate_up.float().chunk(2, -1)
+    assert _rel(silu_and_mul(gate_up), torch.nn.functional.silu(g) * u) < 1e-2
+
+    a = (torch.randn(rows, 4096, device="cuda") * 20).to(dtype)
+    b = torch.randn(rows, 4096, device="cuda").to(dtype)
+    want = 30.0 * torch.tanh((a.float() + b.float()) / 30.0)
+    got = add_softcap(a, b, 30.0)
+    assert got.dtype == dtype and _rel(got, want) < 1e-2
+
+    raw = torch.randn(rows, 3 * rank, device="cuda") * 2
+    state = torch.rand(rows, rank, device="cuda").to(dtype) * 2 - 1
+    gate, cand, out = raw.chunk(3, -1)
+    gate = torch.sigmoid(gate)
+    got_state, got_latent = markov_gate(raw, state)
+    assert got_state.dtype == dtype
+    assert _rel(got_state, gate * state.float() + (1 - gate) * torch.tanh(cand)) < 1e-2
+    assert _rel(got_latent, torch.tanh(out)) < 1e-2

@@ -1,4 +1,4 @@
-From 5e2dd4ff150ffb30b6fb292c753b8d48edc32f7c Mon Sep 17 00:00:00 2001
+From 7c494caee5616f9fae0cb092200fe76ed8f392a4 Mon Sep 17 00:00:00 2001
 From: Pento95 <173375476+Pento95@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 05:39:42 +0100
 Subject: [PATCH] [hyperinkling] Inkling 2 Mini on Ampere (sm86)
@@ -80,8 +80,12 @@ gates PDL/TMA, e4m3 conversions and the native conv/mix kernels below SM90):
   bf16 path is the same code), _situ unpacks fp16 pairs, vision rounding
   uses cvt.rn.f16.f32 (cvt.rn.bf16.f32 is SM80+); bf16 checkpoint tensors
   are cast at load, clamped at fp16's range and logged; the sconv SWA cache
-  takes fp16. Requires --dtype float16 and no speculative decoding (DSpark
-  is bf16 only).
+  takes fp16. Requires --dtype float16.
+- DSpark in fp16: the draft's bf16 (and fp32) checkpoint tensors are cast at
+  load with the same saturation, the Markov fold clamped to fp16's range;
+  the draft kernels (Q/K norm + RoPE, softcap, Markov gate) store in their
+  pointers' dtype (the gate keeps its bf16 roundings, as bit operations);
+  the draft KV accepts float16.
 - Turing's 64 KB of shared memory per block: relative attention takes
   BLOCK_M <= 64 and BLOCK_N 64 (BLOCK_M <= 32) or 32 on sm75, the W8 linear
   BN <= 128 (the sm86 tiles took 72-96 KB and 128 KB there).
@@ -99,9 +103,9 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/models/inkling/nvidia/ops/sconv.py       |  10 +-
  vllm/models/inkling/nvidia/sconv_swa_attn.py  | 147 +++++++++-
  vllm/models/inkling2/nvidia/attention.py      |  45 ++-
- vllm/models/inkling2/nvidia/dspark.py         | 164 ++++++++---
+ vllm/models/inkling2/nvidia/dspark.py         | 191 +++++++++---
  vllm/models/inkling2/nvidia/loop.py           |  52 +++-
- vllm/models/inkling2/nvidia/model.py          | 123 +++++++-
+ vllm/models/inkling2/nvidia/model.py          | 119 +++++++-
  vllm/models/inkling2/nvidia/moe.py            | 110 ++++++-
  vllm/models/inkling2/nvidia/ops/__init__.py   |  65 +++++
  vllm/models/inkling2/nvidia/ops/activation.py |  17 +-
@@ -109,7 +113,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  .../inkling2/nvidia/ops/attention_sm90.py     |  37 ++-
  vllm/models/inkling2/nvidia/ops/bgemv.py      | 183 ++++++++++++
  vllm/models/inkling2/nvidia/ops/conv_mix.py   |   2 +-
- vllm/models/inkling2/nvidia/ops/dspark.py     |  22 +-
+ vllm/models/inkling2/nvidia/ops/dspark.py     |  50 ++--
  vllm/models/inkling2/nvidia/ops/e4m3.py       |  10 +
  vllm/models/inkling2/nvidia/ops/linear.py     |   2 +-
  vllm/models/inkling2/nvidia/ops/linear_w4.py  | 210 ++++++++++++++
@@ -127,14 +131,14 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/models/inkling2/processing.py            |  50 +++-
  vllm/models/inkling2/quant_config.py          |  20 +-
  vllm/models/inkling2/speculator.py            |  24 +-
- vllm/models/inkling2/speculator_config.py     |  13 +-
+ vllm/models/inkling2/speculator_config.py     |  19 +-
  vllm/v1/core/kv_cache_manager.py              |   3 +
  vllm/v1/core/sched/scheduler.py               |  38 ++-
  vllm/v1/core/single_type_kv_cache_manager.py  |   4 +
  vllm/v1/engine/core.py                        |  84 ++++++
  vllm/v1/spec_decode/dynamic/adaptive_k.py     | 130 +++++++++
  vllm/v1/structured_output/backend_xgrammar.py |  41 ++-
- 43 files changed, 2301 insertions(+), 173 deletions(-)
+ 43 files changed, 2340 insertions(+), 191 deletions(-)
  create mode 100644 vllm/models/inkling2/nvidia/ops/bgemv.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/linear_w4.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/linear_w8.py
@@ -622,7 +626,7 @@ index d1fdc61364..757a7b500b 100644
          add_linear_lora(self.wo_ud, out, output)
          return out
 diff --git a/vllm/models/inkling2/nvidia/dspark.py b/vllm/models/inkling2/nvidia/dspark.py
-index 6e1755a18b..021ca02d30 100644
+index 6e1755a18b..bdee2c3bb5 100644
 --- a/vllm/models/inkling2/nvidia/dspark.py
 +++ b/vllm/models/inkling2/nvidia/dspark.py
 @@ -5,6 +5,7 @@ through a small dense transformer over DFlare-mixed target-feature K/V, then a
@@ -633,7 +637,15 @@ index 6e1755a18b..021ca02d30 100644
  from collections.abc import Iterable
  from typing import cast
  
-@@ -26,7 +27,6 @@ from vllm.model_executor.layers.linear import (
+@@ -19,6 +20,7 @@ from vllm.distributed import (
+     tensor_model_parallel_all_reduce,
+ )
+ from vllm.forward_context import get_forward_context
++from vllm.logger import init_logger
+ from vllm.model_executor.layers.attention import Attention
+ from vllm.model_executor.layers.linear import (
+     MergedColumnParallelLinear,
+@@ -26,7 +28,6 @@ from vllm.model_executor.layers.linear import (
      ReplicatedLinear,
      RowParallelLinear,
  )
@@ -641,10 +653,20 @@ index 6e1755a18b..021ca02d30 100644
  from vllm.model_executor.model_loader.weight_utils import default_weight_loader
  from vllm.utils.torch_utils import canonicalize_singleton_dim_strides
  from vllm.v1.attention.backends.flash_attn import (
-@@ -50,6 +50,44 @@ from .ops.dspark import (
+@@ -38,6 +39,7 @@ from vllm.v1.worker.gpu.sample.greedy_argmax import greedy_argmax
+ 
+ from ..configs import Inkling2DSparkConfig
+ from ..speculator_config import Inkling2DSparkSpeculatorConfig
++from .ops import act_dtype, to_fp16_saturated
+ from .ops.attention import block_decode_attention, plan_decode_attention
+ from .ops.dspark import (
+     add_softcap,
+@@ -49,6 +51,45 @@ from .ops.dspark import (
+ )
  from .ops.linear import linear
  
- 
++logger = init_logger(__name__)
++
 +class _DraftKVImpl(FlashAttentionImpl):
 +    """FlashAttention's KV cache writes only: the draft's attention runs in
 +    `block_decode_attention`, so an fp8 cache needs no FlashAttention kernel
@@ -682,11 +704,10 @@ index 6e1755a18b..021ca02d30 100644
 +        return w4(x)
 +    return linear(x, module.weight)
 +
-+
+ 
  class _RMSNorm(nn.Module):
      def __init__(self, hidden_size: int, eps: float) -> None:
-         super().__init__()
-@@ -160,14 +198,20 @@ class Inkling2DraftSelfAttention(nn.Module):
+@@ -160,14 +201,20 @@ class Inkling2DraftSelfAttention(nn.Module):
          # Owns the paged KV cache only; the same spec as the target's layers
          # (the scheduler keeps the last sliding_window_size positions before
          # the block, which is what the draft reads).
@@ -708,7 +729,7 @@ index 6e1755a18b..021ca02d30 100644
          )
          # Keys a block sees: itself and, if local, the window before it.
          self.window = config.sliding_window_size + self.block if is_local else 0
-@@ -192,15 +236,15 @@ class Inkling2DraftSelfAttention(nn.Module):
+@@ -192,15 +239,15 @@ class Inkling2DraftSelfAttention(nn.Module):
          impl.do_kv_cache_update(self.attn, k, v, self.attn.kv_cache, slot_mapping)
  
      def forward(
@@ -727,7 +748,7 @@ index 6e1755a18b..021ca02d30 100644
              self.num_heads,
              self.num_kv_heads,
              self.eps,
-@@ -244,21 +288,21 @@ class Inkling2DraftSelfAttention(nn.Module):
+@@ -244,21 +291,21 @@ class Inkling2DraftSelfAttention(nn.Module):
                  window=self.window,
                  num_splits=num_splits,
              )
@@ -753,7 +774,7 @@ index 6e1755a18b..021ca02d30 100644
          if slot_mapping is not None and self.attn.kv_cache.numel() > 0:
              self._write_kv(
                  k, v.view(-1, self.num_kv_heads, self.head_dim), slot_mapping
-@@ -282,8 +326,8 @@ class Inkling2DraftMLP(nn.Module):
+@@ -282,8 +329,8 @@ class Inkling2DraftMLP(nn.Module):
          )
  
      def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -764,7 +785,7 @@ index 6e1755a18b..021ca02d30 100644
  
  
  class Inkling2DraftLayer(nn.Module):
-@@ -305,7 +349,7 @@ class Inkling2DraftLayer(nn.Module):
+@@ -305,7 +352,7 @@ class Inkling2DraftLayer(nn.Module):
          positions: torch.Tensor,
          x: torch.Tensor,
          residual: torch.Tensor | None,
@@ -773,7 +794,7 @@ index 6e1755a18b..021ca02d30 100644
      ) -> tuple[torch.Tensor, torch.Tensor]:
          """Returns this rank's partial MLP output and the residual."""
          if residual is None:
-@@ -313,7 +357,7 @@ class Inkling2DraftLayer(nn.Module):
+@@ -313,7 +360,7 @@ class Inkling2DraftLayer(nn.Module):
              x = self.input_layernorm(x)
          else:
              x = all_reduce_add_rmsnorm(x, residual, self.input_layernorm)
@@ -782,7 +803,7 @@ index 6e1755a18b..021ca02d30 100644
          x = all_reduce_add_rmsnorm(x, residual, self.post_attention_layernorm)
          return self.mlp(x), residual
  
-@@ -342,6 +386,9 @@ class Inkling2MarkovHead(nn.Module):
+@@ -342,6 +389,9 @@ class Inkling2MarkovHead(nn.Module):
          self.dflare_norm = _RMSNorm(hidden, config.rms_norm_eps)
          self.fold_weight: torch.Tensor | None = None
          self.fold_bias: torch.Tensor | None = None
@@ -792,7 +813,7 @@ index 6e1755a18b..021ca02d30 100644
          self.rnn_bias: torch.Tensor | None = None
  
      @torch.no_grad()
-@@ -350,15 +397,34 @@ class Inkling2MarkovHead(nn.Module):
+@@ -350,15 +400,38 @@ class Inkling2MarkovHead(nn.Module):
          calls refill the same tensors, which CUDA graphs keep pointing at."""
          projection = self.hidden_out.weight.double()
          bias = self.hidden_out.bias.double()
@@ -809,14 +830,20 @@ index 6e1755a18b..021ca02d30 100644
          for start in range(0, num_rows, 4096):
              rows = slice(start, start + 4096)
 -            head = lm_head_weight[rows].double()
+-            self.fold_weight[rows].copy_(head @ projection)
+-            self.fold_bias[rows].copy_(head @ bias)
 +            if w8 is not None:
 +                from .ops.linear_w8 import dequantize_int8
 +
 +                head = dequantize_int8(w8.q[rows], w8.scale[rows]).double()
 +            else:
 +                head = lm_head_weight[rows].double()
-             self.fold_weight[rows].copy_(head @ projection)
-             self.fold_bias[rows].copy_(head @ bias)
++            fold, fold_bias = head @ projection, head @ bias
++            if self.fold_weight.dtype == torch.float16:
++                # HyperInkling fp16 path (Turing): saturate, as the checkpoint.
++                fold, fold_bias = fold.clamp(-65504, 65504), fold_bias.clamp(-65504, 65504)
++            self.fold_weight[rows].copy_(fold)
++            self.fold_bias[rows].copy_(fold_bias)
 +        mode = os.environ.get("HYPERINKLING_DSPARK_FOLD", "bf16")
 +        if mode in ("w8", "w4"):
 +            if mode == "w8":
@@ -830,7 +857,7 @@ index 6e1755a18b..021ca02d30 100644
  
      def context(self, hidden: torch.Tensor, f_rnn: torch.Tensor) -> torch.Tensor:
          """fp32 `rnn_proj` bias plus its `[hidden, f_rnn]` term for the
-@@ -377,18 +443,19 @@ class Inkling2MarkovHead(nn.Module):
+@@ -377,18 +450,19 @@ class Inkling2MarkovHead(nn.Module):
          self, state: torch.Tensor, prev_tokens: torch.Tensor, context: torch.Tensor
      ) -> tuple[torch.Tensor, torch.Tensor]:
          """One recurrence step; returns the new state and the TP-local bias."""
@@ -854,7 +881,7 @@ index 6e1755a18b..021ca02d30 100644
          super().__init__()
          self.config = config
          hidden = config.hidden_size
-@@ -406,13 +473,10 @@ class Inkling2DSparkDecoder(nn.Module):
+@@ -406,13 +480,10 @@ class Inkling2DSparkDecoder(nn.Module):
          )
          self.mask_embed = nn.Parameter(torch.zeros(hidden), requires_grad=False)
          self.register_buffer("fuse_alpha", torch.empty_like(self.fuse_weight))
@@ -872,7 +899,7 @@ index 6e1755a18b..021ca02d30 100644
          # Shared with the target model (see Inkling2DSparkModel.attach_target).
          self.embed_tokens: nn.Module | None = None
          self.embed_norm: nn.Module | None = None
-@@ -434,7 +498,7 @@ class Inkling2DSparkDecoder(nn.Module):
+@@ -434,7 +505,7 @@ class Inkling2DSparkDecoder(nn.Module):
          x = self.embed_block(input_ids)
          residual = None
          for layer in self.layers:
@@ -881,7 +908,7 @@ index 6e1755a18b..021ca02d30 100644
          assert residual is not None
          return all_reduce_add_rmsnorm(x, residual, self.norm)
  
-@@ -477,9 +541,7 @@ class Inkling2DSparkModel(nn.Module):
+@@ -477,9 +548,7 @@ class Inkling2DSparkModel(nn.Module):
                  "to at most that"
              )
          self.config = config
@@ -892,7 +919,16 @@ index 6e1755a18b..021ca02d30 100644
          self.lm_head: nn.Module | None = None
  
      @torch.no_grad()
-@@ -501,7 +563,11 @@ class Inkling2DSparkModel(nn.Module):
+@@ -487,7 +556,7 @@ class Inkling2DSparkModel(nn.Module):
+         """Finish sharing the target's normalized embeddings and LM head (its
+         `embed_tokens` and `lm_head` are aliased by `load_dspark_model`)
+         and derive the weights that depend on them."""
+-        assert self.lm_head is not None and self.lm_head.weight.dtype == torch.bfloat16
++        assert self.lm_head is not None and self.lm_head.weight.dtype == act_dtype()
+         self.model.embed_norm = target_model.model.embed_norm
+         head = self.model.markov_head
+         head.rnn_bias = torch.empty_like(head.rnn_proj.bias, dtype=torch.float32)
+@@ -501,7 +570,11 @@ class Inkling2DSparkModel(nn.Module):
          assert self.lm_head is not None
          head = self.model.markov_head
          assert head.rnn_bias is not None
@@ -905,7 +941,7 @@ index 6e1755a18b..021ca02d30 100644
          head.rnn_bias.copy_(head.rnn_proj.bias)
          self.model.fuse_alpha.copy_(
              torch.softmax(self.model.fuse_weight.float(), dim=-1)
-@@ -525,7 +591,7 @@ class Inkling2DSparkModel(nn.Module):
+@@ -525,7 +598,7 @@ class Inkling2DSparkModel(nn.Module):
              layer.self_attn.store_context_kv(
                  context,
                  context_positions,
@@ -914,9 +950,13 @@ index 6e1755a18b..021ca02d30 100644
                  None if context_slot_mappings is None else context_slot_mappings[i],
              )
  
-@@ -544,6 +610,9 @@ class Inkling2DSparkModel(nn.Module):
+@@ -542,8 +615,12 @@ class Inkling2DSparkModel(nn.Module):
+         return self.model(input_ids, positions)
+ 
      def compute_base_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-         """TP-local bf16 base logits (bf16 GEMM, as the reference)."""
+-        """TP-local bf16 base logits (bf16 GEMM, as the reference)."""
++        """TP-local base logits in the activation dtype (a bf16 GEMM as the
++        reference; fp16 on Turing)."""
          assert self.lm_head is not None
 +        w8 = getattr(self.lm_head, "hyperinkling_w8", None)
 +        if w8 is not None:
@@ -924,7 +964,25 @@ index 6e1755a18b..021ca02d30 100644
          return linear(hidden_states, self.lm_head.weight)
  
      def markov_step(
-@@ -586,4 +655,33 @@ class Inkling2DSparkModel(nn.Module):
+@@ -579,6 +656,17 @@ class Inkling2DSparkModel(nn.Module):
+                     name, shard = name.replace(old, new), shard_id
+                     break
+             param = params[name]
++            if param.dtype == torch.float16 and weight.dtype in (
++                torch.bfloat16,
++                torch.float32,
++            ):
++                # HyperInkling fp16 path (Turing): the bf16 draft as fp16,
++                # saturating at 65504 like the target's tensors.
++                weight, clamped = to_fp16_saturated(weight)
++                if clamped:
++                    logger.warning(
++                        "%s: %d values past fp16's range clamped", name, clamped
++                    )
+             if weight.dtype != param.dtype:
+                 raise ValueError(f"{name}: expected {param.dtype}, got {weight.dtype}")
+             if shard is None:
+@@ -586,4 +674,33 @@ class Inkling2DSparkModel(nn.Module):
              else:
                  param.weight_loader(param, weight, shard)
              loaded.add(name)
@@ -1075,7 +1133,7 @@ index bee8058353..59e8eeb07d 100644
          out = inputs[0]
          if self.aux_hidden_state_layers:
 diff --git a/vllm/models/inkling2/nvidia/model.py b/vllm/models/inkling2/nvidia/model.py
-index db9a9bc16b..b2ab689962 100644
+index db9a9bc16b..3b8677c3da 100644
 --- a/vllm/models/inkling2/nvidia/model.py
 +++ b/vllm/models/inkling2/nvidia/model.py
 @@ -25,6 +25,7 @@ from vllm.distributed import (
@@ -1143,7 +1201,7 @@ index db9a9bc16b..b2ab689962 100644
              else "nvfp4"
          )
          self.mlp = Inkling2MoE(config, expert_format, config.layer_visit_ids(layer_id))
-@@ -557,6 +573,24 @@ class Inkling2ForConditionalGeneration(
+@@ -557,6 +573,20 @@ class Inkling2ForConditionalGeneration(
              # The reference applies embed_norm to raw input embeddings, which
              # cannot be told apart from already-normalized ones here.
              raise ValueError("Inkling2 does not support prompt embeddings")
@@ -1156,10 +1214,6 @@ index db9a9bc16b..b2ab689962 100644
 +                    "Inkling2 fp16 path (Turing, or HYPERINKLING_FP16=1) needs "
 +                    f"--dtype float16, got {vllm_config.model_config.dtype}"
 +                )
-+            if vllm_config.speculative_config is not None:
-+                raise ValueError(
-+                    "Inkling2 fp16 path: DSpark is not ported to fp16 yet (SPEC=off)"
-+                )
 +            logger.warning(
 +                "Inkling2 in fp16 (%s): a port of the bf16 model; HYPERINKLING_FP16_"
 +                "CHECK=1 logs how close the residual stream runs to fp16's limit.",
@@ -1168,7 +1222,7 @@ index db9a9bc16b..b2ab689962 100644
          self.config = config
          self.text_config = text_config = config.text_config
          self.visual = (
-@@ -785,6 +819,16 @@ class Inkling2ForConditionalGeneration(
+@@ -785,6 +815,16 @@ class Inkling2ForConditionalGeneration(
                      continue
                  raise ValueError(f"Unexpected checkpoint tensor: {name}")
              param = params[name]
@@ -1185,7 +1239,7 @@ index db9a9bc16b..b2ab689962 100644
              if param.dtype != weight.dtype:
                  if ".mlp.experts." in name and weight.dtype == torch.bfloat16:
                      raise ValueError(
-@@ -811,9 +855,82 @@ class Inkling2ForConditionalGeneration(
+@@ -811,9 +851,82 @@ class Inkling2ForConditionalGeneration(
                  loaded.add(name)
          if self.visual is not None:
              loaded |= {f"visual.{n}" for n in self.visual.load_weights(visual_weights)}
@@ -1914,7 +1968,7 @@ index 5899d5e99f..f43c86d88c 100644
          assert t is None or (t.is_contiguous() and t.shape == conv_out.shape)
      assert residual is None or addend is not None
 diff --git a/vllm/models/inkling2/nvidia/ops/dspark.py b/vllm/models/inkling2/nvidia/ops/dspark.py
-index 293c39f635..c0f8c263f5 100644
+index 293c39f635..89026fc289 100644
 --- a/vllm/models/inkling2/nvidia/ops/dspark.py
 +++ b/vllm/models/inkling2/nvidia/ops/dspark.py
 @@ -69,7 +69,7 @@ def _qk_norm_rope_kernel(
@@ -1926,7 +1980,7 @@ index 293c39f635..c0f8c263f5 100644
      POS,
      row_stride,
      q_size,
-@@ -80,13 +80,16 @@ def _qk_norm_rope_kernel(
+@@ -80,20 +80,23 @@ def _qk_norm_rope_kernel(
  ):
      t = tl.program_id(0).to(tl.int64)
      h = tl.program_id(1)
@@ -1946,7 +2000,36 @@ index 293c39f635..c0f8c263f5 100644
  
      is_q = h < NHQ
      col0 = tl.where(is_q, h * D, q_size + (h - NHQ) * D).to(tl.int64)
-@@ -118,20 +121,20 @@ def qk_norm_rope_(
+     row = X + t * row_stride + col0
+     if NORM:
+         w_ptr = tl.where(is_q, Q_WEIGHT.to(tl.int64), K_WEIGHT.to(tl.int64)).to(
+-            tl.pointer_type(tl.bfloat16)
++            tl.pointer_type(Q_WEIGHT.dtype.element_ty)
+         )
+         x = tl.load(row + d_ar).to(tl.float32)
+         ms = tl.sum(x * x, 0) / D
+@@ -102,15 +105,16 @@ def _qk_norm_rope_kernel(
+         w2 = tl.load(w_ptr + HALF + half_ar).to(tl.float32)
+         x1 = tl.load(row + half_ar).to(tl.float32) * inv * w1
+         x2 = tl.load(row + HALF + half_ar).to(tl.float32) * inv * w2
+-        x1 = x1.to(tl.bfloat16).to(tl.float32)
+-        x2 = x2.to(tl.bfloat16).to(tl.float32)
++        # Rounded to the activation dtype (bf16 as the reference; fp16 on Turing).
++        x1 = x1.to(X.dtype.element_ty).to(tl.float32)
++        x2 = x2.to(X.dtype.element_ty).to(tl.float32)
+     else:
+         x1 = tl.load(row + half_ar).to(tl.float32)
+         x2 = tl.load(row + HALF + half_ar).to(tl.float32)
+     o1 = x1 * cos - x2 * sin
+     o2 = x2 * cos + x1 * sin
+-    tl.store(row + half_ar, o1.to(tl.bfloat16))
+-    tl.store(row + HALF + half_ar, o2.to(tl.bfloat16))
++    tl.store(row + half_ar, o1.to(X.dtype.element_ty))
++    tl.store(row + HALF + half_ar, o2.to(X.dtype.element_ty))
+ 
+ 
+ def qk_norm_rope_(
+@@ -118,20 +122,20 @@ def qk_norm_rope_(
      positions: torch.Tensor,
      q_weight: torch.Tensor,
      k_weight: torch.Tensor,
@@ -1956,7 +2039,8 @@ index 293c39f635..c0f8c263f5 100644
      num_k_heads: int,
      eps: float,
  ) -> None:
-     """In-place per-head Q/K RMSNorm (rounded to bf16) + neox RoPE on the
+-    """In-place per-head Q/K RMSNorm (rounded to bf16) + neox RoPE on the
++    """In-place per-head Q/K RMSNorm (rounded to qkv's dtype) + neox RoPE on the
      leading `num_q_heads + num_k_heads` heads of the fused `qkv`."""
 -    head_dim = cos_sin_cache.shape[-1]
 +    head_dim = 2 * inv_freq.shape[0]
@@ -1970,7 +2054,7 @@ index 293c39f635..c0f8c263f5 100644
              positions,
              qkv.stride(0),
              num_q_heads * head_dim,
-@@ -142,16 +145,17 @@ def qk_norm_rope_(
+@@ -142,16 +146,17 @@ def qk_norm_rope_(
          )
  
  
@@ -1990,6 +2074,45 @@ index 293c39f635..c0f8c263f5 100644
              positions,
              x.stride(0),
              0,
+@@ -192,15 +197,16 @@ def _add_softcap_kernel(A, B, OUT, stride_a, stride_b, softcap, N, BLOCK: tl.con
+     mask = cols < N
+     a = tl.load(A + row * stride_a + cols, mask, other=0).to(tl.float32)
+     b = tl.load(B + row * stride_b + cols, mask, other=0).to(tl.float32)
+-    x = (a + b).to(tl.bfloat16)
++    x = (a + b).to(OUT.dtype.element_ty)
+     x = x / softcap
+     x = tldevice.tanh(x)
+     x = x * softcap
+-    tl.store(OUT + row * N + cols, x.to(tl.bfloat16), mask)
++    tl.store(OUT + row * N + cols, x.to(OUT.dtype.element_ty), mask)
+ 
+ 
+ def add_softcap(a: torch.Tensor, b: torch.Tensor, softcap: float) -> torch.Tensor:
+-    """bf16 `softcap * tanh(bf16(a + b) / softcap)` of two bf16 2D tensors."""
++    """`softcap * tanh(round(a + b) / softcap)` of two 2D tensors, rounded to
++    `a`'s dtype (bf16, or fp16 on Turing)."""
+     rows, n = a.shape
+     assert a.stride(1) == 1 and b.stride(1) == 1
+     out = a.new_empty((rows, n))
+@@ -230,13 +236,15 @@ def _markov_gate_kernel(RAW, STATE, OUT, LATENT, RANK: tl.constexpr):
+     out = _round_bf16(tl.load(raw + 2 * RANK))
+     state = tl.load(STATE + row * RANK + c).to(tl.float32)
+     # Each torch op of the reference rounds to bf16; its sigmoid is
+-    # 1 / (1 + expf(-x)) with IEEE division.
++    # 1 / (1 + expf(-x)) with IEEE division. The bf16 roundings are bit
++    # operations, so the fp16 path (Turing) keeps them and rounds only the
++    # stored state and latent to fp16 (all in [-1, 1]).
+     gate = _round_bf16(tldevice.div_rn(1.0, 1.0 + tldevice.exp(-gate)))
+     cand = _round_bf16(tldevice.tanh(cand))
+     keep = _round_bf16(gate * state)
+     update = _round_bf16(_round_bf16(1.0 - gate) * cand)
+-    tl.store(OUT + row * RANK + c, (keep + update).to(tl.bfloat16))
+-    tl.store(LATENT + row * RANK + c, tldevice.tanh(out).to(tl.bfloat16))
++    tl.store(OUT + row * RANK + c, (keep + update).to(OUT.dtype.element_ty))
++    tl.store(LATENT + row * RANK + c, tldevice.tanh(out).to(LATENT.dtype.element_ty))
+ 
+ 
+ def markov_gate(
 diff --git a/vllm/models/inkling2/nvidia/ops/e4m3.py b/vllm/models/inkling2/nvidia/ops/e4m3.py
 index 11465fa902..152349eeea 100644
 --- a/vllm/models/inkling2/nvidia/ops/e4m3.py
@@ -3567,7 +3690,7 @@ index 6beae2b0d5..37bfafbbf5 100644
 +                None if self.draft_logits is None else self.draft_logits.values,
 +            )
 diff --git a/vllm/models/inkling2/speculator_config.py b/vllm/models/inkling2/speculator_config.py
-index 0d367f8309..dcc7b20b89 100644
+index 0d367f8309..96d9922b0f 100644
 --- a/vllm/models/inkling2/speculator_config.py
 +++ b/vllm/models/inkling2/speculator_config.py
 @@ -1,8 +1,8 @@
@@ -3581,7 +3704,7 @@ index 0d367f8309..dcc7b20b89 100644
  from vllm.v1.worker.gpu.spec_decode.dspark.config import DSparkSpeculatorConfig
  
  if TYPE_CHECKING:
-@@ -11,11 +11,18 @@ if TYPE_CHECKING:
+@@ -11,14 +11,23 @@ if TYPE_CHECKING:
  
  class Inkling2DSparkSpeculatorConfig(DSparkSpeculatorConfig):
      speculator_class = "vllm.models.inkling2.speculator.Inkling2DSparkSpeculator"
@@ -3601,6 +3724,13 @@ index 0d367f8309..dcc7b20b89 100644
              # The target's clipped, unit-scale FP8 cache does not describe the
              # draft's unnormalized values. Keep the draft cache in BF16.
              if spec.kv_cache_dtype is None:
+                 spec.kv_cache_dtype = "auto"
+-            elif spec.kv_cache_dtype not in ("auto", "bfloat16"):
+-                raise ValueError("Inkling2 DSpark on SM12 requires BF16 draft KV")
++            elif spec.kv_cache_dtype not in ("auto", "bfloat16", "float16"):
++                raise ValueError(
++                    "Inkling2 DSpark on SM12 requires 16-bit draft KV"
++                )
 diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
 index 91f9e26ffd..4a3a61bca3 100644
 --- a/vllm/v1/core/kv_cache_manager.py

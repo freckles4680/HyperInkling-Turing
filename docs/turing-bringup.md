@@ -7,7 +7,10 @@ in order, and stop at the first one that fails. Each step says what to send back
 does.
 
 Assumed: Linux, or WSL2 on Windows, with an NVIDIA driver for CUDA 13 (580 or newer). The
-22 GB card shows about 22 GiB in `nvidia-smi`.
+22 GB card shows about 22 GiB in `nvidia-smi`. To keep an existing CUDA or llama.cpp setup
+as it is, build in a container or in `./venv` with a CUDA 13 toolkit kept beside the system
+one: README, "Next to an existing CUDA setup". The steps below use the native build. In the
+container, run the same commands with `docker compose exec hyperinkling`.
 
 ## 0. Offline compile check (any machine, no GPU)
 
@@ -17,15 +20,16 @@ python3 bench/sm75_compile.py
 ```
 
 This compiles every Triton kernel on the Turing path for sm75, at the model's shapes in
-fp16, and checks each one's shared memory against Turing's 64 KB per block. It should end
-with `0 over 65536 B, 0 steps failed`. It found the attention tiles (72-96 KB) and the W8
-prefill tile (128 KB) over the limit, and those are now smaller on sm75.
+fp16, and checks each one's shared memory against Turing's 64 KB per block. The DSpark
+drafter's kernels are included. It should end with `0 over 65536 B, 0 steps failed`. It
+found the attention tiles (72-96 KB) and the W8 prefill tile (128 KB) over the limit, and
+those are now smaller on sm75.
 
 ## 1. Build
 
 ```bash
 scripts/setup-vllm.sh                 # vllm/ at patches/BASE + the patch
-ARCH=7.5 scripts/build-vllm.sh        # into venv/, sm75 only (30-60 min)
+ARCH=7.5 scripts/build-vllm.sh        # into venv/, sm75 only (30-60 min); CUDA_HOME=... for a side toolkit
 ```
 
 The last line prints the GPU's capability, which should be `(7, 5)`. If the build fails,
@@ -39,7 +43,7 @@ venv/bin/python -m pytest -q -s tests/test_fp16.py tests/test_e4m3.py \
 ```
 
 `test_fp16.py` runs each kernel the port changed, in fp16 against fp32, including Marlin's
-INT4 experts. `OutOfResources` means a tile is too big for Turing: send the kernel name.
+INT4 experts and the DSpark drafter's kernels. `OutOfResources` means a tile is too big for Turing: send the kernel name.
 Some other tests in `tests/` need the original release checkpoint (`models/Inkling-2-Mini`)
 and bf16, so leave them out.
 
@@ -47,11 +51,12 @@ and bf16, so leave them out.
 
 ```bash
 hf download Pentium95/Inkling-2-Mini-W4A16-g128-gptq --local-dir models/Inkling-2-Mini-W4A16-g128-gptq
-HYPERINKLING_FP16_CHECK=1 MAX_LEN=8192 WARMUP=0 ./start.sh 2>&1 | tee .local/fp16-first.log
+HYPERINKLING_FP16_CHECK=1 SPEC=off MAX_LEN=8192 WARMUP=0 ./start.sh 2>&1 | tee .local/fp16-first.log
 ```
 
-`start.sh` sees compute capability 7.5. It turns on fp16, passes `--dtype float16` and
-turns DSpark off. `HYPERINKLING_FP16_CHECK=1` runs eager (no CUDA graphs) and logs the
+`start.sh` sees compute capability 7.5. It turns on fp16 and passes `--dtype float16`.
+This first boot leaves DSpark off (`SPEC=off`) so that only the target model is checked.
+`HYPERINKLING_FP16_CHECK=1` runs eager (no CUDA graphs) and logs the
 residual stream's largest |value| after each layer visit, each time that value sets a new
 record above 4096. In another shell, once `curl -s localhost:8080/health` answers:
 
@@ -68,7 +73,24 @@ What the log means:
 - **`values past fp16's range clamped`:** a checkpoint tensor was clamped at load. A few
   values are harmless; send the tensor names if there are many.
 
-## 4. Quality against the published scores
+## 4. DSpark in fp16
+
+Its bf16 weights are cast to fp16 at load like the target's. Its kernels round to fp16
+where the bf16 path rounds to bf16, except the Markov gate, which keeps the reference's bf16
+roundings. DSpark is on by default, so this boot drops `SPEC=off`:
+
+```bash
+HYPERINKLING_FP16_CHECK=1 MAX_LEN=8192 WARMUP=0 ./start.sh 2>&1 | tee .local/fp16-dspark.log
+python3 scripts/quick_bench.py 1 256
+grep -E 'clamped|Error|Traceback' .local/fp16-dspark.log
+venv/bin/python bench/spec_bench.py 8080 256              # draft acceptance per kind of text
+```
+
+Acceptance comparable to the README's DSpark rows means the drafter works in fp16. Drafts
+cannot change the output: the target verifies every one, so a weak drafter costs only
+speed. If the boot fails in `flashinfer` (the drafter's RMSNorms), send the traceback.
+
+## 5. Quality against the published scores
 
 Restart without the check (CUDA graphs back on) and run the same battery the README
 reports:
@@ -84,7 +106,7 @@ Compare with README "Task accuracy", HyperInkling as served. GSM8K 0.970, tool c
 n=200. Inside that, fp16 is good. A clear drop (say GSM8K below 0.93) means fp16 is losing
 precision somewhere: run step 3's check on a failing prompt and send its lines.
 
-## 5. Memory and speed on the card
+## 6. Memory and speed on the card
 
 ```bash
 bench/memory_matrix.sh .local/memory_matrix_22g.tsv     # one boot per combination, ~2 min each
@@ -96,6 +118,6 @@ wizard then uses them in place of the 24 GiB estimate.
 
 ## What is not done
 
-- DSpark (speculative decoding) is bf16 only, so it stays off on Turing.
+- DSpark in fp16 has not run yet (step 4).
 - The kernels' tiles are the 3090's, shrunk only where Turing's shared memory forced it.
   They are not tuned for the 2080 Ti's speed.
