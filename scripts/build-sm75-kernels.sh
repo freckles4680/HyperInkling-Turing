@@ -1,6 +1,6 @@
 #!/bin/bash
 # Turing (sm75) only: compile kernels/sm75/*.cu into venv/hyperinkling_sm75.so, the
-# tensor-core decode attention Triton cannot emit for sm75 (about a minute, no vLLM
+# tensor-core attention Triton cannot emit for sm75 (about a minute, no vLLM
 # rebuild). start.sh uses the library when it is there (HYPERINKLING_SM75_LIB); without
 # it the Triton kernels serve.
 #   scripts/build-sm75-kernels.sh          # after scripts/build-vllm.sh, and after a git

@@ -33,7 +33,7 @@ ARCH=7.5 scripts/build-vllm.sh        # into venv/, sm75 only (30-60 min); CUDA_
 scripts/build-sm75-kernels.sh         # venv/hyperinkling_sm75.so, about a minute
 ```
 
-The second build is the long-context decode attention on the fp16 tensor cores (Triton
+The second build is attention (prefill and decode) on the fp16 tensor cores (Triton
 cannot emit them for Turing). Run it again after a `git pull` that changes `kernels/sm75/`.
 `start.sh` uses the library when it is there and says so in its banner;
 `HYPERINKLING_SM75_LIB= ./start.sh` serves with the Triton kernel instead.

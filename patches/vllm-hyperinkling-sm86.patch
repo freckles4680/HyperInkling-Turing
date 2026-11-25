@@ -1,4 +1,4 @@
-From 6ef19691a940bfd4196a9129a4fb343cf73ae4c7 Mon Sep 17 00:00:00 2001
+From 30427cfcde14afd049251e31d6db592282ef34db Mon Sep 17 00:00:00 2001
 From: Pento95 <173375476+Pento95@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 05:39:42 +0100
 Subject: [PATCH] [hyperinkling] Inkling 2 Mini on Ampere (sm86)
@@ -106,14 +106,17 @@ gates PDL/TMA, e4m3 conversions and the native conv/mix kernels below SM90):
   (bgemv_sm75): the decode-size loop controllers run on it on sm75
   (controller_gemv_sm75, the rank-R down projection in 8 K slices, which
   the up projection sums in fp32, in order, as it loads them).
-- Full layers' decode attention on sm75 (ops/attention_sm75.py): the split
-  partials (MODE_PARTIAL, window 0, at most 16 rows, E4M3 byte cache) from
-  a CUDA wmma kernel of the HyperInkling repository (kernels/sm75, loaded
-  through ctypes from HYPERINKLING_SM75_LIB, launched on torch's stream),
-  as the Triton kernel's dots run on FMA there (~43 ms a step at 90k
-  tokens on a 2080 Ti). With the library, plan_decode_attention gives
-  HYPERINKLING_SM75_ATTN_CTAS (4) one-warp blocks per SM; without it the
-  Triton kernel serves.
+- Attention on sm75 (ops/attention_sm75.py): prefill (MODE_OUT_LSE) and
+  the split decode partials (MODE_PARTIAL, at most 64 rows), full and
+  sliding-window layers over the E4M3 byte cache, from a CUDA wmma kernel
+  of the HyperInkling repository (kernels/sm75, loaded through ctypes
+  from HYPERINKLING_SM75_LIB, launched on torch's stream), as the Triton
+  kernel's dots run on FMA there (74% of an 8k prefill and ~43 ms of a
+  decode step at 90k tokens on a 2080 Ti). With the library,
+  plan_decode_attention gives full layers HYPERINKLING_SM75_ATTN_CTAS (4)
+  one-warp blocks per SM; without it the Triton kernel serves.
+- k_group_partials above 64 rows on sm75: cuBLAS (the prefill router took
+  97 ms per 1000 tokens on the FMA-bound Triton kernel).
 - HYPERINKLING_FP16_CHECK=1: Inkling2LoopModel.forward logs each new record
   of the residual stream's max |value| above 4096, and any non-finite
   value, by layer and pass (fp16 headroom on Turing; run eager).
@@ -127,15 +130,15 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/envs.py                                  |   6 +
  vllm/models/inkling/nvidia/ops/sconv.py       |  10 +-
  vllm/models/inkling/nvidia/sconv_swa_attn.py  | 147 ++++++++-
- vllm/models/inkling2/nvidia/attention.py      |  45 ++-
+ vllm/models/inkling2/nvidia/attention.py      |  74 ++++-
  vllm/models/inkling2/nvidia/dspark.py         | 197 +++++++++---
  vllm/models/inkling2/nvidia/loop.py           |  54 +++-
  vllm/models/inkling2/nvidia/model.py          | 119 +++++++-
  vllm/models/inkling2/nvidia/moe.py            | 110 ++++++-
  vllm/models/inkling2/nvidia/ops/__init__.py   |  72 +++++
  vllm/models/inkling2/nvidia/ops/activation.py |  17 +-
- vllm/models/inkling2/nvidia/ops/attention.py  |  42 ++-
- .../inkling2/nvidia/ops/attention_sm75.py     | 200 ++++++++++++
+ vllm/models/inkling2/nvidia/ops/attention.py  |  41 ++-
+ .../inkling2/nvidia/ops/attention_sm75.py     | 241 +++++++++++++++
  .../inkling2/nvidia/ops/attention_sm90.py     |  37 ++-
  vllm/models/inkling2/nvidia/ops/bgemv.py      | 183 +++++++++++
  vllm/models/inkling2/nvidia/ops/conv_mix.py   |   2 +-
@@ -164,7 +167,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/v1/engine/core.py                        |  84 +++++
  vllm/v1/spec_decode/dynamic/adaptive_k.py     | 130 ++++++++
  vllm/v1/structured_output/backend_xgrammar.py |  41 ++-
- 44 files changed, 2783 insertions(+), 193 deletions(-)
+ 44 files changed, 2852 insertions(+), 193 deletions(-)
  create mode 100644 vllm/models/inkling2/nvidia/ops/attention_sm75.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/bgemv.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/linear_w4.py
@@ -529,7 +532,7 @@ index 47285b1129..a4c88286eb 100644
 +            hit_alignment_tokens=vllm_config.cache_config.block_size,
          )
 diff --git a/vllm/models/inkling2/nvidia/attention.py b/vllm/models/inkling2/nvidia/attention.py
-index d1fdc61364..757a7b500b 100644
+index d1fdc61364..3b9a708548 100644
 --- a/vllm/models/inkling2/nvidia/attention.py
 +++ b/vllm/models/inkling2/nvidia/attention.py
 @@ -3,6 +3,7 @@
@@ -553,7 +556,7 @@ index d1fdc61364..757a7b500b 100644
  from ..configs import Inkling2ModelConfig
  from .lora import add_linear_lora
 -from .ops import use_sm100_kernels
-+from .ops import is_sm75_or_sm8x, use_sm12x_path, use_sm100_kernels
++from .ops import attention_sm75, is_sm75_or_sm8x, use_sm12x_path, use_sm100_kernels
  from .ops.attention import (
      _INKLING2_FA4_REL_ATTENTION_KERNEL,
      gate_sink,
@@ -652,6 +655,42 @@ index d1fdc61364..757a7b500b 100644
          out = linear(output, self.wo_ud.weight, out)
          add_linear_lora(self.wo_ud, out, output)
          return out
+@@ -615,6 +652,35 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
+         if num_decodes:
+             cu_seqlens_q = cu_seqlens_q - num_decode_tokens
+         key_cache, value_cache = self._split_kv_cache(kv_cache)
++        if attention_sm75.supports(
++            q,
++            key_cache,
++            md.max_query_len,
++            md.block_table,
++            md.seq_lens,
++            cu_seqlens_q,
++            partial=False,
++        ):
++            # HyperInkling, Turing: prefill on the fp16 tensor cores.
++            attention_sm75.rel_attention_sm75(
++                q[:nt],
++                key_cache,
++                value_cache,
++                out,
++                lse,
++                rel_logits,
++                block_table=md.block_table[num_decodes:],
++                cache_seqlens=md.seq_lens[num_decodes:],
++                cu_seqlens_q=cu_seqlens_q,
++                max_query_len=md.max_query_len,
++                softmax_scale=self.scaling,
++                window=self.sliding_window if self.is_local else 0,
++                num_splits=1,
++                mode=attention_sm75.MODE_OUT_LSE,
++            )
++            out[nt:].zero_()
++            lse[:, nt:].zero_()
++            return
+         if not use_sm100_kernels():
+             rel_attention(
+                 q[:nt],
 diff --git a/vllm/models/inkling2/nvidia/dspark.py b/vllm/models/inkling2/nvidia/dspark.py
 index 6e1755a18b..c22c7edcce 100644
 --- a/vllm/models/inkling2/nvidia/dspark.py
@@ -1701,7 +1740,7 @@ index 9c78f1fa49..c8f8ad1928 100644
  
  @triton.jit
 diff --git a/vllm/models/inkling2/nvidia/ops/attention.py b/vllm/models/inkling2/nvidia/ops/attention.py
-index c8bc213285..512458cdd1 100644
+index c8bc213285..8ee902a037 100644
 --- a/vllm/models/inkling2/nvidia/ops/attention.py
 +++ b/vllm/models/inkling2/nvidia/ops/attention.py
 @@ -20,8 +20,9 @@ from vllm.triton_utils import gl, gluon, tl, tldevice, triton
@@ -1739,24 +1778,20 @@ index c8bc213285..512458cdd1 100644
  
  
  _EX2_ASM = tl.constexpr("ex2.approx.ftz.f32 $0, $1;")
-@@ -1251,6 +1258,33 @@ def _decode_attention(
+@@ -1251,6 +1258,32 @@ def _decode_attention(
              num_splits,
              draft,
          )
-+    elif (
-+        not fuse_gate
-+        and window == 0
-+        and attention_sm75.supports(
-+            q,
-+            e4m3_arg(key_cache),
-+            max_query_len,
-+            num_splits,
-+            block_table,
-+            cache_seqlens,
-+            cu_seqlens_q,
-+        )
++    elif not fuse_gate and attention_sm75.supports(
++        q,
++        e4m3_arg(key_cache),
++        max_query_len,
++        block_table,
++        cache_seqlens,
++        cu_seqlens_q,
++        partial=True,
 +    ):
-+        # HyperInkling, Turing: the full layers on the fp16 tensor cores.
++        # HyperInkling, Turing: the split partials on the fp16 tensor cores.
 +        attention_sm75.rel_attention_sm75(
 +            q,
 +            e4m3_arg(key_cache),
@@ -1767,13 +1802,16 @@ index c8bc213285..512458cdd1 100644
 +            block_table=block_table,
 +            cache_seqlens=cache_seqlens,
 +            cu_seqlens_q=cu_seqlens_q,
++            max_query_len=max_query_len,
 +            softmax_scale=softmax_scale,
++            window=window,
 +            num_splits=num_splits,
++            mode=attention_sm75.MODE_PARTIAL,
 +        )
      else:
          rel_attention(
              q,
-@@ -1378,5 +1412,5 @@ def _launch_rel_verify(
+@@ -1378,5 +1411,5 @@ def _launch_rel_verify(
          DRAFT=draft,
          WINDOW=window,
          num_warps=4,
@@ -1782,18 +1820,19 @@ index c8bc213285..512458cdd1 100644
      )
 diff --git a/vllm/models/inkling2/nvidia/ops/attention_sm75.py b/vllm/models/inkling2/nvidia/ops/attention_sm75.py
 new file mode 100644
-index 0000000000..0d784249f0
+index 0000000000..dba458cb0a
 --- /dev/null
 +++ b/vllm/models/inkling2/nvidia/ops/attention_sm75.py
-@@ -0,0 +1,200 @@
+@@ -0,0 +1,241 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-+"""HyperInkling, Turing (sm75): the full layers' split decode/verify attention
-+on the fp16 tensor cores, a CUDA kernel outside the vLLM build.
++"""HyperInkling, Turing (sm75): relative-bias paged attention on the fp16
++tensor cores, a CUDA kernel outside the vLLM build.
 +
 +Triton emits no tensor-core MMA for sm75: `_rel_attention_kernel` runs its dots
-+as FMA through shared memory there (~43 ms a step at 90k tokens on a 2080 Ti,
-+whose KV reads take ~3 ms at the card's bandwidth). `kernels/sm75/rel_attention.cu`
++as FMA through shared memory there (on a 2080 Ti, 74% of an 8k prefill and
++~43 ms of a decode step at 90k tokens, whose KV reads take ~3 ms at the card's
++bandwidth). `kernels/sm75/rel_attention.cu`
 +of the HyperInkling repository does the same work with `wmma`;
 +`scripts/build-sm75-kernels.sh` compiles it into `venv/hyperinkling_sm75.so`,
 +which `start.sh` passes as HYPERINKLING_SM75_LIB. Without the library the
@@ -1810,9 +1849,12 @@ index 0000000000..0d784249f0
 +
 +logger = init_logger(__name__)
 +
-+ROWS = 16
++ROWS = 16  # of a warp; a block has 1 or 4 warps
++MAX_ROWS = 64
 +HEAD_DIM = 128
-+_ABI = 2
++MODE_OUT_LSE = 0
++MODE_PARTIAL = 2
++_ABI = 3
 +
 +
 +class _Args(ctypes.Structure):
@@ -1832,16 +1874,22 @@ index 0000000000..0d784249f0
 +        ("stride_kv_h", ctypes.c_int64),
 +        ("stride_rel_t", ctypes.c_int64),
 +        ("stride_bt", ctypes.c_int64),
++        ("stride_out_t", ctypes.c_int64),
++        ("stride_out_h", ctypes.c_int64),
++        ("stride_lse_h", ctypes.c_int64),
++        ("stride_lse_t", ctypes.c_int64),
 +        ("softmax_scale", ctypes.c_float),
 +        ("num_tokens", ctypes.c_int32),
 +        ("num_splits", ctypes.c_int32),
 +        ("num_kv_heads", ctypes.c_int32),
 +        ("num_heads", ctypes.c_int32),
-+        ("group", ctypes.c_int32),
++        ("group_shift", ctypes.c_int32),
 +        ("extent", ctypes.c_int32),
 +        ("page", ctypes.c_int32),
 +        ("page_shift", ctypes.c_int32),
++        ("window", ctypes.c_int32),
 +        ("draft", ctypes.c_int32),
++        ("mode", ctypes.c_int32),
 +    ]
 +
 +
@@ -1856,6 +1904,8 @@ index 0000000000..0d784249f0
 +    lib.hi_sm75_rel_attention.restype = ctypes.c_int
 +    lib.hi_sm75_rel_attention.argtypes = [
 +        ctypes.POINTER(_Args),
++        ctypes.c_int,
++        ctypes.c_int,
 +        ctypes.c_int,
 +        ctypes.c_void_p,
 +    ]
@@ -1888,20 +1938,25 @@ index 0000000000..0d784249f0
 +    q: torch.Tensor,
 +    key_cache: torch.Tensor,
 +    max_query_len: int,
-+    num_splits: int,
 +    *index: torch.Tensor,
++    partial: bool,
 +) -> bool:
 +    """Whether `rel_attention_sm75` takes this launch (else the Triton kernel):
-+    split partials of at most 16 fp16 rows over an E4M3 byte cache, with int32
-+    `index` tensors (block table, lengths)."""
++    fp16 queries over an E4M3 byte cache with int32 `index` tensors (block
++    table, lengths); split partials (`partial`) of at most 64 rows a request
++    and KV head, or the single-split output and LSE of any number of rows."""
 +    num_heads, head_dim = q.shape[1:]
 +    num_kv_heads = key_cache.shape[2]
++    group = num_heads // num_kv_heads
 +    return (
 +        available()
-+        and num_splits > 1
 +        and head_dim == HEAD_DIM
-+        and max_query_len * (num_heads // num_kv_heads) <= ROWS
++        and group & (group - 1) == 0
++        and group <= ROWS
++        and (not partial or max_query_len * group <= MAX_ROWS)
 +        and q.dtype == torch.float16
++        and q.stride(1) == head_dim
++        and q.stride(2) == 1
 +        and key_cache.dtype == torch.uint8
 +        and all(tensor.dtype == torch.int32 for tensor in index)
 +    )
@@ -1918,29 +1973,41 @@ index 0000000000..0d784249f0
 +    block_table: torch.Tensor,
 +    cache_seqlens: torch.Tensor,
 +    cu_seqlens_q: torch.Tensor,
++    max_query_len: int,
 +    softmax_scale: float,
++    window: int,
 +    num_splits: int,
++    mode: int,
 +    lib: ctypes.CDLL | None = None,
 +) -> None:
-+    """`rel_attention(..., window=0, mode=MODE_PARTIAL)` for at most 16 rows a
-+    request and KV head: fp32 `out` `(S, T, H, D)` and log2 `lse` `(S, T, H)`
-+    partials; `rel_logits` None is the DSpark draft. `lib` is for tests (a CPU
-+    build of the kernel takes CPU tensors)."""
++    """`ops.attention_sm90.rel_attention` in MODE_PARTIAL (fp32 `out`
++    `(S, T, H, D)` and log2 `lse` `(S, T, H)` partials) or MODE_OUT_LSE (fp32
++    `out` `(T, H, D)` and natural-log `lse` `(H, T)`, one split); `rel_logits`
++    None is the DSpark draft, `window` 0 a full layer. Up to 16 rows a request
++    run in one-warp blocks (decode), more in four-warp blocks of 64 rows. `lib`
++    is for tests (a CPU build of the kernel takes CPU tensors)."""
 +    lib = lib or _library()
 +    assert lib is not None
 +    num_tokens, num_heads, head_dim = q.shape
 +    page, num_kv_heads = key_cache.shape[1:3]
++    group = num_heads // num_kv_heads
 +    assert head_dim == HEAD_DIM and q.dtype == torch.float16
++    assert group & (group - 1) == 0 and group <= ROWS
 +    assert q.stride(1) == head_dim and q.stride(2) == 1
 +    assert key_cache.stride() == value_cache.stride() and key_cache.stride(3) == 1
 +    assert key_cache.element_size() == 1 and page & (page - 1) == 0
 +    # The kernel reads the cache in 32-bit words.
 +    assert key_cache.data_ptr() % 4 == 0 and value_cache.data_ptr() % 4 == 0
 +    assert all(stride % 4 == 0 for stride in key_cache.stride()[:3])
-+    assert out.is_contiguous() and lse.is_contiguous()
 +    assert out.dtype == lse.dtype == torch.float32
-+    assert out.shape == (num_splits, num_tokens, num_heads, head_dim)
-+    assert lse.shape == (num_splits, num_tokens, num_heads)
++    out_strides = (0, 0, 0, 0)
++    if mode == MODE_PARTIAL:
++        assert out.is_contiguous() and lse.is_contiguous()
++        assert out.shape == (num_splits, num_tokens, num_heads, head_dim)
++        assert lse.shape == (num_splits, num_tokens, num_heads)
++    else:
++        assert mode == MODE_OUT_LSE and num_splits == 1 and out.stride(2) == 1
++        out_strides = (out.stride(0), out.stride(1), lse.stride(0), lse.stride(1))
 +    for index in (block_table, cache_seqlens, cu_seqlens_q):
 +        assert index.dtype == torch.int32
 +    assert cache_seqlens.stride(0) == 1 and cu_seqlens_q.stride(0) == 1
@@ -1953,6 +2020,8 @@ index 0000000000..0d784249f0
 +        assert rel_logits.stride(1) == rel_logits.shape[2]
 +        assert rel_logits.stride(2) == 1
 +        rel = rel_logits
++    warps = 1 if max_query_len * group <= ROWS else MAX_ROWS // ROWS
++    tokens_per_block = warps * ROWS // group
 +    args = _Args(
 +        q=q.data_ptr(),
 +        k=key_cache.data_ptr(),
@@ -1969,20 +2038,30 @@ index 0000000000..0d784249f0
 +        stride_kv_h=key_cache.stride(2),
 +        stride_rel_t=rel.stride(0),
 +        stride_bt=block_table.stride(0),
++        stride_out_t=out_strides[0],
++        stride_out_h=out_strides[1],
++        stride_lse_h=out_strides[2],
++        stride_lse_t=out_strides[3],
 +        softmax_scale=softmax_scale,
 +        num_tokens=num_tokens,
 +        num_splits=num_splits,
 +        num_kv_heads=num_kv_heads,
 +        num_heads=num_heads,
-+        group=num_heads // num_kv_heads,
++        group_shift=group.bit_length() - 1,
 +        extent=extent,
 +        page=page,
 +        page_shift=page.bit_length() - 1,
++        window=window,
 +        draft=rel_logits is None,
++        mode=mode,
 +    )
 +    stream = torch.cuda.current_stream(q.device).cuda_stream if q.is_cuda else 0
 +    error = lib.hi_sm75_rel_attention(
-+        ctypes.byref(args), cache_seqlens.shape[0], ctypes.c_void_p(stream)
++        ctypes.byref(args),
++        cache_seqlens.shape[0],
++        -(-max_query_len // tokens_per_block),
++        warps,
++        ctypes.c_void_p(stream),
 +    )
 +    if error:
 +        raise RuntimeError(f"hi_sm75_rel_attention: CUDA error {error}")
@@ -2478,7 +2557,7 @@ index 11465fa902..152349eeea 100644
 +    bits = ((x & 0x7F) << 7) | ((x & 0x80) << 8)
 +    return bits.to(tl.uint16).to(tl.float16, bitcast=True)
 diff --git a/vllm/models/inkling2/nvidia/ops/linear.py b/vllm/models/inkling2/nvidia/ops/linear.py
-index 57aa7937d2..d9d97d06db 100644
+index 57aa7937d2..9268b74538 100644
 --- a/vllm/models/inkling2/nvidia/ops/linear.py
 +++ b/vllm/models/inkling2/nvidia/ops/linear.py
 @@ -9,7 +9,8 @@ from vllm.platforms import current_platform
@@ -2491,20 +2570,26 @@ index 57aa7937d2..d9d97d06db 100644
  from .ll_gemm_sm120 import sm12x_bf16_ll_gemm, use_sm12x_bf16_ll_gemm
  from .pdl import gdc_launch_dependents, gdc_wait
  
-@@ -214,6 +215,12 @@ def k_group_partials(
+@@ -214,6 +215,18 @@ def k_group_partials(
      assert x.is_contiguous() and weight.is_contiguous()
      tokens, hidden = x.shape
      n = weight.shape[0]
-+    if is_sm75() and 0 < tokens <= SM75_GEMV_MAX_M and hidden % 128 == 0:
-+        # HyperInkling: Turing decode (router, sconv taps) on the dot-free GEMV,
-+        # already summed (G = 1); the K-group summation order is not kept.
-+        out = torch.empty((1, tokens, n), dtype=out_dtype, device=x.device)
-+        gemv_sm75(x, weight, None, out[0], sm75_gemv_tile(tokens, n))
-+        return out
++    if is_sm75() and tokens > 0:
++        # HyperInkling: Triton emits no tensor-core MMA for Turing. Decode rows
++        # (router, sconv taps) on the dot-free GEMV, prefill on cuBLAS (the router
++        # took 97 ms per 1000 prefill tokens on `_k_group_kernel`, 2080 Ti); already
++        # summed (G = 1), the K-group summation order is not kept.
++        if tokens <= SM75_GEMV_MAX_M and hidden % 128 == 0:
++            out = torch.empty((1, tokens, n), dtype=out_dtype, device=x.device)
++            gemv_sm75(x, weight, None, out[0], sm75_gemv_tile(tokens, n))
++            return out
++        if out_dtype == x.dtype:
++            return torch.mm(x, weight.T)[None]
++        return torch.mm(x, weight.T, out_dtype=out_dtype)[None]
      sm120 = current_platform.is_device_capability_family(120)
      # SM12x and SM8x have ~100 KB of shared memory per block; SM8x has no TMA.
      small_smem = sm120 or not use_pdl()
-@@ -237,7 +244,7 @@ def k_group_partials(
+@@ -237,7 +250,7 @@ def k_group_partials(
              num_warps=4 if block_n == 64 else 8,
              num_stages=2 if sm120 else 4 if block_n == 64 else 3,
              enable_fp_fusion=False,
@@ -2513,19 +2598,6 @@ index 57aa7937d2..d9d97d06db 100644
          )
          return out
      block_m = 16 if tokens <= 128 else 64
-@@ -284,6 +291,12 @@ def linear_k_groups(
-     Each 1024-wide K group is accumulated in fp32 and the partials are summed in
-     order, as in the reference `linear`.
-     """
-+    if is_sm75() and x.shape[0] > SM75_GEMV_MAX_M:
-+        # HyperInkling: Turing prefill on cuBLAS (fp32 accumulation) instead of
-+        # the FMA-bound Triton kernel; the K-group summation order is not kept.
-+        if out_dtype == x.dtype:
-+            return torch.nn.functional.linear(x, weight)
-+        return torch.mm(x, weight.T, out_dtype=out_dtype)
-     partials = k_group_partials(x, weight, out_dtype)
-     if partials.shape[0] == 1:
-         return partials[0]
 diff --git a/vllm/models/inkling2/nvidia/ops/linear_w4.py b/vllm/models/inkling2/nvidia/ops/linear_w4.py
 new file mode 100644
 index 0000000000..8bcd77f4da

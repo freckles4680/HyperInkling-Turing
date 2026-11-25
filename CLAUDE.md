@@ -63,8 +63,8 @@ Key mechanisms of the port (spread across several files):
   checks every kernel offline (no GPU). `HYPERINKLING_FP16_CHECK=1` logs the residual
   stream's fp16 headroom. Bring-up on the card: `docs/turing-bringup.md`.
   Triton emits no tensor-core MMA for sm75 (`tl.dot` runs on FMA): decode-size linears go
-  through the dot-free GEMV (`ops/linear_w8.py`, `gemv_sm75`), and the full layers' decode
-  attention through a CUDA `wmma` kernel outside the vLLM build (`kernels/sm75/`,
+  through the dot-free GEMV (`ops/linear_w8.py`, `gemv_sm75`), and attention (prefill and
+  split decode) through a CUDA `wmma` kernel outside the vLLM build (`kernels/sm75/`,
   `scripts/build-sm75-kernels.sh` -> `venv/hyperinkling_sm75.so`, `ops/attention_sm75.py`;
   it also compiles for the CPU, `tests/test_sm75_attention.py`).
 - The small loop kernels carry the reference numerics (fixed summation orders, no FMA

@@ -80,8 +80,13 @@ T2. **Speed on the card**: Triton emits no tensor-core MMA for sm75, so every `t
     checked on the CPU against the Triton kernel. On the card its tests pass; first timing
     2.2 ms a call at 90k (85 GB/s) against Triton's 3.5-5.2 ms, decode at 90k 41 tok/s: each
     lane read its own key, 32 scattered rows a load. Now the warp reads a key row at a time
-    (one contiguous transaction), not yet timed. Prefill
-    attention is still Triton. Target: 70 tok/s at 1 request (~26 ms a step) with 90k+ context.
+    (one contiguous transaction), not yet timed. Prefill profile at 8k (668 tok/s, 1491 ms
+    of kernels per 1000 tokens): `_rel_attention_kernel` 1097, Marlin 149, the router on
+    `_k_group_kernel` 97, cuBLAS (W8 above 64 rows, dequantized) ~58, `_qr_rel_kernel` 24.
+    Since: the wmma kernel also does prefill (MODE_OUT_LSE, four-warp blocks of 64 rows
+    sharing the decoded keys, sliding-window layers) and the decode partials of local
+    layers; K-group linears above 64 rows on cuBLAS. Not yet timed. Target (prefill:
+    1000 tok/s): 70 tok/s at 1 request (~26 ms a step) with 90k+ context.
 T3. **DSpark on the card** (in code): the draft's attention runs in `block_decode_attention`
     (Triton `rel_attention` on sm75, compiled in `bench/sm75_compile.py`). Its KV write is
     vLLM's `reshape_and_cache_flash` (core op, no FlashAttention kernel), and its RMSNorms

@@ -152,9 +152,9 @@ def _w8():
 
 def _k_groups():
     linear = load("linear")
-    for t in (1, 6, 16, 48, 128, 256, 512, 2048, 4096):
+    for t in (1, 6, 16, 48):  # more rows run on cuBLAS on Turing
         for n, k in ((2304, 2304), (128, 2304), (4608, 2304)):
-            linear.k_group_partials(_r(t, k), _r(n, k))  # (Turing prefill: linear_k_groups on cuBLAS)
+            linear.k_group_partials(_r(t, k), _r(n, k))
 
 
 def _controllers():
