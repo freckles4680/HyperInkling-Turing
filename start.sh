@@ -1,6 +1,6 @@
 #!/bin/bash
 # HyperInkling: Inkling 2 Mini on one RTX 3090 / 3090 Ti (sm86), single entry point.
-# Turing (sm75, e.g. a 22 GB 2080 Ti) is being brought up: see GPU_CC below.
+# Turing (sm75, e.g. a 22 GB 2080 Ti) runs in fp16, untested on hardware: see GPU_CC below.
 #
 #   ./start.sh                      # runs in the foreground
 #   PORT=18020 KV_OFFLOAD_GB=0 ./start.sh
@@ -25,12 +25,18 @@ if [ -n "$ENV_FILE" ] && [ -f "$ENV_FILE" ]; then
 fi
 
 # The GPU's compute capability (nvidia-smi; GPU_CC=7.5 forces it). Turing (sm75: RTX 20xx,
-# 2080 Ti 22 GB mods) is being brought up: DSpark's draft KV goes through vLLM's
-# FlashAttention backend (SM80+, untested on sm75), so it is off there unless SPEC says so.
+# 2080 Ti 22 GB mods) has no bf16 tensor cores: the model runs in fp16 there
+# (HYPERINKLING_FP16=1, which also runs the fp16 path on a 3090 to compare it with bf16).
+# DSpark is not ported to fp16: off on that path.
 GPU_CC=${GPU_CC:-$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 || true)}
-if [ "$GPU_CC" = 7.5 ]; then
+[ "$GPU_CC" = 7.5 ] && export HYPERINKLING_FP16=1
+export HYPERINKLING_FP16=${HYPERINKLING_FP16:-0}
+DTYPE=auto
+if [ "$HYPERINKLING_FP16" = 1 ]; then
+	DTYPE=float16
 	SPEC=${SPEC:-off}
-	echo "Turing (sm75): work in progress, the model still runs bf16 paths; SPEC=$SPEC" >&2
+	[ "$SPEC" = off ] || { echo "SPEC=$SPEC: DSpark is not ported to fp16 yet" >&2; exit 1; }
+	echo "fp16 activations (GPU ${GPU_CC:-?}): a port of the bf16 model, check its KL" >&2
 fi
 
 MODEL=${MODEL:-$REPO/models/Inkling-2-Mini-W4A16-g128-gptq}
@@ -210,7 +216,7 @@ fi
 exec taskset -c "$CPUS" "${wrap[@]}" vllm serve "$MODEL" \
 	--served-model-name "$SERVED_NAME" $SERVED_ALIASES --host "$HOST" --port "$PORT" \
 	--max-model-len "$([ "$MAX_LEN" = auto ] && echo -1 || echo "$MAX_LEN")" --max-num-seqs "$MAX_SEQS" \
-	--max-num-batched-tokens "$NBT" --gpu-memory-utilization "$GPU_UTIL" \
+	--max-num-batched-tokens "$NBT" --gpu-memory-utilization "$GPU_UTIL" --dtype "$DTYPE" \
 	--kv-cache-dtype "$KV_DTYPE" --enable-prefix-caching \
 	--reasoning-parser inkling --enable-auto-tool-choice --tool-call-parser inkling \
 	--structured-outputs-config '{"backend":"xgrammar","disable_any_whitespace":true}' \

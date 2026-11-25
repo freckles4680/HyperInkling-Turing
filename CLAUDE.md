@@ -56,6 +56,9 @@ Key mechanisms of the port (spread across several files):
   default on): `ops/lookup.py`.
 - Images over the profiled page are scaled down in `processing.py` (`fit_to_budget`);
   `HYPERINKLING_VISION_HOST=1` streams the vision tower from host RAM per layer (`model.py`).
+- fp16 activations for Turing (`ops.use_fp16`, `ops.act_dtype`; `HYPERINKLING_FP16=1` runs
+  the same path on Ampere to compare with bf16): kernels take their dtype from their
+  pointers, so the bf16 path is the same code. DSpark is bf16 only.
 - The small loop kernels carry the reference numerics (fixed summation orders, no FMA
   contraction): any fusion must be checked bitwise against the unfused path.
 

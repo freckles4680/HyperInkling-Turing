@@ -193,9 +193,9 @@ def main():
                       check=lambda v: 8 <= v <= 96 or print("  8 to 96"))
     rows, measured_gib = pick_table(tables, gpu_gib)
     if turing:
-        print("\nTuring (sm75) is still being ported: the model runs bf16 paths that this GPU "
-              "lacks, so it may not\nboot yet. DSpark is off by default (its draft attention "
-              "needs SM80+). Speeds below are 3090 Ti numbers.")
+        print("\nTuring (sm75) runs the model in fp16 (no bf16 tensor cores): ported but not "
+              "yet run on a Turing GPU.\nDSpark is not ported to fp16, so answer no to it. "
+              "Speeds below are 3090 Ti numbers.")
     if round(gpu_gib) != measured_gib:
         print(f"\nContext below: measured at {measured_gib} GiB, scaled to {gpu_gib:g} GiB.")
     print()
@@ -234,6 +234,9 @@ def main():
           f"longest request {ctx(vision, 'dspark', True, seqs, 2048)}")
     print(f"   n) no: longest request {ctx(vision, 'off', True, seqs, 2048)}")
     spec = "dspark" if ask("   choice", "yn", "n" if turing else "y") == "y" else "off"
+    if turing and spec == "dspark":
+        print("   DSpark is not ported to fp16: start.sh refuses SPEC=dspark on Turing.")
+        spec = "off"
 
     adaptive = "n"
     if spec == "dspark":

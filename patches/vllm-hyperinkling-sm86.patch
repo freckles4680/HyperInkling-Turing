@@ -1,4 +1,4 @@
-From a974492a7b2705433bf6b967e367dee089a5b6de Mon Sep 17 00:00:00 2001
+From af03ba600406cd6176c166caa336b9314ca5054e Mon Sep 17 00:00:00 2001
 From: Pento95 <173375476+Pento95@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 05:39:42 +0100
 Subject: [PATCH] [hyperinkling] Inkling 2 Mini on Ampere (sm86)
@@ -68,12 +68,20 @@ gates PDL/TMA, e4m3 conversions and the native conv/mix kernels below SM90):
   /ping, /load, /version (auth-deny-default); stall sentinel
   (VLLM_ENGINE_STALL_SENTINEL_S, engine-stall-sentinel); continuous usage
   kept while a tool parser buffers deltas (continuous-stream-usage).
-- Turing (sm75) bring-up, not yet serving: is_sm75() / is_sm75_or_sm8x()
-  route sm75 like sm8x (SM12x Triton path, software e4m3 KV, Marlin
-  experts, Triton controller GEMVs); the quant config admits capability
-  75; the vision tower runs on per-image SDPA instead of FlashAttention 2;
-  a load-time warning says what is still bf16 (decoder, experts, Triton
-  dots; Marlin MoE is fp16-only on sm75) and that DSpark is untested.
+- Turing (sm75), not yet run on one: is_sm75() / is_sm75_or_sm8x() route
+  sm75 like sm8x (SM12x Triton path, software e4m3 KV, Marlin experts,
+  Triton controller GEMVs); the quant config admits capability 75 and
+  fp16 activations; the vision tower runs on per-image SDPA instead of
+  FlashAttention 2.
+- fp16 activations (use_fp16(): Turing, or HYPERINKLING_FP16=1 on any GPU;
+  act_dtype()): buffers, RMSNorm outputs, loop controllers, router weight,
+  vision tower and Marlin MoE activations and INT4 scales follow it; the
+  W8/W4/bgemv/SwiGLU kernels take their dtype from their pointers (the
+  bf16 path is the same code), _situ unpacks fp16 pairs, vision rounding
+  uses cvt.rn.f16.f32 (cvt.rn.bf16.f32 is SM80+); bf16 checkpoint tensors
+  are cast at load, clamped at fp16's range and logged; the sconv SWA cache
+  takes fp16. Requires --dtype float16 and no speculative decoding (DSpark
+  is bf16 only).
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
@@ -83,16 +91,18 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  .../serve/middleware/authenticate.py          |  34 ++-
  vllm/envs.py                                  |   6 +
  vllm/models/inkling/nvidia/ops/sconv.py       |  10 +-
- vllm/models/inkling/nvidia/sconv_swa_attn.py  | 141 ++++++++-
+ vllm/models/inkling/nvidia/sconv_swa_attn.py  | 147 +++++++++-
  vllm/models/inkling2/nvidia/attention.py      |  45 ++-
  vllm/models/inkling2/nvidia/dspark.py         | 164 ++++++++---
- vllm/models/inkling2/nvidia/loop.py           |  12 +
- vllm/models/inkling2/nvidia/model.py          | 100 ++++++-
- vllm/models/inkling2/nvidia/moe.py            | 108 ++++++-
- vllm/models/inkling2/nvidia/ops/__init__.py   |  36 +++
+ vllm/models/inkling2/nvidia/loop.py           |  22 +-
+ vllm/models/inkling2/nvidia/model.py          | 123 +++++++-
+ vllm/models/inkling2/nvidia/moe.py            | 110 ++++++-
+ vllm/models/inkling2/nvidia/ops/__init__.py   |  65 +++++
+ vllm/models/inkling2/nvidia/ops/activation.py |  17 +-
  vllm/models/inkling2/nvidia/ops/attention.py  |   8 +-
  .../inkling2/nvidia/ops/attention_sm90.py     |  21 +-
- vllm/models/inkling2/nvidia/ops/bgemv.py      | 180 ++++++++++++
+ vllm/models/inkling2/nvidia/ops/bgemv.py      | 183 ++++++++++++
+ vllm/models/inkling2/nvidia/ops/conv_mix.py   |   2 +-
  vllm/models/inkling2/nvidia/ops/dspark.py     |  22 +-
  vllm/models/inkling2/nvidia/ops/e4m3.py       |  10 +
  vllm/models/inkling2/nvidia/ops/linear.py     |   2 +-
@@ -100,12 +110,16 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/models/inkling2/nvidia/ops/linear_w8.py  | 139 +++++++++
  .../inkling2/nvidia/ops/ll_gemm_sm120.py      |  25 +-
  vllm/models/inkling2/nvidia/ops/lookup.py     | 233 +++++++++++++++
- vllm/models/inkling2/nvidia/ops/moe_marlin.py | 272 ++++++++++++++++++
+ vllm/models/inkling2/nvidia/ops/loop.py       |   5 +-
+ vllm/models/inkling2/nvidia/ops/moe_marlin.py | 274 ++++++++++++++++++
  vllm/models/inkling2/nvidia/ops/moe_sm120.py  |   6 +-
+ vllm/models/inkling2/nvidia/ops/moe_sm90.py   |  13 +-
  vllm/models/inkling2/nvidia/ops/sconv.py      |   3 +-
- vllm/models/inkling2/nvidia/vision.py         |  28 +-
+ vllm/models/inkling2/nvidia/ops/vision.py     |  55 ++--
+ vllm/models/inkling2/nvidia/sconv.py          |   3 +-
+ vllm/models/inkling2/nvidia/vision.py         |  46 ++-
  vllm/models/inkling2/processing.py            |  50 +++-
- vllm/models/inkling2/quant_config.py          |  18 +-
+ vllm/models/inkling2/quant_config.py          |  20 +-
  vllm/models/inkling2/speculator.py            |  24 +-
  vllm/models/inkling2/speculator_config.py     |  13 +-
  vllm/v1/core/kv_cache_manager.py              |   3 +
@@ -114,7 +128,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/v1/engine/core.py                        |  84 ++++++
  vllm/v1/spec_decode/dynamic/adaptive_k.py     | 130 +++++++++
  vllm/v1/structured_output/backend_xgrammar.py |  41 ++-
- 37 files changed, 2111 insertions(+), 121 deletions(-)
+ 43 files changed, 2251 insertions(+), 171 deletions(-)
  create mode 100644 vllm/models/inkling2/nvidia/ops/bgemv.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/linear_w4.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/linear_w8.py
@@ -287,7 +301,7 @@ index 28101ec960..d8a27b5ce0 100644
      if num_padded_tokens is None:
          num_padded_tokens = num_actual_tokens
 diff --git a/vllm/models/inkling/nvidia/sconv_swa_attn.py b/vllm/models/inkling/nvidia/sconv_swa_attn.py
-index 47285b1129..e1b0d455b9 100644
+index 47285b1129..a4c88286eb 100644
 --- a/vllm/models/inkling/nvidia/sconv_swa_attn.py
 +++ b/vllm/models/inkling/nvidia/sconv_swa_attn.py
 @@ -16,6 +16,7 @@ is padded up to the uniform attention page by `unify_kv_cache_spec_page_size`.
@@ -450,7 +464,20 @@ index 47285b1129..e1b0d455b9 100644
  @dataclass
  class InklingSconvMetadata(AttentionMetadata):
      block_table: torch.Tensor  # [num_reqs, max_blocks] physical blocks per req
-@@ -203,6 +331,11 @@ class InklingConvState(nn.Module, AttentionLayerBase):
+@@ -173,8 +301,10 @@ class InklingConvState(nn.Module, AttentionLayerBase):
+         )
+         vllm_config = get_current_vllm_config()
+         self._dtype = vllm_config.model_config.dtype
+-        assert self._dtype == torch.bfloat16, (
+-            f"sconv SWA cache supports bfloat16 only, got {self._dtype}"
++        # HyperInkling: fp16 too, for Inkling2 on Turing (its kernels follow
++        # the cache's element type).
++        assert self._dtype in (torch.bfloat16, torch.float16), (
++            f"sconv SWA cache supports bfloat16 and float16, got {self._dtype}"
+         )
+         # Register in the forward context so the runner enumerates this owner as
+         # an attention-like layer (get_kv_cache_config / get_attn_backend).
+@@ -203,6 +333,11 @@ class InklingConvState(nn.Module, AttentionLayerBase):
              head_size_v=0,  # all 4 streams packed into head_size
              dtype=self._dtype,
          )
@@ -926,20 +953,50 @@ index 6e1755a18b..021ca02d30 100644
 +            )
 +        torch.cuda.empty_cache()
 diff --git a/vllm/models/inkling2/nvidia/loop.py b/vllm/models/inkling2/nvidia/loop.py
-index bee8058353..cc984f7370 100644
+index bee8058353..8be48afe15 100644
 --- a/vllm/models/inkling2/nvidia/loop.py
 +++ b/vllm/models/inkling2/nvidia/loop.py
 @@ -26,7 +26,10 @@ from .model import (
      Inkling2ForConditionalGeneration,
      Inkling2Model,
  )
-+from .ops import is_sm75_or_sm8x
++from .ops import act_dtype, is_sm75_or_sm8x
  from .ops.attn_res import attn_res
 +from .ops.bgemv import MAX_M as BGEMV_MAX_M
 +from .ops.bgemv import controller_gemv
  from .ops.linear import linear_k_groups
  from .ops.ll_gemm_sm120 import sm12x_bf16_ll_gemm, use_sm12x_bf16_ll_gemm
  from .ops.loop import blend_rms_norm, pair_rms_norm
+@@ -57,8 +60,8 @@ class Inkling2MessageController(nn.Module):
+         """fp32 `(T, D)` `dest` and `message` -> fp32 `(T, D)`."""
+         pair = torch.stack((dest, message), dim=1)
+         pair = pair * torch.rsqrt(pair.square().mean(-1, keepdim=True) + 1e-6)
+-        normalized = pair.to(torch.bfloat16).flatten(1)
+-        hidden = linear_k_groups(normalized, self.down_weight, torch.bfloat16)
++        normalized = pair.to(act_dtype()).flatten(1)
++        hidden = linear_k_groups(normalized, self.down_weight, act_dtype())
+         gain = torch.mm(hidden, self.gain_weight.t(), out_dtype=torch.float32)
+         forget = torch.mm(hidden, self.forget_weight.t(), out_dtype=torch.float32)
+         return (1.0 - torch.tanh(forget)) * dest + torch.tanh(gain) * message
+@@ -81,15 +84,15 @@ class Inkling2LoopDecoderLayer(Inkling2DecoderLayer):
+         assert config.loop_config is not None
+         rank, width = config.loop_config["gate_rank"], config.hidden_size
+         streams = len(LOOP_STREAMS)
+-        # down (S, r, 2D) and [gain; forget] (S, 2D, r), bf16.
++        # down (S, r, 2D) and [gain; forget] (S, 2D, r), bf16 (fp16 on Turing).
+         self.register_buffer(
+             "controller_down",
+-            torch.empty(streams, rank, 2 * width, dtype=torch.bfloat16),
++            torch.empty(streams, rank, 2 * width, dtype=act_dtype()),
+             persistent=False,
+         )
+         self.register_buffer(
+             "controller_gain_forget",
+-            torch.empty(streams, 2 * width, rank, dtype=torch.bfloat16),
++            torch.empty(streams, 2 * width, rank, dtype=act_dtype()),
+             persistent=False,
+         )
+         self.controllers = nn.ModuleDict(
 @@ -122,6 +125,15 @@ class Inkling2LoopDecoderLayer(Inkling2DecoderLayer):
          broadcast over streams) and `message`, each output RMS-normalized
          with its row of `norm_weight` `(S, D)`: bf16 `(S, T, D)`."""
@@ -957,7 +1014,7 @@ index bee8058353..cc984f7370 100644
          up = self.controller_gain_forget[streams]
          if use_sm12x_bf16_ll_gemm(pair, down):
 diff --git a/vllm/models/inkling2/nvidia/model.py b/vllm/models/inkling2/nvidia/model.py
-index db9a9bc16b..a94cf86a4e 100644
+index db9a9bc16b..c3be6e3fb0 100644
 --- a/vllm/models/inkling2/nvidia/model.py
 +++ b/vllm/models/inkling2/nvidia/model.py
 @@ -25,6 +25,7 @@ from vllm.distributed import (
@@ -972,7 +1029,7 @@ index db9a9bc16b..a94cf86a4e 100644
  )
  from .lora import register as register_lora
  from .moe import Inkling2MoE, QuantFormat
-+from .ops import is_sm75
++from .ops import act_dtype, is_sm75, to_fp16_saturated, use_fp16
  from .ops.allreduce import Inkling2AllReduceWorkspace
  from .ops.attention import compute_log_scaling_tau
  from .ops.attn_res import attn_res
@@ -999,7 +1056,22 @@ index db9a9bc16b..a94cf86a4e 100644
          from vllm.model_executor.layers.linear import UnquantizedLinearMethod
          from vllm.model_executor.layers.vocab_parallel_embedding import (
              UnquantizedEmbeddingMethod,
-@@ -206,8 +219,8 @@ class Inkling2DecoderLayer(nn.Module):
+@@ -109,10 +122,13 @@ class Inkling2RMSNorm(nn.Module):
+         self,
+         hidden_size: int,
+         eps: float,
+-        out_dtype: torch.dtype | None = torch.bfloat16,
++        out_dtype: torch.dtype | None | str = "act",
+         num_inputs: int = 1,
+     ) -> None:
+         super().__init__()
++        # "act": the activation dtype (bf16, fp16 on Turing); None: fp32.
++        if out_dtype == "act":
++            out_dtype = act_dtype()
+         self.weight = nn.Parameter(
+             torch.ones(num_inputs, hidden_size), requires_grad=False
+         )
+@@ -206,8 +222,8 @@ class Inkling2DecoderLayer(nn.Module):
          )
          self.mlp_norm = Inkling2RMSNorm(config.hidden_size, eps)
          expert_format: QuantFormat = (
@@ -1010,24 +1082,49 @@ index db9a9bc16b..a94cf86a4e 100644
              else "nvfp4"
          )
          self.mlp = Inkling2MoE(config, expert_format, config.layer_visit_ids(layer_id))
-@@ -557,6 +570,16 @@ class Inkling2ForConditionalGeneration(
+@@ -557,6 +573,24 @@ class Inkling2ForConditionalGeneration(
              # The reference applies embed_norm to raw input embeddings, which
              # cannot be told apart from already-normalized ones here.
              raise ValueError("Inkling2 does not support prompt embeddings")
-+        if is_sm75():
-+            # HyperInkling: Turing bring-up. Gating, build and vision run here;
-+            # the rest is still bf16 (no bf16 tensor cores, Marlin MoE fp16-only).
++        if use_fp16():
++            # HyperInkling: fp16 activations (Turing, or HYPERINKLING_FP16=1).
++            # Every buffer and kernel follows `ops.act_dtype`, and the bf16
++            # checkpoint tensors are cast at load (saturating at 65504).
++            if vllm_config.model_config.dtype != torch.float16:
++                raise ValueError(
++                    "Inkling2 fp16 path (Turing, or HYPERINKLING_FP16=1) needs "
++                    f"--dtype float16, got {vllm_config.model_config.dtype}"
++                )
++            if vllm_config.speculative_config is not None:
++                raise ValueError(
++                    "Inkling2 fp16 path: DSpark is not ported to fp16 yet (SPEC=off)"
++                )
 +            logger.warning(
-+                "Inkling2 on Turing (sm75) is a work in progress: the decoder, "
-+                "experts and Triton kernels still assume bf16 activations "
-+                "(model dtype %s). Run with SPEC=off: DSpark's draft KV goes "
-+                "through vLLM's FlashAttention backend (SM80+), untested here.",
-+                vllm_config.model_config.dtype,
++                "Inkling2 in fp16 (%s): a port of the bf16 model, check its KL "
++                "against bf16 (bench/kl_eval.py) before trusting its outputs.",
++                "Turing" if is_sm75() else "HYPERINKLING_FP16=1",
 +            )
          self.config = config
          self.text_config = text_config = config.text_config
          self.visual = (
-@@ -811,9 +834,82 @@ class Inkling2ForConditionalGeneration(
+@@ -785,6 +819,16 @@ class Inkling2ForConditionalGeneration(
+                     continue
+                 raise ValueError(f"Unexpected checkpoint tensor: {name}")
+             param = params[name]
++            if (
++                use_fp16()
++                and weight.dtype == torch.bfloat16
++                and param.dtype == torch.float16
++            ):
++                weight, clamped = to_fp16_saturated(weight)
++                if clamped:
++                    logger.warning(
++                        "%s: %d values past fp16's range clamped", name, clamped
++                    )
+             if param.dtype != weight.dtype:
+                 if ".mlp.experts." in name and weight.dtype == torch.bfloat16:
+                     raise ValueError(
+@@ -811,9 +855,82 @@ class Inkling2ForConditionalGeneration(
                  loaded.add(name)
          if self.visual is not None:
              loaded |= {f"visual.{n}" for n in self.visual.load_weights(visual_weights)}
@@ -1099,7 +1196,7 @@ index db9a9bc16b..a94cf86a4e 100644
 +
 +            def forward(module, input_ids):
 +                ids = input_ids.long()
-+                return dequantize_int8(q[ids], scale[ids]).to(torch.bfloat16)
++                return dequantize_int8(q[ids], scale[ids]).to(act_dtype())
 +
 +            embed.forward = types.MethodType(forward, embed)
 +        if os.environ.get("HYPERINKLING_HEAD_W8") == "1":
@@ -1111,7 +1208,7 @@ index db9a9bc16b..a94cf86a4e 100644
  
  __all__ = ["Inkling2ForConditionalGeneration"]
 diff --git a/vllm/models/inkling2/nvidia/moe.py b/vllm/models/inkling2/nvidia/moe.py
-index 93fe44c4a3..2ff3772d96 100644
+index 93fe44c4a3..65226f47a4 100644
 --- a/vllm/models/inkling2/nvidia/moe.py
 +++ b/vllm/models/inkling2/nvidia/moe.py
 @@ -7,6 +7,7 @@ rank returns the full all-reduced bf16 output. Checkpoint names under
@@ -1129,7 +1226,7 @@ index 93fe44c4a3..2ff3772d96 100644
 -from vllm.platforms import current_platform
  
 -from .ops import use_sm100_kernels
-+from .ops import is_sm75_or_sm8x, use_sm12x_path, use_sm100_kernels
++from .ops import act_dtype, is_sm75_or_sm8x, use_sm12x_path, use_sm100_kernels
  from .ops.activation import swiglu_quantize
  from .ops.block_scales import shuffle_rows, swizzle_block_scales
  from .ops.moe import NUM_COUNTERS, combine, combine_push, route
@@ -1195,6 +1292,15 @@ index 93fe44c4a3..2ff3772d96 100644
  
  
  class ExpertsLoRA(Protocol):
+@@ -74,7 +125,7 @@ class Inkling2Gate(nn.Module):
+         self.topk = config.num_experts_per_tok
+         self.route_scale = config.route_scale
+         self.weight = nn.Parameter(
+-            torch.empty(num_experts, hidden, dtype=torch.bfloat16),
++            torch.empty(num_experts, hidden, dtype=act_dtype()),
+             requires_grad=False,
+         )
+         self.bias = nn.Parameter(
 @@ -102,7 +153,9 @@ class Inkling2Experts(nn.Module):
          self.topk = config.num_experts_per_tok
          self.gate_cap = config.mlp_gate_softcap
@@ -1320,10 +1426,10 @@ index 93fe44c4a3..2ff3772d96 100644
          plan = experts.plan(x.shape[0])
          routing, quantized = route(
 diff --git a/vllm/models/inkling2/nvidia/ops/__init__.py b/vllm/models/inkling2/nvidia/ops/__init__.py
-index bc0f45f003..7f5ab8e7e3 100644
+index bc0f45f003..1942522425 100644
 --- a/vllm/models/inkling2/nvidia/ops/__init__.py
 +++ b/vllm/models/inkling2/nvidia/ops/__init__.py
-@@ -39,3 +39,39 @@ def use_native_e4m3() -> bool:
+@@ -39,3 +39,68 @@ def use_native_e4m3() -> bool:
      from vllm.platforms import current_platform
  
      return current_platform.has_device_capability(89)
@@ -1359,10 +1465,77 @@ index bc0f45f003..7f5ab8e7e3 100644
 +
 +
 +@functools.cache
++def use_fp16() -> bool:
++    """Whether activations run in fp16 instead of bf16: always on Turing (no
++    bf16 tensor cores; vLLM resolves the model dtype to fp16 there), and on
++    other GPUs with HYPERINKLING_FP16=1 (start.sh then passes --dtype float16),
++    so the fp16 path can be checked against bf16 on a 3090."""
++    import os
++
++    return is_sm75() or os.environ.get("HYPERINKLING_FP16") == "1"
++
++
++def act_dtype():
++    """The activation dtype of the decoder and the vision tower."""
++    import torch
++
++    return torch.float16 if use_fp16() else torch.bfloat16
++
++
++def to_fp16_saturated(weight):
++    """A bf16 checkpoint tensor as fp16 for the fp16 path, with values past
++    fp16's range (65504) clamped instead of becoming inf. Returns the tensor
++    and how many values were clamped."""
++    import torch
++
++    wide = weight.float()
++    clamped = int((wide.abs() > 65504.0).sum())
++    return wide.clamp_(-65504.0, 65504.0).to(torch.float16), clamped
++
++
++@functools.cache
 +def is_sm75_or_sm8x() -> bool:
 +    """The HyperInkling consumer path: software e4m3 KV, Marlin experts,
 +    batched Triton GEMVs for the loop controllers."""
 +    return is_sm8x() or is_sm75()
+diff --git a/vllm/models/inkling2/nvidia/ops/activation.py b/vllm/models/inkling2/nvidia/ops/activation.py
+index 9c78f1fa49..c8f8ad1928 100644
+--- a/vllm/models/inkling2/nvidia/ops/activation.py
++++ b/vllm/models/inkling2/nvidia/ops/activation.py
+@@ -64,8 +64,9 @@ def _softcap(x, CAP: tl.constexpr):
+ 
+ @triton.jit
+ def _situ(X, row, start, gamma, N: tl.constexpr, BLOCK: tl.constexpr, GATE_CAP, UP_CAP):
+-    """fp32 values of the bf16 SiTU of columns `[start, start + BLOCK)`."""
+-    # Interleaved (gate, up) bf16 pairs as one word each, loaded so that each
++    """fp32 values of the SiTU of columns `[start, start + BLOCK)`, rounded to
++    `X`'s dtype (bf16, or fp16 on Turing)."""
++    # Interleaved (gate, up) 16-bit pairs as one word each, loaded so that each
+     # thread holds whole 16-column blocks: column 16 * b + 4 * i + j at
+     # [i, b, j].
+     i = tl.arange(0, 4)[:, None, None]
+@@ -74,12 +75,18 @@ def _situ(X, row, start, gamma, N: tl.constexpr, BLOCK: tl.constexpr, GATE_CAP,
+     cols = start + 16 * b + 4 * i + j
+     pairs = tl.load(X.to(tl.pointer_type(tl.uint32)) + row * N + cols)
+     pairs = tl.reshape(tl.permute(pairs, (1, 0, 2)), (BLOCK,))
+-    gate = (pairs << 16).to(tl.float32, bitcast=True)
+-    up = (pairs & 0xFFFF0000).to(tl.float32, bitcast=True)
++    if X.dtype.element_ty == tl.float16:
++        gate = (pairs & 0xFFFF).to(tl.uint16).to(tl.float16, bitcast=True)
++        up = (pairs >> 16).to(tl.uint16).to(tl.float16, bitcast=True)
++        gate = gate.to(tl.float32)
++        up = up.to(tl.float32)
++    else:
++        gate = (pairs << 16).to(tl.float32, bitcast=True)
++        up = (pairs & 0xFFFF0000).to(tl.float32, bitcast=True)
+     sigmoid = _sigmoid_approx(gate)
+     gate = _softcap(gate, GATE_CAP)
+     up = _softcap(up, UP_CAP)
+-    return (((gate * sigmoid) * up) * gamma).to(tl.bfloat16).to(tl.float32)
++    return (((gate * sigmoid) * up) * gamma).to(X.dtype.element_ty).to(tl.float32)
+ 
+ 
+ @triton.jit
 diff --git a/vllm/models/inkling2/nvidia/ops/attention.py b/vllm/models/inkling2/nvidia/ops/attention.py
 index c8bc213285..a1670a8cc2 100644
 --- a/vllm/models/inkling2/nvidia/ops/attention.py
@@ -1449,10 +1622,10 @@ index 3cac9b9605..9ad1cfff0e 100644
      if MODE == 0:
 diff --git a/vllm/models/inkling2/nvidia/ops/bgemv.py b/vllm/models/inkling2/nvidia/ops/bgemv.py
 new file mode 100644
-index 0000000000..849d2e8263
+index 0000000000..daa621c400
 --- /dev/null
 +++ b/vllm/models/inkling2/nvidia/ops/bgemv.py
-@@ -0,0 +1,180 @@
+@@ -0,0 +1,183 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""HyperInkling batched low-M GEMV: `out[s] = x[s] @ w[s].T` for a few
@@ -1564,8 +1737,9 @@ index 0000000000..849d2e8263
 +        (cols[None, :] < N) & (rs[:, None] < R),
 +        other=0,
 +    )
-+    # The reference rounds the rank-r hidden state to bf16 (its bmm output).
-+    acc = tl.dot(hidden.to(tl.bfloat16), w)
++    # The reference rounds the rank-r hidden state to bf16 (its bmm output;
++    # fp16 on Turing, the weights' dtype).
++    acc = tl.dot(hidden.to(W.dtype.element_ty), w)
 +    tl.store(
 +        Y + s.to(tl.int64) * SYS + rows[:, None] * SYM + cols[None, :],
 +        acc.to(Y.dtype.element_ty),
@@ -1612,9 +1786,11 @@ index 0000000000..849d2e8263
 +
 +
 +def bgemv(
-+    x: torch.Tensor, w: torch.Tensor, out_dtype: torch.dtype = torch.bfloat16
++    x: torch.Tensor, w: torch.Tensor, out_dtype: torch.dtype | None = None
 +) -> torch.Tensor:
-+    """bf16 `x (S, M, K)`, `w (S, N, K)` -> `(S, M, N)` of `out_dtype`."""
++    """bf16/fp16 `x (S, M, K)`, `w (S, N, K)` -> `(S, M, N)` of `out_dtype`
++    (default `x`'s)."""
++    out_dtype = out_dtype or x.dtype
 +    s, m, k = x.shape
 +    n = w.shape[1]
 +    assert m <= MAX_M and w.shape == (s, n, k)
@@ -1633,6 +1809,19 @@ index 0000000000..849d2e8263
 +        BN=bn, BK=bk, MP=_rows_tile(m), num_warps=4,
 +    )  # fmt: skip
 +    return out
+diff --git a/vllm/models/inkling2/nvidia/ops/conv_mix.py b/vllm/models/inkling2/nvidia/ops/conv_mix.py
+index 5899d5e99f..f43c86d88c 100644
+--- a/vllm/models/inkling2/nvidia/ops/conv_mix.py
++++ b/vllm/models/inkling2/nvidia/ops/conv_mix.py
+@@ -53,7 +53,7 @@ def conv_mix(
+     assert num_tokens > 0 and conv_out.is_contiguous()
+     assert x.shape[-2:] == (halo + num_tokens, d)
+     assert x.stride(-1) == 1 and x.stride(-2) == d
+-    assert x.dtype == torch.bfloat16
++    assert x.dtype in (torch.bfloat16, torch.float16)
+     for t in (residual, addend, last):
+         assert t is None or (t.is_contiguous() and t.shape == conv_out.shape)
+     assert residual is None or addend is not None
 diff --git a/vllm/models/inkling2/nvidia/ops/dspark.py b/vllm/models/inkling2/nvidia/ops/dspark.py
 index 293c39f635..c0f8c263f5 100644
 --- a/vllm/models/inkling2/nvidia/ops/dspark.py
@@ -1743,7 +1932,7 @@ index 57aa7937d2..4dc63f30f7 100644
      block_m = 16 if tokens <= 128 else 64
 diff --git a/vllm/models/inkling2/nvidia/ops/linear_w4.py b/vllm/models/inkling2/nvidia/ops/linear_w4.py
 new file mode 100644
-index 0000000000..884f759994
+index 0000000000..8bcd77f4da
 --- /dev/null
 +++ b/vllm/models/inkling2/nvidia/ops/linear_w4.py
 @@ -0,0 +1,210 @@
@@ -1820,8 +2009,8 @@ index 0000000000..884f759994
 +        )
 +        z = tl.load(Z + cols.to(tl.int64) * SZ + g, col_ok, other=0).to(tl.float32)
 +        s = tl.load(S + cols.to(tl.int64) * SS + g, col_ok, other=0).to(tl.float32)
-+        lo = ((b & 15).to(tl.float32) - z[None, :]).to(tl.bfloat16)
-+        hi = ((b >> 4).to(tl.float32) - z[None, :]).to(tl.bfloat16)
++        lo = ((b & 15).to(tl.float32) - z[None, :]).to(X.dtype.element_ty)
++        hi = ((b >> 4).to(tl.float32) - z[None, :]).to(X.dtype.element_ty)
 +        xk = rows[:, None].to(tl.int64) * SX + g * G + 2 * half[None, :]
 +        x_even = tl.load(X + xk, row_ok, other=0)
 +        x_odd = tl.load(X + xk + 1, row_ok, other=0)
@@ -1862,8 +2051,8 @@ index 0000000000..884f759994
 +        )
 +        z = tl.load(Z + cols.to(tl.int64) * SZ + g, col_ok, other=0).to(tl.float32)
 +        s = tl.load(S + cols.to(tl.int64) * SS + g, col_ok, other=0).to(tl.float32)
-+        lo = ((b & 15).to(tl.float32) - z[:, None]).to(tl.bfloat16)
-+        hi = ((b >> 4).to(tl.float32) - z[:, None]).to(tl.bfloat16)
++        lo = ((b & 15).to(tl.float32) - z[:, None]).to(X.dtype.element_ty)
++        hi = ((b >> 4).to(tl.float32) - z[:, None]).to(X.dtype.element_ty)
 +        x = tl.load(
 +            X + rows[:, None].to(tl.int64) * SX + g * G + ks[None, :], row_ok, other=0
 +        )
@@ -1959,7 +2148,7 @@ index 0000000000..884f759994
 +        return w4_matmul(x.contiguous(), self.packed, self.scale, self.zero, out)
 diff --git a/vllm/models/inkling2/nvidia/ops/linear_w8.py b/vllm/models/inkling2/nvidia/ops/linear_w8.py
 new file mode 100644
-index 0000000000..2da3cb057a
+index 0000000000..425880ad77
 --- /dev/null
 +++ b/vllm/models/inkling2/nvidia/ops/linear_w8.py
 @@ -0,0 +1,139 @@
@@ -2022,7 +2211,7 @@ index 0000000000..2da3cb057a
 +            other=0,
 +        )
 +        s = tl.load(S + cols.to(tl.int64) * SS + g, col_ok, other=0).to(tl.float32)
-+        acc += tl.dot(x, w.to(tl.bfloat16)) * s[None, :]
++        acc += tl.dot(x, w.to(X.dtype.element_ty)) * s[None, :]
 +    tl.store(
 +        Y + rows[:, None].to(tl.int64) * SY + cols[None, :],
 +        acc.to(Y.dtype.element_ty),
@@ -2036,7 +2225,7 @@ index 0000000000..2da3cb057a
 +    scale: torch.Tensor,
 +    out: torch.Tensor | None = None,
 +) -> torch.Tensor:
-+    """`x [M, K] bf16 @ dequant(q, scale).T` -> `[M, N]` bf16."""
++    """`x [M, K] bf16/fp16 @ dequant(q, scale).T` -> `[M, N]` of `x`'s dtype."""
 +    m, k = x.shape
 +    n = q.shape[0]
 +    assert k % GROUP == 0 and q.shape[1] == k and x.stride(1) == 1
@@ -2440,18 +2629,49 @@ index 0000000000..9103f9b745
 +                BLOCK_V=4096,
 +                num_warps=4,
 +            )
+diff --git a/vllm/models/inkling2/nvidia/ops/loop.py b/vllm/models/inkling2/nvidia/ops/loop.py
+index 3df661741e..51385aef23 100644
+--- a/vllm/models/inkling2/nvidia/ops/loop.py
++++ b/vllm/models/inkling2/nvidia/ops/loop.py
+@@ -12,6 +12,7 @@ import torch
+ 
+ from vllm.triton_utils import tl, tldevice, triton
+ 
++from . import act_dtype
+ from .norm import rsqrt
+ 
+ 
+@@ -46,7 +47,7 @@ def pair_rms_norm(dest: torch.Tensor, message: torch.Tensor) -> torch.Tensor:
+     assert dest.shape == message.shape and message.is_contiguous()
+     assert dest.stride(1) == d and dest.stride(2) == 1
+     assert dest.dtype == message.dtype == torch.float32
+-    out = message.new_empty((num_streams, num_tokens, 2 * d), dtype=torch.bfloat16)
++    out = message.new_empty((num_streams, num_tokens, 2 * d), dtype=act_dtype())
+     if num_tokens:
+         _pair_rms_norm_kernel[(num_streams, num_tokens)](
+             dest,
+@@ -111,7 +112,7 @@ def blend_rms_norm(
+     assert gain_forget.shape == (num_streams, num_tokens, 2 * d)
+     assert gain_forget.is_contiguous() and gain_forget.dtype == torch.float32
+     assert norm_weight.shape == (num_streams, d) and norm_weight.stride(1) == 1
+-    out = message.new_empty((num_streams, num_tokens, d), dtype=torch.bfloat16)
++    out = message.new_empty((num_streams, num_tokens, d), dtype=act_dtype())
+     if num_tokens:
+         _blend_rms_norm_kernel[(num_streams, num_tokens)](
+             dest,
 diff --git a/vllm/models/inkling2/nvidia/ops/moe_marlin.py b/vllm/models/inkling2/nvidia/ops/moe_marlin.py
 new file mode 100644
-index 0000000000..216edd678b
+index 0000000000..b8dd7f6851
 --- /dev/null
 +++ b/vllm/models/inkling2/nvidia/ops/moe_marlin.py
-@@ -0,0 +1,272 @@
+@@ -0,0 +1,274 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Inkling2 routed experts on Ampere (SM8x): Marlin MoE GEMMs (bf16
 +activations, weights dequantized in the kernel) in place of Hopper's Humming
 +ones. SM8x has neither FP4 nor FP8 tensor cores, so the activations stay in
-+bf16, as on Hopper.
++bf16, as on Hopper. Turing (SM75) runs the same GEMMs with fp16 activations
++(`ops.act_dtype`): vLLM builds sm75 Marlin for fp16 only.
 +
 +Weights are the checkpoint's NVFP4 / MXFP8 experts, or HyperInkling's INT4
 +(AWQ layout: asymmetric, group 128, `uint4` with zero points).
@@ -2488,6 +2708,7 @@ index 0000000000..216edd678b
 +from vllm.scalar_type import scalar_types
 +from vllm.triton_utils import tl, triton
 +
++from . import act_dtype
 +from .moe_sm90 import swiglu
 +
 +ExpertFormat = Literal["nvfp4", "mxfp8", "int4"]
@@ -2561,8 +2782,9 @@ index 0000000000..216edd678b
 +    marlin_qweight = ops.awq_marlin_moe_repack(
 +        qweight, size_k=size_k, size_n=size_n, num_bits=4
 +    )
++    # Marlin's scales are in the activation dtype (fp16 on Turing).
 +    marlin_scales = marlin_moe_permute_scales(
-+        s=scales, size_k=size_k, size_n=size_n, group_size=INT4_GROUP
++        s=scales.to(act_dtype()), size_k=size_k, size_n=size_n, group_size=INT4_GROUP
 +    )
 +    marlin_zeros = moe_awq_to_marlin_zero_points(
 +        qzeros, size_k=qzeros.shape[1], size_n=size_n, num_bits=4
@@ -2601,7 +2823,7 @@ index 0000000000..216edd678b
 +            num_experts=self.num_experts,
 +            hidden_size=hidden,
 +            intermediate_size_per_partition=inter,
-+            params_dtype=torch.bfloat16,
++            params_dtype=act_dtype(),
 +        )
 +        # Per projection: global scales (NVFP4) and zero points (INT4).
 +        g13 = g2 = z13 = z2 = None
@@ -2704,16 +2926,15 @@ index 0000000000..216edd678b
 +        # The routing weights are applied by `swiglu`, not by the GEMMs.
 +        topk_weights = weights.view(tokens, topk)
 +        n13 = 2 * self.intermediate_size
-+        gate_up = torch.empty((rows, n13), dtype=torch.bfloat16, device=x.device)
++        # bf16 on Ampere; fp16 on Turing, the only activations sm75 Marlin has.
++        gate_up = torch.empty((rows, n13), dtype=x.dtype, device=x.device)
 +        self._gemm(
 +            x, gate_up, self.w13, self.s13, self.g13, self.z13, alignment,
 +            topk_weights, block_m, topk, tokens, n13, self.hidden_size,
 +        )  # fmt: skip
 +        activated = swiglu(gate_up, weights, src2dst, gate_cap, up_cap)
 +        del gate_up
-+        down = torch.empty(
-+            (rows, self.hidden_size), dtype=torch.bfloat16, device=x.device
-+        )
++        down = torch.empty((rows, self.hidden_size), dtype=x.dtype, device=x.device)
 +        return self._gemm(
 +            activated, down, self.w2, self.s2, self.g2, self.z2, alignment,
 +            topk_weights, block_m, 1, rows, self.hidden_size, self.intermediate_size,
@@ -2750,6 +2971,46 @@ index 8a438dd37a..6b5c51a0f4 100644
          )
          return out
      assert weight.dtype == torch.uint8
+diff --git a/vllm/models/inkling2/nvidia/ops/moe_sm90.py b/vllm/models/inkling2/nvidia/ops/moe_sm90.py
+index 53417df4c3..2444bb1ba3 100644
+--- a/vllm/models/inkling2/nvidia/ops/moe_sm90.py
++++ b/vllm/models/inkling2/nvidia/ops/moe_sm90.py
+@@ -119,14 +119,17 @@ def _swiglu_kernel(
+     GATE_CAP: tl.constexpr,
+     UP_CAP: tl.constexpr,
+ ):
+-    """bf16 softcapped SwiGLU of a local row times its routing weight."""
++    """Softcapped SwiGLU of a local row times its routing weight, in `Out`'s
++    dtype (bf16, or fp16 on Turing)."""
+     row = tl.program_id(0)
+     if tl.load(Src2Dst + row) < 0:
+         return
+     start = tl.program_id(1) * BLOCK
+     gamma = tl.load(Weights + row)
+     values = _situ(GateUp, row, start, gamma, N, BLOCK, GATE_CAP, UP_CAP)
+-    tl.store(Out + row * N + start + tl.arange(0, BLOCK), values.to(tl.bfloat16))
++    tl.store(
++        Out + row * N + start + tl.arange(0, BLOCK), values.to(Out.dtype.element_ty)
++    )
+ 
+ 
+ def swiglu(
+@@ -137,12 +140,12 @@ def swiglu(
+     up_cap: float,
+ ) -> torch.Tensor:
+     """`activation.swiglu_quantize`'s SiTU of the interleaved (gate, up)
+-    columns times the routing weights, in bf16, for the local rows (the
+-    others are left unset)."""
++    columns times the routing weights, in `gate_up`'s dtype, for the local
++    rows (the others are left unset)."""
+     rows, n = gate_up.shape[0], gate_up.shape[1] // 2
+     block = 256 if n % 256 == 0 else 128
+     assert n % block == 0
+-    out = torch.empty((rows, n), dtype=torch.bfloat16, device=gate_up.device)
++    out = torch.empty((rows, n), dtype=gate_up.dtype, device=gate_up.device)
+     _swiglu_kernel[(rows, n // block)](
+         gate_up,
+         weights,
 diff --git a/vllm/models/inkling2/nvidia/ops/sconv.py b/vllm/models/inkling2/nvidia/ops/sconv.py
 index 67a3607a3e..d2df98d288 100644
 --- a/vllm/models/inkling2/nvidia/ops/sconv.py
@@ -2764,8 +3025,138 @@ index 67a3607a3e..d2df98d288 100644
  
      tap_args = (
          x_ptr,
+diff --git a/vllm/models/inkling2/nvidia/ops/vision.py b/vllm/models/inkling2/nvidia/ops/vision.py
+index 662b429a9a..6533918cfc 100644
+--- a/vllm/models/inkling2/nvidia/ops/vision.py
++++ b/vllm/models/inkling2/nvidia/ops/vision.py
+@@ -5,7 +5,8 @@
+ Rows are tokens of the packed images (a CLS row, then the native patches in
+ row-major order). Row metadata is int32 `[T, 4]`: native `(y, x)` and the
+ native grid `(height, width)`, with `y = x = -1` on CLS rows. Outputs are
+-rounded to bf16 at the same points as the eager PyTorch ops they replace.
++rounded to bf16 (fp16 on Turing) at the same points as the eager PyTorch ops
++they replace.
+ """
+ 
+ import functools
+@@ -14,6 +15,8 @@ import torch
+ 
+ from vllm.triton_utils import tl, tldevice, triton
+ 
++from . import act_dtype
++
+ 
+ @functools.cache
+ def _rope_inv_freq(head_dim: int, device: torch.device) -> torch.Tensor:
+@@ -23,16 +26,27 @@ def _rope_inv_freq(head_dim: int, device: torch.device) -> torch.Tensor:
+ 
+ 
+ @triton.jit
+-def _bf16(x):
+-    # Round to bf16 and back; inline asm keeps Triton from folding the casts.
+-    rounded = tl.inline_asm_elementwise(
+-        "cvt.rn.bf16.f32 $0, $1;",
+-        "=h,f",
+-        [x],
+-        dtype=tl.bfloat16,
+-        is_pure=True,
+-        pack=1,
+-    )
++def _round(x, DTYPE: tl.constexpr):
++    # Round to the activation dtype (bf16, or fp16 on Turing) and back; inline
++    # asm keeps Triton from folding the casts (cvt.rn.bf16.f32 needs SM80).
++    if DTYPE == tl.float16:
++        rounded = tl.inline_asm_elementwise(
++            "cvt.rn.f16.f32 $0, $1;",
++            "=h,f",
++            [x],
++            dtype=tl.float16,
++            is_pure=True,
++            pack=1,
++        )
++    else:
++        rounded = tl.inline_asm_elementwise(
++            "cvt.rn.bf16.f32 $0, $1;",
++            "=h,f",
++            [x],
++            dtype=tl.bfloat16,
++            is_pure=True,
++            pack=1,
++        )
+     return rounded.to(tl.float32)
+ 
+ 
+@@ -82,7 +96,9 @@ def _gather_patches_kernel(
+     )
+     std = tl.where(channel == 0, std0, tl.where(channel == 1, std1, std2))
+     value = tl.load(pixels_ptr + src, mask=mask).to(tl.float32)
+-    value = _bf16(tl.div_rn(tl.div_rn(value, 255.0) - mean, clip_std))
++    value = _round(
++        tl.div_rn(tl.div_rn(value, 255.0) - mean, clip_std), out_ptr.dtype.element_ty
++    )
+     value = 2.0 * (value * std + mean) - 1.0
+     tl.store(out_ptr + row * (PATCH * PATCH * 3) + feature, value, mask=mask)
+ 
+@@ -104,7 +120,9 @@ def gather_patches(
+     _, side, _, channels = pixels.shape
+     assert channels == 3 and pixels.is_contiguous()
+     features = patch_size * patch_size * 3
+-    out = pixels.new_empty((offsets.numel(), features))
++    # The processor's pixels are bf16 (0-255 and -1 are exact in it); the
++    # patches are in the activation dtype.
++    out = pixels.new_empty((offsets.numel(), features), dtype=act_dtype())
+     _gather_patches_kernel[(offsets.numel(),)](
+         pixels,
+         offsets,
+@@ -181,10 +199,12 @@ def _embed_kernel(
+         bottom = _lerp(v10.to(tl.float32), v11.to(tl.float32), wx0, wx1)
+         patch_row = tl.load(patch_rows_ptr + row).to(tl.int64)
+         hidden = tl.load(patch_ptr + patch_row * DIM + dim, mask=mask)
+-        hidden = hidden.to(tl.float32) + _bf16(_lerp(top, bottom, wy0, wy1))
+-    hidden = tl.where(mask, _bf16(hidden), 0.0)
++        hidden = hidden.to(tl.float32) + _round(
++            _lerp(top, bottom, wy0, wy1), hidden_ptr.dtype.element_ty
++        )
++    hidden = tl.where(mask, _round(hidden, hidden_ptr.dtype.element_ty), 0.0)
+     hidden = _layer_norm(hidden, pre_w_ptr, pre_b_ptr, dim, mask, DIM, eps)
+-    hidden = tl.where(mask, _bf16(hidden), 0.0)
++    hidden = tl.where(mask, _round(hidden, hidden_ptr.dtype.element_ty), 0.0)
+     tl.store(hidden_ptr + row * DIM + dim, hidden, mask=mask)
+     normed = _layer_norm(hidden, ln_w_ptr, ln_b_ptr, dim, mask, DIM, eps)
+     tl.store(normed_ptr + row * DIM + dim, normed, mask=mask)
+@@ -314,7 +334,8 @@ def _scaled_residual_norm_kernel(
+     update = tl.load(update_ptr + row * DIM + dim, mask=mask).to(tl.float32)
+     gamma = tl.load(gamma_ptr + dim, mask=mask).to(tl.float32)
+     hidden = tl.load(hidden_ptr + row * DIM + dim, mask=mask).to(tl.float32)
+-    hidden = tl.where(mask, _bf16(hidden + _bf16(update * gamma)), 0.0)
++    dtype = hidden_ptr.dtype.element_ty
++    hidden = tl.where(mask, _round(hidden + _round(update * gamma, dtype), dtype), 0.0)
+     tl.store(hidden_ptr + row * DIM + dim, hidden, mask=mask)
+     if HAS_NORM:
+         normed = _layer_norm(hidden, ln_w_ptr, ln_b_ptr, dim, mask, DIM, eps)
+diff --git a/vllm/models/inkling2/nvidia/sconv.py b/vllm/models/inkling2/nvidia/sconv.py
+index e87a03312d..3bdaea36a2 100644
+--- a/vllm/models/inkling2/nvidia/sconv.py
++++ b/vllm/models/inkling2/nvidia/sconv.py
+@@ -21,6 +21,7 @@ from vllm.models.inkling.nvidia.sconv_swa_attn import (
+     InklingSconvMetadata,
+ )
+ 
++from .ops import act_dtype
+ from .ops.allreduce import Inkling2AllReduceWorkspace, all_reduce_conv_mix
+ from .ops.conv_mix import conv_mix as fused_conv_mix
+ from .ops.linear import linear_k_groups
+@@ -268,7 +269,7 @@ class Inkling2ShortConv(nn.Module):
+         )
+         cache = torch.empty(
+             (1, owner.num_kv_heads, owner.block_size, owner.head_size),
+-            dtype=torch.bfloat16,
++            dtype=act_dtype(),
+             device=positions.device,
+         )
+         return metadata, cache, owner.block_size
 diff --git a/vllm/models/inkling2/nvidia/vision.py b/vllm/models/inkling2/nvidia/vision.py
-index a83dc50398..38ae33a261 100644
+index a83dc50398..b9c02f82b6 100644
 --- a/vllm/models/inkling2/nvidia/vision.py
 +++ b/vllm/models/inkling2/nvidia/vision.py
 @@ -17,7 +17,7 @@ import torch.nn.functional as F
@@ -2773,10 +3164,24 @@ index a83dc50398..38ae33a261 100644
  
  from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 -from vllm.models.inkling2.nvidia.ops import use_sm100_kernels
-+from vllm.models.inkling2.nvidia.ops import is_sm75, use_sm100_kernels
++from vllm.models.inkling2.nvidia.ops import act_dtype, is_sm75, use_sm100_kernels
  from vllm.models.inkling2.nvidia.ops.linear import linear_k_groups
  from vllm.models.inkling2.nvidia.ops.vision import (
      apply_rotary_qk_,
+@@ -45,11 +45,11 @@ class _SM120Linear(nn.Linear):
+ 
+ def _linear(in_features: int, out_features: int, bias: bool = True) -> nn.Linear:
+     # cuBLAS picks its kernels by row count on SM8x and SM12x.
+-    padding_invariant = any(
++    padding_invariant = is_sm75() or any(
+         current_platform.is_device_capability_family(f) for f in (80, 120)
+     )
+     cls = _SM120Linear if padding_invariant else nn.Linear
+-    return cls(in_features, out_features, bias=bias, dtype=torch.bfloat16)
++    return cls(in_features, out_features, bias=bias, dtype=act_dtype())
+ 
+ 
+ class VisionMetadata(NamedTuple):
 @@ -65,6 +65,28 @@ class VisionMetadata(NamedTuple):
      max_seqlen: int
  
@@ -2817,6 +3222,50 @@ index a83dc50398..38ae33a261 100644
          else:
              from vllm.vllm_flash_attn import flash_attn_varlen_func
  
+@@ -111,16 +137,16 @@ class Inkling2VisionMLP(nn.Module):
+ class Inkling2VisionLayerScale(nn.Module):
+     def __init__(self, width: int) -> None:
+         super().__init__()
+-        self.gamma = nn.Parameter(torch.empty(width, dtype=torch.bfloat16))
++        self.gamma = nn.Parameter(torch.empty(width, dtype=act_dtype()))
+ 
+ 
+ class Inkling2VisionLayer(nn.Module):
+     def __init__(self, config: Mapping[str, Any]) -> None:
+         super().__init__()
+         width, eps = config["hidden_size"], config["layer_norm_eps"]
+-        self.ln_1 = nn.LayerNorm(width, eps=eps, dtype=torch.bfloat16)
++        self.ln_1 = nn.LayerNorm(width, eps=eps, dtype=act_dtype())
+         self.self_attn = Inkling2VisionAttention(width, config["num_attention_heads"])
+-        self.ln_2 = nn.LayerNorm(width, eps=eps, dtype=torch.bfloat16)
++        self.ln_2 = nn.LayerNorm(width, eps=eps, dtype=act_dtype())
+         self.mlp = Inkling2VisionMLP(width, int(width * config["mlp_ratio"]))
+         self.ls_1 = Inkling2VisionLayerScale(width)
+         self.ls_2 = Inkling2VisionLayerScale(width)
+@@ -150,11 +176,11 @@ class Inkling2VisionEmbeddings(nn.Module):
+             3 * config["native_patch_size"] ** 2, width, bias=False
+         )
+         self.position_embedding = nn.Parameter(
+-            torch.empty(grid * grid, width, dtype=torch.bfloat16)
++            torch.empty(grid * grid, width, dtype=act_dtype())
+         )
+-        self.class_embedding = nn.Parameter(torch.empty(width, dtype=torch.bfloat16))
++        self.class_embedding = nn.Parameter(torch.empty(width, dtype=act_dtype()))
+         self.cls_position_embedding = nn.Parameter(
+-            torch.empty(width, dtype=torch.bfloat16)
++            torch.empty(width, dtype=act_dtype())
+         )
+ 
+ 
+@@ -163,7 +189,7 @@ class Inkling2VisionBackbone(nn.Module):
+         super().__init__()
+         self.embeddings = Inkling2VisionEmbeddings(config)
+         self.ln_pre = nn.LayerNorm(
+-            config["hidden_size"], eps=config["layer_norm_eps"], dtype=torch.bfloat16
++            config["hidden_size"], eps=config["layer_norm_eps"], dtype=act_dtype()
+         )
+         self.layers = nn.ModuleList(
+             Inkling2VisionLayer(config) for _ in range(config["num_hidden_layers"])
 diff --git a/vllm/models/inkling2/processing.py b/vllm/models/inkling2/processing.py
 index 1413a5a6d1..d1383cf419 100644
 --- a/vllm/models/inkling2/processing.py
@@ -2904,7 +3353,7 @@ index 1413a5a6d1..d1383cf419 100644
          }
  
 diff --git a/vllm/models/inkling2/quant_config.py b/vllm/models/inkling2/quant_config.py
-index af504ebc6a..caeeb23979 100644
+index af504ebc6a..64894431fd 100644
 --- a/vllm/models/inkling2/quant_config.py
 +++ b/vllm/models/inkling2/quant_config.py
 @@ -2,7 +2,8 @@
@@ -2941,13 +3390,18 @@ index af504ebc6a..caeeb23979 100644
  
      @classmethod
      def get_name(cls) -> QuantizationMethods:
-@@ -43,7 +47,9 @@ class Inkling2QuantConfig(QuantizationConfig):
+@@ -39,11 +43,13 @@ class Inkling2QuantConfig(QuantizationConfig):
+ 
+     @classmethod
+     def get_supported_act_dtypes(cls) -> list[torch.dtype]:
+-        return [torch.bfloat16]
++        # HyperInkling: fp16 for Turing (no bf16 tensor cores; `ops.use_fp16`).
++        return [torch.bfloat16, torch.float16]
  
      @classmethod
      def get_min_capability(cls) -> int:
 -        return 80
-+        # HyperInkling: Turing (sm75) is admitted so the port can be brought
-+        # up; its bf16 paths still need fp16 (see `ops.is_sm75`).
++        # HyperInkling: Turing (sm75) runs the fp16 path (`ops.use_fp16`).
 +        return 75
  
      @staticmethod

@@ -6,7 +6,7 @@ fetched with `hf download --include` only when chosen.
 
 | phase | items |
 |---|---|
-| T, Turing (sm75) | T1, T2, T3, T4 |
+| T, Turing (sm75) | T1, T2, T3, T4 (fp16 in code) |
 | 2, the checkpoint (new files on HF) | 33 |
 | 3, context (best effort) | 18, 13, 55 |
 | 4, speed and upstream | 10, 7, 21, 22, 32 |
@@ -30,16 +30,24 @@ own structure, **[NS]** ours (measurements in this repo, nsys profiles).
 
 In place: `is_sm75()` routes sm75 like sm8x, the quant config admits 7.5, the vision tower
 runs on per-image SDPA (FlashAttention 2 is SM80+), `ARCH=7.5` for `scripts/build-vllm.sh`
-and `scripts/build-image.sh`, `start.sh` turns DSpark off on 7.5, and the wizard scales the
-context to the card's memory (`--gpu-gib`, `gpu_gib` column of `docs/memory_matrix.tsv`).
-Nothing of it has run on a Turing GPU yet. What stands between it and a server:
+and `scripts/build-image.sh`, and the wizard scales the context to the card's memory
+(`--gpu-gib`, `gpu_gib` column of `docs/memory_matrix.tsv`).
 
-T1. **fp16 activations**: Turing has no bf16 tensor cores and vLLM resolves the model dtype
-    to fp16 there, while the inkling2 code hardcodes bf16 (buffers, Triton `tl.dot` inputs,
-    `.to(tl.bfloat16)` stores, the W4/W8 dequant). Needs a model-dtype switch through
-    `ops/`, then a KL check against the 3090 for overflow (softcaps, the loop's residuals).
-T2. **Marlin MoE in fp16**: vLLM builds Marlin MoE for sm75 with fp16 activations only
-    (`csrc/quantization/marlin/generate_kernels.py`), so the INT4 experts follow T1.
+**fp16 activations** (T1, T2 done in code): `ops.use_fp16()` (Turing, or
+`HYPERINKLING_FP16=1` on any GPU) and `ops.act_dtype()`; buffers, norms, controllers, the
+router, vision and Marlin's activations and INT4 scales follow it, the Triton kernels take
+the dtype from their pointers (bitwise the same code on bf16), `_situ` unpacks fp16 pairs,
+the vision rounding uses `cvt.rn.f16.f32`, and bf16 checkpoint tensors are cast at load,
+clamped at 65504 (logged). `start.sh` passes `--dtype float16` on that path and refuses
+DSpark. `tests/test_fp16.py` checks each changed kernel in fp16 (W8/W4/bgemv also ran in
+Triton's CPU interpreter). Nothing has run on a Turing GPU yet. Left:
+
+T1. **KL of fp16 against bf16** on a 3090 (`HYPERINKLING_FP16=1 SPEC=off ./start.sh`, then
+    `bench/kl_eval.py`): overflow would show in the loop's residuals or the softcaps' inputs
+    (pre-cap infinities saturate cleanly; NaNs would not). Then the same on the 2080 Ti.
+T2. **Shared memory**: Turing allows 64 KB per block against Ampere's ~100 KB; tiles tuned
+    on the 3090 (W8 prefill 64x256, 3 stages; `linear.py`'s k-group tiles) may raise
+    Triton's OutOfResources there and need smaller tiles or fewer stages.
 T3. **DSpark**: its draft KV goes through vLLM's FlashAttention backend (SM80+); with
     `HYPERINKLING_DRAFT_KV_FP8=1` the attention itself runs in `block_decode_attention`,
     so only the KV write may need a non-FA path.
