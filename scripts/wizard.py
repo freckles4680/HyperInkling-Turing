@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """HyperInkling launch wizard: a few questions, then the .env (and the command) that serves
-Inkling 2 Mini on one RTX 3090 / 3090 Ti with those choices.
+Inkling 2 Mini on one RTX 3090 / 3090 Ti (or a 22 GB 2080 Ti) with those choices.
 
     python3 scripts/wizard.py            # interactive; writes .env next to docker-compose.yml
     python3 scripts/wizard.py --print    # only print, write nothing
+    python3 scripts/wizard.py --gpu-gib 22 --compute-cap 7.5   # answer for another GPU
 
 The server fits the longest request to the GPU at boot (MAX_LEN=auto); the context shown
 for each choice comes from docs/memory_matrix.tsv, measured on an RTX 3090 Ti with nothing
-else on the GPU (bench/memory_matrix.sh), KV cache at 8 bits per value.
+else on the GPU (bench/memory_matrix.sh), KV cache at 8 bits per value. For a GPU with
+other memory (a 22 GB 2080 Ti) the rows measured at that size are used if there are any,
+else the 24 GiB ones minus the KV the missing memory would have held.
 Standard library only, so it runs wherever Python 3.9+ does (Linux, macOS, Windows).
 """
 
@@ -16,6 +19,7 @@ import csv
 import math
 import os
 import secrets
+import subprocess
 import sys
 from pathlib import Path
 
@@ -27,6 +31,8 @@ MAX_CONTEXT = 1_048_576  # the model's own limit
 KIB_PER_TOKEN = {"dspark": 18, "off": 16}
 # Decode tok/s of one request, 8k context, RTX 3090 Ti (README).
 DECODE_1 = {"dspark": 254, "off": 131}
+GPU_UTIL = 0.95  # start.sh's default --gpu-memory-utilization
+REF_GPU_GIB = 24  # the size most of docs/memory_matrix.tsv was measured at
 # Context the adaptive verify length (its CUDA graphs) and the context lookup take.
 ADAPTIVE_COST = 5_120
 CELL = 40  # px per image token side (40 px patches, 2x2 merge)
@@ -40,16 +46,48 @@ CHECKPOINTS = {
 
 
 def load_table():
-    """{(vision, spec, async, max_seqs, nbt): longest request}."""
-    rows = {}
+    """{gpu_gib: {(vision, spec, async, max_seqs, nbt): longest request}}."""
+    tables = {}
     with TABLE.open() as f:
         for r in csv.DictReader(f, delimiter="\t"):
             if r["max_len_fits"] in ("", "?"):
                 continue
             key = (r["vision"], r["spec"], r["async"] == "1", int(r["max_seqs"]),
                    int(r["nbt"]))
-            rows[key] = int(r["max_len_fits"])
-    return rows
+            gib = int(r.get("gpu_gib") or REF_GPU_GIB)
+            tables.setdefault(gib, {})[key] = int(r["max_len_fits"])
+    return tables
+
+
+def pick_table(tables, gpu_gib):
+    """(rows, measured size) for a GPU of `gpu_gib`: its own rows if measured, else the
+    reference size's (shifted later by `memory_shift`)."""
+    size = round(gpu_gib)
+    if size in tables:
+        return tables[size], size
+    ref = REF_GPU_GIB if REF_GPU_GIB in tables else max(tables)
+    return tables[ref], ref
+
+
+def memory_shift(gpu_gib, measured_gib, spec):
+    """Tokens of KV gained (negative: lost) by `gpu_gib` against rows measured at
+    `measured_gib`: the KV pool is what --gpu-memory-utilization leaves after weights and
+    activations, which do not change with the card."""
+    return int((gpu_gib - measured_gib) * GPU_UTIL * 2**20 / KIB_PER_TOKEN[spec])
+
+
+def gpu_info():
+    """(memory GiB, compute capability "7.5") of the first GPU, from nvidia-smi; Nones
+    when there is no GPU or no nvidia-smi."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total,compute_cap",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10, check=True).stdout
+        mib, cap = (v.strip() for v in out.splitlines()[0].split(","))
+        return int(mib) / 1024, cap
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return None, None
 
 
 def expected(rows, vision, spec, async_, seqs, nbt):
@@ -135,12 +173,41 @@ def fmt_tokens(n):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--print", action="store_true", help="print only, do not write .env")
+    ap.add_argument("--gpu-gib", type=float, help="GPU memory in GiB (default: nvidia-smi)")
+    ap.add_argument("--compute-cap", help="GPU compute capability, e.g. 7.5 (default: "
+                    "nvidia-smi)")
     args = ap.parse_args()
-    rows = load_table()
+    tables = load_table()
     print(__doc__.split("\n\n")[0], "\n")
 
+    found_gib, found_cap = gpu_info()
+    cap = args.compute_cap or found_cap
+    turing = cap == "7.5"
+    if args.gpu_gib:
+        gpu_gib = args.gpu_gib
+    else:
+        default = round(found_gib, 1) if found_gib else REF_GPU_GIB
+        print("GPU memory" + (f" (nvidia-smi: {found_gib:.1f} GiB)" if found_gib else
+                              ": no nvidia-smi here; a 22 GB 2080 Ti is 22"))
+        gpu_gib = ask("   GiB", default=default, cast=float,
+                      check=lambda v: 8 <= v <= 96 or print("  8 to 96"))
+    rows, measured_gib = pick_table(tables, gpu_gib)
+    if turing:
+        print("\nTuring (sm75) is still being ported: the model runs bf16 paths that this GPU "
+              "lacks, so it may not\nboot yet. DSpark is off by default (its draft attention "
+              "needs SM80+). Speeds below are 3090 Ti numbers.")
+    if round(gpu_gib) != measured_gib:
+        print(f"\nContext below: measured at {measured_gib} GiB, scaled to {gpu_gib:g} GiB.")
+    print()
+
+    def fit(vision, spec, *a):
+        n = expected(rows, vision, spec, *a)
+        if n is None:
+            return None
+        return max(0, min(MAX_CONTEXT, n + memory_shift(gpu_gib, measured_gib, spec)))
+
     def ctx(*a):
-        n = expected(rows, *a)
+        n = fit(*a)
         return fmt_tokens(n) if n else "?"
 
     print("0) Which checkpoint?")
@@ -166,7 +233,7 @@ def main():
           f"~{DECODE_1['off']} (more on code and structured output, less on free prose); "
           f"longest request {ctx(vision, 'dspark', True, seqs, 2048)}")
     print(f"   n) no: longest request {ctx(vision, 'off', True, seqs, 2048)}")
-    spec = "dspark" if ask("   choice", "yn", "y") == "y" else "off"
+    spec = "dspark" if ask("   choice", "yn", "n" if turing else "y") == "y" else "off"
 
     adaptive = "n"
     if spec == "dspark":
@@ -188,14 +255,14 @@ def main():
                      check=lambda v: 256 <= v <= 16384 or print("  256 to 16384"))
         width, height = image_size(tokens)
 
-    nbt_gain = (expected(rows, vision, spec, True, seqs, 1024) or 0) - (
-        expected(rows, vision, spec, True, seqs, 2048) or 0)
+    nbt_gain = (fit(vision, spec, True, seqs, 1024) or 0) - (
+        fit(vision, spec, True, seqs, 2048) or 0)
     print(f"\n5) Prefill chunk (NBT): 2048, or 1024 for ~{fmt_tokens(max(0, nbt_gain))} more "
           "context at ~8% slower prefill (same decode).")
     nbt = int(ask("   chunk", ("2048", "1024"), "2048"))
 
-    on = expected(rows, vision, spec, True, seqs, nbt)
-    off = expected(rows, vision, spec, False, seqs, nbt)
+    on = fit(vision, spec, True, seqs, nbt)
+    off = fit(vision, spec, False, seqs, nbt)
     gain = f"~{fmt_tokens(off - on)} more context" if on and off else "more context"
     print(f"\n6) Async scheduling (two steps in flight): +3-4% decode; off: {gain}.")
     async_ = ask("   enable", "yn", "y") == "y"
@@ -203,7 +270,10 @@ def main():
     headroom = ask("\n7) GiB of GPU memory to leave free (a display on this GPU: 1)",
                    default=0.0, cast=float, check=lambda v: 0 <= v <= 4)
 
-    longest = expected(rows, vision, spec, async_, seqs, nbt)
+    longest = fit(vision, spec, async_, seqs, nbt)
+    if longest == 0:
+        print(f"\n   Nothing fits: at {gpu_gib:g} GiB the weights and activations leave no "
+              "KV cache with these choices.")
     if longest:
         if adaptive == "n" and spec == "dspark":
             longest += ADAPTIVE_COST
@@ -242,7 +312,7 @@ def main():
         "ASYNC": int(async_),
         "NBT": nbt,
         "KV_OFFLOAD_GB": tier,
-        "GPU_UTIL": round(0.95 - headroom / 24, 3),
+        "GPU_UTIL": round(GPU_UTIL - headroom / gpu_gib, 3),
     }
     repo, local = CHECKPOINTS[checkpoint]
     if checkpoint != "original":  # compose downloads HF_REPO into models/CHECKPOINT

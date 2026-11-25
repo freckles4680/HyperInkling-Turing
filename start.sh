@@ -1,5 +1,6 @@
 #!/bin/bash
 # HyperInkling: Inkling 2 Mini on one RTX 3090 / 3090 Ti (sm86), single entry point.
+# Turing (sm75, e.g. a 22 GB 2080 Ti) is being brought up: see GPU_CC below.
 #
 #   ./start.sh                      # runs in the foreground
 #   PORT=18020 KV_OFFLOAD_GB=0 ./start.sh
@@ -21,6 +22,15 @@ if [ -n "$ENV_FILE" ] && [ -f "$ENV_FILE" ]; then
 		case "$key" in ''|'#'*|UID|GID) continue ;; esac
 		if [ -z "${!key+set}" ]; then export "$key=$value"; fi
 	done < "$ENV_FILE"
+fi
+
+# The GPU's compute capability (nvidia-smi; GPU_CC=7.5 forces it). Turing (sm75: RTX 20xx,
+# 2080 Ti 22 GB mods) is being brought up: DSpark's draft KV goes through vLLM's
+# FlashAttention backend (SM80+, untested on sm75), so it is off there unless SPEC says so.
+GPU_CC=${GPU_CC:-$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 || true)}
+if [ "$GPU_CC" = 7.5 ]; then
+	SPEC=${SPEC:-off}
+	echo "Turing (sm75): work in progress, the model still runs bf16 paths; SPEC=$SPEC" >&2
 fi
 
 MODEL=${MODEL:-$REPO/models/Inkling-2-Mini-W4A16-g128-gptq}

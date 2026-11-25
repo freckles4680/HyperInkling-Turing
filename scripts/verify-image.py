@@ -16,8 +16,10 @@ from vllm import _custom_ops as ops
 def main():
     cap = torch.cuda.get_device_capability()
     torch.manual_seed(0)
-    x = torch.randn(64, 2304, device="cuda", dtype=torch.bfloat16)
-    w = torch.randn(2304, device="cuda", dtype=torch.bfloat16)
+    # Turing (sm75) has no bf16 kernels in vLLM: check the fp16 build there.
+    dtype = torch.bfloat16 if cap >= (8, 0) else torch.float16
+    x = torch.randn(64, 2304, device="cuda", dtype=dtype)
+    w = torch.randn(2304, device="cuda", dtype=dtype)
     out = torch.full_like(x, float("nan"))
     ops.rms_norm(out, x, w, 1e-6)
     ref = (x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + 1e-6)

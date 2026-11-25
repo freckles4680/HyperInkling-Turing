@@ -1,7 +1,8 @@
-# HyperInkling: Inkling 2 Mini on one RTX 3090 / 3090 Ti, as a container.
+# HyperInkling: Inkling 2 Mini on one RTX 3090 / 3090 Ti (or Turing, in progress), as a container.
 #
-# The vLLM layer is vLLM's own docker/Dockerfile built from our patched checkout for sm86
-# only (scripts/build-image.sh does both steps); this file adds the launcher on top.
+# The vLLM layer is vLLM's own docker/Dockerfile built from our patched checkout for one
+# arch, sm86 by default (scripts/build-image.sh does both steps, ARCH=7.5 for Turing); this
+# file adds the launcher on top.
 #
 #   scripts/build-image.sh                 # ~1 h the first time, then cached
 #   docker compose up -d                   # see docker-compose.yml and scripts/wizard.py

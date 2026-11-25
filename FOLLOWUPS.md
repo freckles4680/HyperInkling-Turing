@@ -6,6 +6,7 @@ fetched with `hf download --include` only when chosen.
 
 | phase | items |
 |---|---|
+| T, Turing (sm75) | T1, T2, T3, T4 |
 | 2, the checkpoint (new files on HF) | 33 |
 | 3, context (best effort) | 18, 13, 55 |
 | 4, speed and upstream | 10, 7, 21, 22, 32 |
@@ -24,6 +25,26 @@ Where each idea comes from: **[HQ]** HyperQwen (github.com/syv-ai/HyperQwen, `pa
 **[CD]** crazydiamond-on-ampere (github.com/Mr-Moonsilver/crazydiamond-on-ampere, KV in
 host RAM), **[LC]** [llm-compressor](https://github.com/vllm-project/llm-compressor), **[IK]** the model's
 own structure, **[NS]** ours (measurements in this repo, nsys profiles).
+
+## Phase T: Turing (sm75, a 22 GB 2080 Ti)
+
+In place: `is_sm75()` routes sm75 like sm8x, the quant config admits 7.5, the vision tower
+runs on per-image SDPA (FlashAttention 2 is SM80+), `ARCH=7.5` for `scripts/build-vllm.sh`
+and `scripts/build-image.sh`, `start.sh` turns DSpark off on 7.5, and the wizard scales the
+context to the card's memory (`--gpu-gib`, `gpu_gib` column of `docs/memory_matrix.tsv`).
+Nothing of it has run on a Turing GPU yet. What stands between it and a server:
+
+T1. **fp16 activations**: Turing has no bf16 tensor cores and vLLM resolves the model dtype
+    to fp16 there, while the inkling2 code hardcodes bf16 (buffers, Triton `tl.dot` inputs,
+    `.to(tl.bfloat16)` stores, the W4/W8 dequant). Needs a model-dtype switch through
+    `ops/`, then a KL check against the 3090 for overflow (softcaps, the loop's residuals).
+T2. **Marlin MoE in fp16**: vLLM builds Marlin MoE for sm75 with fp16 activations only
+    (`csrc/quantization/marlin/generate_kernels.py`), so the INT4 experts follow T1.
+T3. **DSpark**: its draft KV goes through vLLM's FlashAttention backend (SM80+); with
+    `HYPERINKLING_DRAFT_KV_FP8=1` the attention itself runs in `block_decode_attention`,
+    so only the KV write may need a non-FA path.
+T4. **A 22 GiB memory matrix**: `bench/memory_matrix.sh` on the card replaces the scaled
+    estimate (it writes `gpu_gib`).
 
 ## Phase 2: the checkpoint
 

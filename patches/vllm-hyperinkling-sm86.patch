@@ -1,4 +1,4 @@
-From 961e6526788d947da7a71ead1305602207ae3d79 Mon Sep 17 00:00:00 2001
+From a974492a7b2705433bf6b967e367dee089a5b6de Mon Sep 17 00:00:00 2001
 From: Pento95 <173375476+Pento95@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 05:39:42 +0100
 Subject: [PATCH] [hyperinkling] Inkling 2 Mini on Ampere (sm86)
@@ -68,6 +68,12 @@ gates PDL/TMA, e4m3 conversions and the native conv/mix kernels below SM90):
   /ping, /load, /version (auth-deny-default); stall sentinel
   (VLLM_ENGINE_STALL_SENTINEL_S, engine-stall-sentinel); continuous usage
   kept while a tool parser buffers deltas (continuous-stream-usage).
+- Turing (sm75) bring-up, not yet serving: is_sm75() / is_sm75_or_sm8x()
+  route sm75 like sm8x (SM12x Triton path, software e4m3 KV, Marlin
+  experts, Triton controller GEMVs); the quant config admits capability
+  75; the vision tower runs on per-image SDPA instead of FlashAttention 2;
+  a load-time warning says what is still bf16 (decoder, experts, Triton
+  dots; Marlin MoE is fp16-only on sm75) and that DSpark is untested.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
@@ -78,12 +84,12 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/envs.py                                  |   6 +
  vllm/models/inkling/nvidia/ops/sconv.py       |  10 +-
  vllm/models/inkling/nvidia/sconv_swa_attn.py  | 141 ++++++++-
- vllm/models/inkling2/nvidia/attention.py      |  43 ++-
+ vllm/models/inkling2/nvidia/attention.py      |  45 ++-
  vllm/models/inkling2/nvidia/dspark.py         | 164 ++++++++---
  vllm/models/inkling2/nvidia/loop.py           |  12 +
- vllm/models/inkling2/nvidia/model.py          |  86 +++++-
- vllm/models/inkling2/nvidia/moe.py            | 107 ++++++-
- vllm/models/inkling2/nvidia/ops/__init__.py   |  18 ++
+ vllm/models/inkling2/nvidia/model.py          | 100 ++++++-
+ vllm/models/inkling2/nvidia/moe.py            | 108 ++++++-
+ vllm/models/inkling2/nvidia/ops/__init__.py   |  36 +++
  vllm/models/inkling2/nvidia/ops/attention.py  |   8 +-
  .../inkling2/nvidia/ops/attention_sm90.py     |  21 +-
  vllm/models/inkling2/nvidia/ops/bgemv.py      | 180 ++++++++++++
@@ -97,8 +103,9 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/models/inkling2/nvidia/ops/moe_marlin.py | 272 ++++++++++++++++++
  vllm/models/inkling2/nvidia/ops/moe_sm120.py  |   6 +-
  vllm/models/inkling2/nvidia/ops/sconv.py      |   3 +-
+ vllm/models/inkling2/nvidia/vision.py         |  28 +-
  vllm/models/inkling2/processing.py            |  50 +++-
- vllm/models/inkling2/quant_config.py          |  14 +-
+ vllm/models/inkling2/quant_config.py          |  18 +-
  vllm/models/inkling2/speculator.py            |  24 +-
  vllm/models/inkling2/speculator_config.py     |  13 +-
  vllm/v1/core/kv_cache_manager.py              |   3 +
@@ -107,7 +114,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/v1/engine/core.py                        |  84 ++++++
  vllm/v1/spec_decode/dynamic/adaptive_k.py     | 130 +++++++++
  vllm/v1/structured_output/backend_xgrammar.py |  41 ++-
- 36 files changed, 2046 insertions(+), 119 deletions(-)
+ 37 files changed, 2111 insertions(+), 121 deletions(-)
  create mode 100644 vllm/models/inkling2/nvidia/ops/bgemv.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/linear_w4.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/linear_w8.py
@@ -458,7 +465,7 @@ index 47285b1129..e1b0d455b9 100644
 +            hit_alignment_tokens=vllm_config.cache_config.block_size,
          )
 diff --git a/vllm/models/inkling2/nvidia/attention.py b/vllm/models/inkling2/nvidia/attention.py
-index d1fdc61364..3081660a9e 100644
+index d1fdc61364..757a7b500b 100644
 --- a/vllm/models/inkling2/nvidia/attention.py
 +++ b/vllm/models/inkling2/nvidia/attention.py
 @@ -3,6 +3,7 @@
@@ -482,7 +489,7 @@ index d1fdc61364..3081660a9e 100644
  from ..configs import Inkling2ModelConfig
  from .lora import add_linear_lora
 -from .ops import use_sm100_kernels
-+from .ops import is_sm8x, use_sm12x_path, use_sm100_kernels
++from .ops import is_sm75_or_sm8x, use_sm12x_path, use_sm100_kernels
  from .ops.attention import (
      _INKLING2_FA4_REL_ATTENTION_KERNEL,
      gate_sink,
@@ -538,7 +545,7 @@ index d1fdc61364..3081660a9e 100644
          # ``linear`` on the weight bypasses the layer (and a LoRA wrapper's
          # forward), so the LoRA deltas are added here (no-op without LoRA).
          weight = self.qkvr.weight
-@@ -355,12 +370,30 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
+@@ -355,12 +370,32 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
          add_linear_lora(self.qkvr, v, x_v, [5])
          return [*projected.split(self.q_side_splits, dim=-1)[:4], k, v]
  
@@ -565,12 +572,14 @@ index d1fdc61364..3081660a9e 100644
          if self.fp8_kv:
              # Every loop pass owns byte storage containing unit-scale E4M3 KV.
 -            kv_cache = kv_cache.view(torch.float8_e4m3fn)
-+            # SM8x has no FP8 type in Triton: raw bytes, `ops.e4m3`.
-+            kv_cache = kv_cache.view(torch.uint8 if is_sm8x() else torch.float8_e4m3fn)
++            # SM75/SM8x have no FP8 type in Triton: raw bytes, `ops.e4m3`.
++            kv_cache = kv_cache.view(
++                torch.uint8 if is_sm75_or_sm8x() else torch.float8_e4m3fn
++            )
          key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_dim, dim=-1)
          return (
              canonicalize_singleton_dim_strides(key_cache),
-@@ -403,6 +436,8 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
+@@ -403,6 +438,8 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
              output,
              pass_idx,
          )
@@ -917,14 +926,14 @@ index 6e1755a18b..021ca02d30 100644
 +            )
 +        torch.cuda.empty_cache()
 diff --git a/vllm/models/inkling2/nvidia/loop.py b/vllm/models/inkling2/nvidia/loop.py
-index bee8058353..daca53110a 100644
+index bee8058353..cc984f7370 100644
 --- a/vllm/models/inkling2/nvidia/loop.py
 +++ b/vllm/models/inkling2/nvidia/loop.py
 @@ -26,7 +26,10 @@ from .model import (
      Inkling2ForConditionalGeneration,
      Inkling2Model,
  )
-+from .ops import is_sm8x
++from .ops import is_sm75_or_sm8x
  from .ops.attn_res import attn_res
 +from .ops.bgemv import MAX_M as BGEMV_MAX_M
 +from .ops.bgemv import controller_gemv
@@ -935,7 +944,7 @@ index bee8058353..daca53110a 100644
          broadcast over streams) and `message`, each output RMS-normalized
          with its row of `norm_weight` `(S, D)`: bf16 `(S, T, D)`."""
          pair = pair_rms_norm(dest, message)
-+        if pair.shape[1] <= BGEMV_MAX_M and is_sm8x():
++        if pair.shape[1] <= BGEMV_MAX_M and is_sm75_or_sm8x():
 +            # HyperInkling: decode-size controllers on a batched Triton GEMV
 +            # (cuBLAS picks latency-bound wmma kernels for these shapes).
 +            gain_forget = controller_gemv(
@@ -948,10 +957,33 @@ index bee8058353..daca53110a 100644
          up = self.controller_gain_forget[streams]
          if use_sm12x_bf16_ll_gemm(pair, down):
 diff --git a/vllm/models/inkling2/nvidia/model.py b/vllm/models/inkling2/nvidia/model.py
-index db9a9bc16b..58cd3b52ab 100644
+index db9a9bc16b..a94cf86a4e 100644
 --- a/vllm/models/inkling2/nvidia/model.py
 +++ b/vllm/models/inkling2/nvidia/model.py
-@@ -82,6 +82,15 @@ class Inkling2LogitsProcessor(LogitsProcessor):
+@@ -25,6 +25,7 @@ from vllm.distributed import (
+     tensor_model_parallel_all_gather,
+     tensor_model_parallel_all_reduce,
+ )
++from vllm.logger import init_logger
+ from vllm.model_executor.layers.logits_processor import LogitsProcessor
+ from vllm.model_executor.layers.vocab_parallel_embedding import (
+     ParallelLMHead,
+@@ -68,6 +69,7 @@ from .lora import (
+ )
+ from .lora import register as register_lora
+ from .moe import Inkling2MoE, QuantFormat
++from .ops import is_sm75
+ from .ops.allreduce import Inkling2AllReduceWorkspace
+ from .ops.attention import compute_log_scaling_tau
+ from .ops.attn_res import attn_res
+@@ -77,11 +79,22 @@ from .ops.seq_parallel import SeqParallel
+ from .sconv import ATTN_STREAM, MLP_STREAM, Inkling2ShortConv, conv_metadata
+ from .vision import Inkling2VisionEncoder, VisionMetadata
+ 
++logger = init_logger(__name__)
++
+ 
+ class Inkling2LogitsProcessor(LogitsProcessor):
      """Use the low-M projection while preserving vocab gathering and softcaps."""
  
      def _apply_head(self, lm_head, hidden_states, embedding_bias):
@@ -967,7 +999,7 @@ index db9a9bc16b..58cd3b52ab 100644
          from vllm.model_executor.layers.linear import UnquantizedLinearMethod
          from vllm.model_executor.layers.vocab_parallel_embedding import (
              UnquantizedEmbeddingMethod,
-@@ -206,8 +215,8 @@ class Inkling2DecoderLayer(nn.Module):
+@@ -206,8 +219,8 @@ class Inkling2DecoderLayer(nn.Module):
          )
          self.mlp_norm = Inkling2RMSNorm(config.hidden_size, eps)
          expert_format: QuantFormat = (
@@ -978,7 +1010,24 @@ index db9a9bc16b..58cd3b52ab 100644
              else "nvfp4"
          )
          self.mlp = Inkling2MoE(config, expert_format, config.layer_visit_ids(layer_id))
-@@ -811,9 +820,82 @@ class Inkling2ForConditionalGeneration(
+@@ -557,6 +570,16 @@ class Inkling2ForConditionalGeneration(
+             # The reference applies embed_norm to raw input embeddings, which
+             # cannot be told apart from already-normalized ones here.
+             raise ValueError("Inkling2 does not support prompt embeddings")
++        if is_sm75():
++            # HyperInkling: Turing bring-up. Gating, build and vision run here;
++            # the rest is still bf16 (no bf16 tensor cores, Marlin MoE fp16-only).
++            logger.warning(
++                "Inkling2 on Turing (sm75) is a work in progress: the decoder, "
++                "experts and Triton kernels still assume bf16 activations "
++                "(model dtype %s). Run with SPEC=off: DSpark's draft KV goes "
++                "through vLLM's FlashAttention backend (SM80+), untested here.",
++                vllm_config.model_config.dtype,
++            )
+         self.config = config
+         self.text_config = text_config = config.text_config
+         self.visual = (
+@@ -811,9 +834,82 @@ class Inkling2ForConditionalGeneration(
                  loaded.add(name)
          if self.visual is not None:
              loaded |= {f"visual.{n}" for n in self.visual.load_weights(visual_weights)}
@@ -1062,7 +1111,7 @@ index db9a9bc16b..58cd3b52ab 100644
  
  __all__ = ["Inkling2ForConditionalGeneration"]
 diff --git a/vllm/models/inkling2/nvidia/moe.py b/vllm/models/inkling2/nvidia/moe.py
-index 93fe44c4a3..e96974721c 100644
+index 93fe44c4a3..2ff3772d96 100644
 --- a/vllm/models/inkling2/nvidia/moe.py
 +++ b/vllm/models/inkling2/nvidia/moe.py
 @@ -7,6 +7,7 @@ rank returns the full all-reduced bf16 output. Checkpoint names under
@@ -1080,7 +1129,7 @@ index 93fe44c4a3..e96974721c 100644
 -from vllm.platforms import current_platform
  
 -from .ops import use_sm100_kernels
-+from .ops import is_sm8x, use_sm12x_path, use_sm100_kernels
++from .ops import is_sm75_or_sm8x, use_sm12x_path, use_sm100_kernels
  from .ops.activation import swiglu_quantize
  from .ops.block_scales import shuffle_rows, swizzle_block_scales
  from .ops.moe import NUM_COUNTERS, combine, combine_push, route
@@ -1170,15 +1219,16 @@ index 93fe44c4a3..e96974721c 100644
              # Rows are shuffled and block scales swizzled (``block_scales``).
              self._register(
                  f"{name}_weight",
-@@ -148,15 +208,21 @@ class Inkling2Experts(nn.Module):
+@@ -148,15 +208,22 @@ class Inkling2Experts(nn.Module):
          )
          # Humming weights are repacked after loading.
          self.sm100 = use_sm100_kernels()
 -        self.sm120 = current_platform.is_device_capability_family(120)
 +        self.sm120 = use_sm12x_path()
-+        # HyperInkling: Ampere takes the SM12x path except for the experts,
-+        # which run Hopper's bf16-activation routing over Marlin GEMMs.
-+        self.marlin = is_sm8x()
++        # HyperInkling: Ampere and Turing take the SM12x path except for the
++        # experts, which run Hopper's bf16-activation routing over Marlin GEMMs.
++        # Turing: Marlin MoE is built for sm75 in fp16 only (not ported yet).
++        self.marlin = is_sm75_or_sm8x()
          vllm_config = get_current_vllm_config_or_none()
          self.humming_nvfp4 = (
              self.sm120
@@ -1194,7 +1244,7 @@ index 93fe44c4a3..e96974721c 100644
          if self.sm100:
              load_kernels(
                  (self.w13_weight, self.w2_weight),
-@@ -202,9 +268,19 @@ class Inkling2Experts(nn.Module):
+@@ -202,9 +269,19 @@ class Inkling2Experts(nn.Module):
          param.data.copy_(loaded)
  
      def process_weights_after_loading(self) -> None:
@@ -1215,7 +1265,7 @@ index 93fe44c4a3..e96974721c 100644
          for name in ("w13", "w2"):
              amax, denominator = self.scales(name)
              global_scale = None
-@@ -217,11 +293,12 @@ class Inkling2Experts(nn.Module):
+@@ -217,11 +294,12 @@ class Inkling2Experts(nn.Module):
                  getattr(self, f"{name}_weight_scale").data,
                  global_scale,
              )
@@ -1233,7 +1283,7 @@ index 93fe44c4a3..e96974721c 100644
          # The Humming copies replace the checkpoint layout.
          for name in ("w13", "w2"):
              for suffix in ("weight", "weight_scale"):
-@@ -274,7 +351,7 @@ class Inkling2Experts(nn.Module):
+@@ -274,7 +352,7 @@ class Inkling2Experts(nn.Module):
          Without `reduce`, returns the local expert rows and `src2dst` for
          the consumer to combine and reduce, or pushes their combine to the
          token shard owners."""
@@ -1242,7 +1292,7 @@ index 93fe44c4a3..e96974721c 100644
              src2dst, gammas, rows, tiles = routing
              gate_up = self._gemm(quantized, "w13", tiles, plan, 0)
              m = plan.max_ctas
-@@ -341,6 +418,8 @@ class Inkling2MoE(nn.Module):
+@@ -341,6 +419,8 @@ class Inkling2MoE(nn.Module):
              torch.tensor([0, config.n_routed_experts], dtype=torch.int32),
              persistent=False,
          )
@@ -1251,7 +1301,7 @@ index 93fe44c4a3..e96974721c 100644
  
      def routed_expert_ids(self, x: torch.Tensor) -> torch.Tensor:
          """Each token's top-k expert ids `[T, topk]` over all experts: the
-@@ -382,7 +461,7 @@ class Inkling2MoE(nn.Module):
+@@ -382,7 +462,7 @@ class Inkling2MoE(nn.Module):
          is_padding = None
          if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
              is_padding = get_forward_context().is_padding
@@ -1260,7 +1310,7 @@ index 93fe44c4a3..e96974721c 100644
              selected = select_experts(
                  x,
                  gate.weight,
-@@ -392,6 +471,8 @@ class Inkling2MoE(nn.Module):
+@@ -392,6 +472,8 @@ class Inkling2MoE(nn.Module):
                  experts.expert_bounds,
                  is_padding,
              )
@@ -1270,10 +1320,10 @@ index 93fe44c4a3..e96974721c 100644
          plan = experts.plan(x.shape[0])
          routing, quantized = route(
 diff --git a/vllm/models/inkling2/nvidia/ops/__init__.py b/vllm/models/inkling2/nvidia/ops/__init__.py
-index bc0f45f003..f6381104e7 100644
+index bc0f45f003..7f5ab8e7e3 100644
 --- a/vllm/models/inkling2/nvidia/ops/__init__.py
 +++ b/vllm/models/inkling2/nvidia/ops/__init__.py
-@@ -39,3 +39,21 @@ def use_native_e4m3() -> bool:
+@@ -39,3 +39,39 @@ def use_native_e4m3() -> bool:
      from vllm.platforms import current_platform
  
      return current_platform.has_device_capability(89)
@@ -1283,11 +1333,11 @@ index bc0f45f003..f6381104e7 100644
 +def use_sm12x_path() -> bool:
 +    """Whether to take the SM12x code path: Triton experts, Triton relative
 +    attention, no native conv/mix kernels. HyperInkling also routes Ampere
-+    (SM8x) here; what SM8x lacks beyond that (FP8/e2m1 hardware) is checked
-+    separately with `is_sm8x()`."""
++    (SM8x) and Turing (SM75) here; what they lack beyond that (FP8/e2m1
++    hardware) is checked separately with `is_sm75_or_sm8x()`."""
 +    from vllm.platforms import current_platform
 +
-+    return current_platform.is_device_capability_family(120) or is_sm8x()
++    return current_platform.is_device_capability_family(120) or is_sm75_or_sm8x()
 +
 +
 +@functools.cache
@@ -1295,6 +1345,24 @@ index bc0f45f003..f6381104e7 100644
 +    from vllm.platforms import current_platform
 +
 +    return current_platform.is_device_capability_family(80)
++
++
++@functools.cache
++def is_sm75() -> bool:
++    """Turing (RTX 20xx, including 22 GB 2080 Ti mods). Beyond SM8x it lacks
++    bf16 tensor cores, cp.async and FlashAttention 2: the Marlin MoE kernels
++    exist for it in fp16 only, and the vision tower runs on SDPA."""
++    from vllm.platforms import current_platform
++
++    cap = current_platform.get_device_capability()
++    return cap is not None and cap.to_int() == 75
++
++
++@functools.cache
++def is_sm75_or_sm8x() -> bool:
++    """The HyperInkling consumer path: software e4m3 KV, Marlin experts,
++    batched Triton GEMVs for the loop controllers."""
++    return is_sm8x() or is_sm75()
 diff --git a/vllm/models/inkling2/nvidia/ops/attention.py b/vllm/models/inkling2/nvidia/ops/attention.py
 index c8bc213285..a1670a8cc2 100644
 --- a/vllm/models/inkling2/nvidia/ops/attention.py
@@ -2696,6 +2764,59 @@ index 67a3607a3e..d2df98d288 100644
  
      tap_args = (
          x_ptr,
+diff --git a/vllm/models/inkling2/nvidia/vision.py b/vllm/models/inkling2/nvidia/vision.py
+index a83dc50398..38ae33a261 100644
+--- a/vllm/models/inkling2/nvidia/vision.py
++++ b/vllm/models/inkling2/nvidia/vision.py
+@@ -17,7 +17,7 @@ import torch.nn.functional as F
+ from torch import nn
+ 
+ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+-from vllm.models.inkling2.nvidia.ops import use_sm100_kernels
++from vllm.models.inkling2.nvidia.ops import is_sm75, use_sm100_kernels
+ from vllm.models.inkling2.nvidia.ops.linear import linear_k_groups
+ from vllm.models.inkling2.nvidia.ops.vision import (
+     apply_rotary_qk_,
+@@ -65,6 +65,28 @@ class VisionMetadata(NamedTuple):
+     max_seqlen: int
+ 
+ 
++def _sdpa_varlen(
++    q: torch.Tensor,
++    k: torch.Tensor,
++    v: torch.Tensor,
++    cu_seqlens: torch.Tensor,
++    scale: float,
++) -> torch.Tensor:
++    """`flash_attn_varlen_func` for non-causal `(T, H, D)` inputs on SDPA,
++    one sequence at a time (images are few per step). Reads `cu_seqlens` on
++    the host, so not for encoder CUDA graphs (`cudagraph_mm_encoder`)."""
++    out = torch.empty_like(q)
++    bounds = cu_seqlens.tolist()
++    for start, end in zip(bounds[:-1], bounds[1:]):
++        if end == start:
++            continue
++        qs, ks, vs = (t[start:end].transpose(0, 1) for t in (q, k, v))
++        out[start:end] = F.scaled_dot_product_attention(
++            qs, ks, vs, scale=scale
++        ).transpose(0, 1)
++    return out
++
++
+ class Inkling2VisionAttention(nn.Module):
+     def __init__(self, width: int, num_heads: int) -> None:
+         super().__init__()
+@@ -90,6 +112,10 @@ class Inkling2VisionAttention(nn.Module):
+             from vllm.third_party.tml_fa4 import flash_attn_varlen_func as fa4
+ 
+             out, _ = fa4(q, k, v, **kwargs)
++        elif is_sm75():
++            # HyperInkling: FlashAttention 2 needs SM80; Turing runs each
++            # image's patches through SDPA (non-causal, no cross-image keys).
++            out = _sdpa_varlen(q, k, v, metadata.cu_seqlens, self.head_dim**-0.5)
+         else:
+             from vllm.vllm_flash_attn import flash_attn_varlen_func
+ 
 diff --git a/vllm/models/inkling2/processing.py b/vllm/models/inkling2/processing.py
 index 1413a5a6d1..d1383cf419 100644
 --- a/vllm/models/inkling2/processing.py
@@ -2783,7 +2904,7 @@ index 1413a5a6d1..d1383cf419 100644
          }
  
 diff --git a/vllm/models/inkling2/quant_config.py b/vllm/models/inkling2/quant_config.py
-index af504ebc6a..c1a70321e6 100644
+index af504ebc6a..caeeb23979 100644
 --- a/vllm/models/inkling2/quant_config.py
 +++ b/vllm/models/inkling2/quant_config.py
 @@ -2,7 +2,8 @@
@@ -2820,7 +2941,18 @@ index af504ebc6a..c1a70321e6 100644
  
      @classmethod
      def get_name(cls) -> QuantizationMethods:
-@@ -76,3 +80,9 @@ class Inkling2QuantConfig(QuantizationConfig):
+@@ -43,7 +47,9 @@ class Inkling2QuantConfig(QuantizationConfig):
+ 
+     @classmethod
+     def get_min_capability(cls) -> int:
+-        return 80
++        # HyperInkling: Turing (sm75) is admitted so the port can be brought
++        # up; its bf16 paths still need fp16 (see `ops.is_sm75`).
++        return 75
+ 
+     @staticmethod
+     def get_config_filenames() -> list[str]:
+@@ -76,3 +82,9 @@ class Inkling2QuantConfig(QuantizationConfig):
      def is_mxfp8_layer(self, layer_id: int) -> bool:
          name = f"model.llm.layers.{layer_id}.mlp.experts.w13_weight"
          return name in self.mxfp8_weights
@@ -3333,5 +3465,5 @@ index d5c2ec4ecc..9d2620836e 100644
 +    tag.format = convert(tag.format)
 +    return tag
 -- 
-2.56.1
+2.43.0
 
