@@ -41,6 +41,10 @@ class Prompts:
     def __init__(self, base):
         self.base = base
         self.text = "\n\n".join(f.read_text(errors="ignore") for f in sorted(SRC.rglob("*.txt")))
+        if not self.text:  # no AA-LCR download: vLLM's own sources (code accepts more drafts)
+            print(f"no documents under {SRC}: prompts from vllm/vllm/**/*.py instead")
+            files = sorted(Path("vllm/vllm").rglob("*.py"))
+            self.text = "\n\n".join(f.read_text(errors="ignore") for f in files)
 
     def count(self, content):
         body = {"model": MODEL, "messages": [{"role": "user", "content": content}]}
@@ -124,8 +128,13 @@ def run(args):
             # The same documents every run (DSpark's acceptance depends on the text); a
             # server restart and no CPU tier keep runs from hitting each other's prefixes.
             seed = ctx * 10 + conc
-            measure(base, prompts, ctx, conc, seed + 1000, args.gen)  # warm-up, unmeasured
-            r = measure(base, prompts, ctx, conc, seed, args.gen)
+            try:
+                measure(base, prompts, ctx, conc, seed + 1000, args.gen)  # warm-up, unmeasured
+                r = measure(base, prompts, ctx, conc, seed, args.gen)
+            except Exception as e:  # noqa: BLE001 (a context the server refuses: keep the rest)
+                detail = e.read().decode(errors="ignore")[:300] if hasattr(e, "read") else ""
+                print(f"{ctx:6d} tokens x{conc}: failed: {e} {detail}", flush=True)
+                continue
             results[f"{ctx}x{conc}"] = r
             print(f"{ctx:6d} tokens x{conc}: " + ", ".join(
                 f"{k} {v:,.0f}" for k, v in r.items()), flush=True)

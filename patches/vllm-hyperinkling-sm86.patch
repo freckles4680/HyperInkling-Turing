@@ -1,4 +1,4 @@
-From eb1f6e5396f7001560ce7760520c5aa464412ae3 Mon Sep 17 00:00:00 2001
+From a7d9978776be3234da28f5f1cb3b06ee790614bc Mon Sep 17 00:00:00 2001
 From: Pento95 <173375476+Pento95@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 05:39:42 +0100
 Subject: [PATCH] [hyperinkling] Inkling 2 Mini on Ampere (sm86)
@@ -104,8 +104,8 @@ gates PDL/TMA, e4m3 conversions and the native conv/mix kernels below SM90):
   summed), and linear_k_groups above that runs on cuBLAS; the K-group
   summation order is not kept there. Its axis 2 batches and splits K
   (bgemv_sm75): the decode-size loop controllers run on it on sm75
-  (controller_gemv_sm75, the rank-R down projection in 8 K slices summed in
-  fp32).
+  (controller_gemv_sm75, the rank-R down projection in 8 K slices, which
+  the up projection sums in fp32, in order, as it loads them).
 - HYPERINKLING_FP16_CHECK=1: Inkling2LoopModel.forward logs each new record
   of the residual stream's max |value| above 4096, and any non-finite
   value, by layer and pass (fp16 headroom on Turing; run eager).
@@ -134,7 +134,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/models/inkling2/nvidia/ops/e4m3.py       |  10 +
  vllm/models/inkling2/nvidia/ops/linear.py     |  17 +-
  vllm/models/inkling2/nvidia/ops/linear_w4.py  | 210 +++++++++++++
- vllm/models/inkling2/nvidia/ops/linear_w8.py  | 284 ++++++++++++++++++
+ vllm/models/inkling2/nvidia/ops/linear_w8.py  | 289 ++++++++++++++++++
  .../inkling2/nvidia/ops/ll_gemm_sm120.py      |  25 +-
  vllm/models/inkling2/nvidia/ops/lookup.py     | 233 ++++++++++++++
  vllm/models/inkling2/nvidia/ops/loop.py       |   5 +-
@@ -152,10 +152,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/v1/core/kv_cache_manager.py              |   3 +
  vllm/v1/core/sched/scheduler.py               |  38 ++-
  vllm/v1/core/single_type_kv_cache_manager.py  |   4 +
- vllm/v1/engine/core.py                        |  84 ++++++
+ vllm/v1/engine/core.py                        |  84 +++++
  vllm/v1/spec_decode/dynamic/adaptive_k.py     | 130 ++++++++
  vllm/v1/structured_output/backend_xgrammar.py |  41 ++-
- 43 files changed, 2545 insertions(+), 192 deletions(-)
+ 43 files changed, 2550 insertions(+), 192 deletions(-)
  create mode 100644 vllm/models/inkling2/nvidia/ops/bgemv.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/linear_w4.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/linear_w8.py
@@ -2479,10 +2479,10 @@ index 0000000000..8bcd77f4da
 +        return w4_matmul(x.contiguous(), self.packed, self.scale, self.zero, out)
 diff --git a/vllm/models/inkling2/nvidia/ops/linear_w8.py b/vllm/models/inkling2/nvidia/ops/linear_w8.py
 new file mode 100644
-index 0000000000..950984eede
+index 0000000000..e1aaa136c7
 --- /dev/null
 +++ b/vllm/models/inkling2/nvidia/ops/linear_w8.py
-@@ -0,0 +1,284 @@
+@@ -0,0 +1,289 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""HyperInkling W8A16 linears: bf16 weights quantized at load time to int8
@@ -2563,9 +2563,9 @@ index 0000000000..950984eede
 +
 +@triton.jit
 +def _w8_gemv_kernel(
-+    X, W, S, Y, M, N, K, KS, SX, SW, SS, SY, BX, BW, BY,
++    X, W, S, Y, M, N, K, KS, SX, SW, SS, SY, BX, BW, BY, XP,
 +    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, GROUP_K: tl.constexpr,
-+    HAS_SCALE: tl.constexpr, SPLIT: tl.constexpr,
++    HAS_SCALE: tl.constexpr, SPLIT: tl.constexpr, NX: tl.constexpr,
 +):  # fmt: skip
 +    """Turing: Triton emits no tensor-core MMA for sm75, and `tl.dot` there runs
 +    as FMA through shared memory (~2 ms a call on a 2080 Ti). Small row counts
@@ -2574,7 +2574,8 @@ index 0000000000..950984eede
 +    elementwise, and K is reduced once at the end. Without HAS_SCALE, W is a
 +    plain bf16/fp16 weight (the K-group linears and the router). Axis 2 runs
 +    batches (strides BX, BW) times SPLIT slices of KS along K; each writes its
-+    own `[M, N]` at Y + axis 2 * BY (the loop controllers)."""
++    own `[M, N]` at Y + axis 2 * BY (the loop controllers). x is the sum, in
++    order, of NX partials XP apart (the previous call's K slices)."""
 +    pid_n = tl.program_id(0)
 +    pid_m = tl.program_id(1)
 +    pid_b = tl.program_id(2)
@@ -2597,6 +2598,8 @@ index 0000000000..950984eede
 +            s = tl.load(S + c3.to(tl.int64) * SS + k0 // GROUP_K, col_ok, other=0)
 +            w = w * s.to(tl.float32)
 +        x = tl.load(X + r3.to(tl.int64) * SX + k3, row_ok, other=0).to(tl.float32)
++        for p in tl.static_range(1, NX):
++            x += tl.load(X + p * XP + r3.to(tl.int64) * SX + k3, row_ok, other=0).to(tl.float32)
 +        acc += x * w
 +    out = tl.sum(acc, axis=2)
 +    rows2 = pid_m * BM + tl.arange(0, BM)
@@ -2637,8 +2640,8 @@ index 0000000000..950984eede
 +    _w8_gemv_kernel[grid](
 +        x, w, w if scale is None else scale, out, m, w.shape[0], k, k,
 +        x.stride(0), w.stride(0), 0 if scale is None else scale.stride(0), out.stride(0),
-+        0, 0, 0,
-+        BM=bm, BN=bn, BK=bk, GROUP_K=GROUP, HAS_SCALE=scale is not None, SPLIT=1,
++        0, 0, 0, 0,
++        BM=bm, BN=bn, BK=bk, GROUP_K=GROUP, HAS_SCALE=scale is not None, SPLIT=1, NX=1,
 +        num_warps=warps, num_stages=1,
 +    )  # fmt: skip
 +    return out
@@ -2646,11 +2649,13 @@ index 0000000000..950984eede
 +
 +def bgemv_sm75(x, w, split=1):
 +    """Batched `x (B, M, K) @ w (B, N, K).T` -> fp32 `(B, split, M, N)`, K cut
-+    in `split` slices (summed by the caller; the loop controllers' rank-R down
-+    projection has too few outputs to fill the GPU otherwise). `x` may be fp32."""
-+    b, m, k = x.shape
++    in `split` slices (the loop controllers' rank-R down projection has too few
++    outputs to fill the GPU otherwise). `x` may be fp32, or `(B, P, M, K)`
++    partials (a split call's output), summed in order as they load."""
++    x4 = x if x.ndim == 4 else x[:, None]
++    b, nx, m, k = x4.shape
 +    n = w.shape[1]
-+    assert w.shape == (b, n, k) and x.stride(2) == 1 and w.stride(2) == 1
++    assert w.shape == (b, n, k) and x4.stride(3) == 1 and w.stride(2) == 1
 +    bm, bn, bk, warps = sm75_gemv_tile(m, n)
 +    while k % bk:  # same accumulator count with a K step that divides K
 +        bk, bn = bk // 2, bn * 2
@@ -2659,8 +2664,9 @@ index 0000000000..950984eede
 +    grid = (triton.cdiv(n, bn), triton.cdiv(m, bm), b * split)
 +    _w8_gemv_kernel[grid](
 +        x, w, w, out, m, n, k, ks,
-+        x.stride(1), w.stride(1), 0, out.stride(2), x.stride(0), w.stride(0), out.stride(1),
-+        BM=bm, BN=bn, BK=bk, GROUP_K=GROUP, HAS_SCALE=False, SPLIT=split,
++        x4.stride(2), w.stride(1), 0, out.stride(2), x4.stride(0), w.stride(0), out.stride(1),
++        x4.stride(1),
++        BM=bm, BN=bn, BK=bk, GROUP_K=GROUP, HAS_SCALE=False, SPLIT=split, NX=nx,
 +        num_warps=warps, num_stages=1,
 +    )  # fmt: skip
 +    return out
@@ -2669,10 +2675,9 @@ index 0000000000..950984eede
 +def controller_gemv_sm75(x, down, up):
 +    """Turing: the loop controllers' `bmm(bmm(x, down.T), up.T)` in fp32 for
 +    decode rows (as ops.bgemv.controller_gemv, whose `tl.dot` runs on FMA
-+    through shared memory there): the down projection in 8 K slices, summed in
-+    fp32, then the up projection on the fp32 sums."""
-+    hidden = bgemv_sm75(x, down, split=8).sum(1)
-+    return bgemv_sm75(hidden, up)[:, 0]
++    through shared memory there): the down projection in 8 K slices, which the
++    up projection sums in fp32, in order, as it loads them."""
++    return bgemv_sm75(bgemv_sm75(x, down, split=8), up)[:, 0]
 +
 +
 +def w8_gemv_sm75(x, q, scale, out, tile):
