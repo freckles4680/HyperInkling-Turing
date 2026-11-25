@@ -19,7 +19,10 @@ from vllm.models.inkling2.nvidia.ops.linear_w8 import (
 )
 
 K = 2304
-SHAPES = [(m, n) for n in (1024, 2304, 4608, 201024) for m in (1, 2, 8, 16)]
+MS = (1, 2, 4, 8, 16)
+# INT8 (attention, LM head); fp16 weights (router, sconv taps, loop down projections).
+SHAPES = [("int8", m, n) for n in (1024, 2304, 4608, 201024) for m in MS]
+SHAPES += [("fp16", m, n) for n in (256, 2304) for m in MS]
 
 
 def _time(fn, reps):
@@ -38,17 +41,19 @@ def _time(fn, reps):
 
 def main():
     torch.manual_seed(0)
-    print(f"{'M':>3} {'N':>7} {'default us':>10} {'best us':>8} {'best tile':>18} "
+    print(f"{'W':>4} {'M':>3} {'N':>7} {'default us':>10} {'best us':>8} {'best tile':>18} "
           f"{'GB/s':>6} {'cuBLAS fp16 us':>14}")
-    for m, n in SHAPES:
+    for kind, m, n in SHAPES:
         q, s = quantize_int8((torch.randn(n, K, device="cuda") * 0.02).half())
+        if kind == "fp16":
+            q, s = (q.float() * 0.01).half(), None
         x = torch.randn(m, K, device="cuda").half()
         out = torch.empty(m, n, device="cuda", dtype=torch.half)
         reps = 5 if n > 100000 else 30
         default = sm75_gemv_tile(m, n)
         results = {}
         bm = min(1 << (m - 1).bit_length(), 8)
-        for bk, acc, warps in itertools.product((16, 32, 64, 128), (1024, 2048, 4096, 8192),
+        for bk, acc, warps in itertools.product((16, 32, 64, 128), (256, 512, 1024, 2048, 4096, 8192),
                                                 (1, 2, 4, 8)):
             bn = acc // (bm * bk)
             if bn < 1 or acc // (32 * warps) > 128:
@@ -63,10 +68,10 @@ def main():
             w8_gemv_sm75(x, q, s, out, default)
             results[default] = _time(lambda: w8_gemv_sm75(x, q, s, out, default), reps)
         best = min(results, key=results.get)
-        w16 = (q.float() * 0).half()  # same shape, fp16
+        w16 = q if s is None else (q.float() * 0).half()  # same shape, fp16
         cublas = _time(lambda: torch.mm(x, w16.t()), reps)
-        rate = n * K / results[best] / 1e3
-        print(f"{m:3d} {n:7d} {results[default]:10.1f} {results[best]:8.1f} "
+        rate = n * K * (2 if s is None else 1) / results[best] / 1e3
+        print(f"{kind:>4} {m:3d} {n:7d} {results[default]:10.1f} {results[best]:8.1f} "
               f"{str(best):>18} {rate:6.0f} {cublas:14.1f}")
 
 

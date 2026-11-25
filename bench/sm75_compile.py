@@ -118,8 +118,6 @@ def _setup():
         is_sm8x=lambda: False, is_sm75_or_sm8x=lambda: True, use_pdl=lambda: False,
         use_sm12x_path=lambda: True, use_sm100_kernels=lambda: False,
         use_native_e4m3=lambda: False, use_native_conv_mix=lambda: False,
-        # The Triton kernels HYPERINKLING_SM75_CUBLAS=0 keeps on Turing.
-        sm75_cublas=lambda: False,
     )
     for name, value in switches.items():
         setattr(pkg, name, value)
@@ -156,7 +154,7 @@ def _k_groups():
     linear = load("linear")
     for t in (1, 6, 16, 48, 128, 256, 512, 2048, 4096):
         for n, k in ((2304, 2304), (128, 2304), (4608, 2304)):
-            linear.linear_k_groups(_r(t, k), _r(n, k))
+            linear.k_group_partials(_r(t, k), _r(n, k))  # (Turing prefill: linear_k_groups on cuBLAS)
 
 
 def _controllers():
