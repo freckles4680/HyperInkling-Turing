@@ -1,4 +1,4 @@
-From bbca83d7f860d291bbbbb7532cb5a0142e3fcf68 Mon Sep 17 00:00:00 2001
+From eb1f6e5396f7001560ce7760520c5aa464412ae3 Mon Sep 17 00:00:00 2001
 From: Pento95 <173375476+Pento95@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 05:39:42 +0100
 Subject: [PATCH] [hyperinkling] Inkling 2 Mini on Ampere (sm86)
@@ -102,7 +102,10 @@ gates PDL/TMA, e4m3 conversions and the native conv/mix kernels below SM90):
   blocks on cuBLAS. The same kernel without scales (gemv_sm75) serves
   k_group_partials up to 64 rows on sm75 (MoE router, sconv taps, already
   summed), and linear_k_groups above that runs on cuBLAS; the K-group
-  summation order is not kept there.
+  summation order is not kept there. Its axis 2 batches and splits K
+  (bgemv_sm75): the decode-size loop controllers run on it on sm75
+  (controller_gemv_sm75, the rank-R down projection in 8 K slices summed in
+  fp32).
 - HYPERINKLING_FP16_CHECK=1: Inkling2LoopModel.forward logs each new record
   of the residual stream's max |value| above 4096, and any non-finite
   value, by layer and pass (fp16 headroom on Turing; run eager).
@@ -115,34 +118,34 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  .../serve/middleware/authenticate.py          |  34 ++-
  vllm/envs.py                                  |   6 +
  vllm/models/inkling/nvidia/ops/sconv.py       |  10 +-
- vllm/models/inkling/nvidia/sconv_swa_attn.py  | 147 +++++++++-
+ vllm/models/inkling/nvidia/sconv_swa_attn.py  | 147 ++++++++-
  vllm/models/inkling2/nvidia/attention.py      |  45 ++-
- vllm/models/inkling2/nvidia/dspark.py         | 197 ++++++++++---
- vllm/models/inkling2/nvidia/loop.py           |  52 +++-
+ vllm/models/inkling2/nvidia/dspark.py         | 197 +++++++++---
+ vllm/models/inkling2/nvidia/loop.py           |  54 +++-
  vllm/models/inkling2/nvidia/model.py          | 119 +++++++-
  vllm/models/inkling2/nvidia/moe.py            | 110 ++++++-
  vllm/models/inkling2/nvidia/ops/__init__.py   |  72 +++++
  vllm/models/inkling2/nvidia/ops/activation.py |  17 +-
  vllm/models/inkling2/nvidia/ops/attention.py  |   8 +-
  .../inkling2/nvidia/ops/attention_sm90.py     |  37 ++-
- vllm/models/inkling2/nvidia/ops/bgemv.py      | 183 ++++++++++++
+ vllm/models/inkling2/nvidia/ops/bgemv.py      | 183 +++++++++++
  vllm/models/inkling2/nvidia/ops/conv_mix.py   |   2 +-
  vllm/models/inkling2/nvidia/ops/dspark.py     |  87 ++++--
  vllm/models/inkling2/nvidia/ops/e4m3.py       |  10 +
  vllm/models/inkling2/nvidia/ops/linear.py     |  17 +-
- vllm/models/inkling2/nvidia/ops/linear_w4.py  | 210 ++++++++++++++
- vllm/models/inkling2/nvidia/ops/linear_w8.py  | 244 ++++++++++++++++
+ vllm/models/inkling2/nvidia/ops/linear_w4.py  | 210 +++++++++++++
+ vllm/models/inkling2/nvidia/ops/linear_w8.py  | 284 ++++++++++++++++++
  .../inkling2/nvidia/ops/ll_gemm_sm120.py      |  25 +-
- vllm/models/inkling2/nvidia/ops/lookup.py     | 233 +++++++++++++++
+ vllm/models/inkling2/nvidia/ops/lookup.py     | 233 ++++++++++++++
  vllm/models/inkling2/nvidia/ops/loop.py       |   5 +-
- vllm/models/inkling2/nvidia/ops/moe_marlin.py | 274 ++++++++++++++++++
+ vllm/models/inkling2/nvidia/ops/moe_marlin.py | 274 +++++++++++++++++
  vllm/models/inkling2/nvidia/ops/moe_sm120.py  |   6 +-
  vllm/models/inkling2/nvidia/ops/moe_sm90.py   |  13 +-
  vllm/models/inkling2/nvidia/ops/sconv.py      |   3 +-
  vllm/models/inkling2/nvidia/ops/vision.py     |  55 ++--
  vllm/models/inkling2/nvidia/sconv.py          |   3 +-
  vllm/models/inkling2/nvidia/vision.py         |  46 ++-
- vllm/models/inkling2/processing.py            |  50 +++-
+ vllm/models/inkling2/processing.py            |  50 ++-
  vllm/models/inkling2/quant_config.py          |  20 +-
  vllm/models/inkling2/speculator.py            |  24 +-
  vllm/models/inkling2/speculator_config.py     |  19 +-
@@ -150,9 +153,9 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/v1/core/sched/scheduler.py               |  38 ++-
  vllm/v1/core/single_type_kv_cache_manager.py  |   4 +
  vllm/v1/engine/core.py                        |  84 ++++++
- vllm/v1/spec_decode/dynamic/adaptive_k.py     | 130 +++++++++
+ vllm/v1/spec_decode/dynamic/adaptive_k.py     | 130 ++++++++
  vllm/v1/structured_output/backend_xgrammar.py |  41 ++-
- 43 files changed, 2503 insertions(+), 192 deletions(-)
+ 43 files changed, 2545 insertions(+), 192 deletions(-)
  create mode 100644 vllm/models/inkling2/nvidia/ops/bgemv.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/linear_w4.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/linear_w8.py
@@ -1044,7 +1047,7 @@ index 6e1755a18b..c22c7edcce 100644
 +            )
 +        torch.cuda.empty_cache()
 diff --git a/vllm/models/inkling2/nvidia/loop.py b/vllm/models/inkling2/nvidia/loop.py
-index bee8058353..59e8eeb07d 100644
+index bee8058353..ca9563bbd4 100644
 --- a/vllm/models/inkling2/nvidia/loop.py
 +++ b/vllm/models/inkling2/nvidia/loop.py
 @@ -12,12 +12,15 @@ controller. Each sublayer's short conv runs fused with the next AttnRes mix
@@ -1063,15 +1066,16 @@ index bee8058353..59e8eeb07d 100644
  
  from ..configs import Inkling2ModelConfig
  from ..quant_config import Inkling2QuantConfig
-@@ -26,12 +29,40 @@ from .model import (
+@@ -26,12 +29,41 @@ from .model import (
      Inkling2ForConditionalGeneration,
      Inkling2Model,
  )
-+from .ops import act_dtype, is_sm75_or_sm8x
++from .ops import act_dtype, is_sm75, is_sm75_or_sm8x
  from .ops.attn_res import attn_res
 +from .ops.bgemv import MAX_M as BGEMV_MAX_M
 +from .ops.bgemv import controller_gemv
  from .ops.linear import linear_k_groups
++from .ops.linear_w8 import controller_gemv_sm75
  from .ops.ll_gemm_sm120 import sm12x_bf16_ll_gemm, use_sm12x_bf16_ll_gemm
  from .ops.loop import blend_rms_norm, pair_rms_norm
  from .sconv import conv_metadata
@@ -1104,7 +1108,7 @@ index bee8058353..59e8eeb07d 100644
  LOOP_STREAMS = ("attn", "k", "v", "mlp")
  
  
-@@ -57,8 +88,8 @@ class Inkling2MessageController(nn.Module):
+@@ -57,8 +89,8 @@ class Inkling2MessageController(nn.Module):
          """fp32 `(T, D)` `dest` and `message` -> fp32 `(T, D)`."""
          pair = torch.stack((dest, message), dim=1)
          pair = pair * torch.rsqrt(pair.square().mean(-1, keepdim=True) + 1e-6)
@@ -1115,7 +1119,7 @@ index bee8058353..59e8eeb07d 100644
          gain = torch.mm(hidden, self.gain_weight.t(), out_dtype=torch.float32)
          forget = torch.mm(hidden, self.forget_weight.t(), out_dtype=torch.float32)
          return (1.0 - torch.tanh(forget)) * dest + torch.tanh(gain) * message
-@@ -81,15 +112,15 @@ class Inkling2LoopDecoderLayer(Inkling2DecoderLayer):
+@@ -81,15 +113,15 @@ class Inkling2LoopDecoderLayer(Inkling2DecoderLayer):
          assert config.loop_config is not None
          rank, width = config.loop_config["gate_rank"], config.hidden_size
          streams = len(LOOP_STREAMS)
@@ -1134,14 +1138,15 @@ index bee8058353..59e8eeb07d 100644
              persistent=False,
          )
          self.controllers = nn.ModuleDict(
-@@ -122,6 +153,15 @@ class Inkling2LoopDecoderLayer(Inkling2DecoderLayer):
+@@ -122,6 +154,16 @@ class Inkling2LoopDecoderLayer(Inkling2DecoderLayer):
          broadcast over streams) and `message`, each output RMS-normalized
          with its row of `norm_weight` `(S, D)`: bf16 `(S, T, D)`."""
          pair = pair_rms_norm(dest, message)
 +        if pair.shape[1] <= BGEMV_MAX_M and is_sm75_or_sm8x():
 +            # HyperInkling: decode-size controllers on a batched Triton GEMV
 +            # (cuBLAS picks latency-bound wmma kernels for these shapes).
-+            gain_forget = controller_gemv(
++            gemv = controller_gemv_sm75 if is_sm75() else controller_gemv
++            gain_forget = gemv(
 +                pair,
 +                self.controller_down[streams],
 +                self.controller_gain_forget[streams],
@@ -1150,7 +1155,7 @@ index bee8058353..59e8eeb07d 100644
          down = self.controller_down[streams]
          up = self.controller_gain_forget[streams]
          if use_sm12x_bf16_ll_gemm(pair, down):
-@@ -394,6 +434,8 @@ class Inkling2LoopModel(Inkling2Model):
+@@ -394,6 +436,8 @@ class Inkling2LoopModel(Inkling2Model):
                  tau,
                  plan,
              )
@@ -2474,10 +2479,10 @@ index 0000000000..8bcd77f4da
 +        return w4_matmul(x.contiguous(), self.packed, self.scale, self.zero, out)
 diff --git a/vllm/models/inkling2/nvidia/ops/linear_w8.py b/vllm/models/inkling2/nvidia/ops/linear_w8.py
 new file mode 100644
-index 0000000000..522b16b25b
+index 0000000000..950984eede
 --- /dev/null
 +++ b/vllm/models/inkling2/nvidia/ops/linear_w8.py
-@@ -0,0 +1,244 @@
+@@ -0,0 +1,284 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""HyperInkling W8A16 linears: bf16 weights quantized at load time to int8
@@ -2558,18 +2563,26 @@ index 0000000000..522b16b25b
 +
 +@triton.jit
 +def _w8_gemv_kernel(
-+    X, W, S, Y, M, N, K, SX, SW, SS, SY,
++    X, W, S, Y, M, N, K, KS, SX, SW, SS, SY, BX, BW, BY,
 +    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, GROUP_K: tl.constexpr,
-+    HAS_SCALE: tl.constexpr,
++    HAS_SCALE: tl.constexpr, SPLIT: tl.constexpr,
 +):  # fmt: skip
 +    """Turing: Triton emits no tensor-core MMA for sm75, and `tl.dot` there runs
 +    as FMA through shared memory (~2 ms a call on a 2080 Ti). Small row counts
 +    as plain FMAs instead: x and the scaled weight are loaded straight into a
 +    3D `[BM, BN, BK]` layout (no layout conversion), products accumulate
 +    elementwise, and K is reduced once at the end. Without HAS_SCALE, W is a
-+    plain bf16/fp16 weight (the K-group linears and the router)."""
++    plain bf16/fp16 weight (the K-group linears and the router). Axis 2 runs
++    batches (strides BX, BW) times SPLIT slices of KS along K; each writes its
++    own `[M, N]` at Y + axis 2 * BY (the loop controllers)."""
 +    pid_n = tl.program_id(0)
 +    pid_m = tl.program_id(1)
++    pid_b = tl.program_id(2)
++    X += (pid_b // SPLIT).to(tl.int64) * BX
++    W += (pid_b // SPLIT).to(tl.int64) * BW
++    Y += pid_b.to(tl.int64) * BY
++    k_lo = (pid_b % SPLIT) * KS
++    k_hi = tl.minimum(k_lo + KS, K)
 +    rows = pid_m * BM + tl.arange(0, BM)
 +    cols = pid_n * BN + tl.arange(0, BN)
 +    r3 = rows[:, None, None]
@@ -2577,7 +2590,7 @@ index 0000000000..522b16b25b
 +    row_ok = r3 < M
 +    col_ok = c3 < N
 +    acc = tl.zeros((BM, BN, BK), tl.float32)
-+    for k0 in range(0, K, BK):
++    for k0 in range(k_lo, k_hi, BK):
 +        k3 = k0 + tl.arange(0, BK)[None, None, :]
 +        w = tl.load(W + c3.to(tl.int64) * SW + k3, col_ok, other=0).to(tl.float32)
 +        if HAS_SCALE:
@@ -2620,14 +2633,46 @@ index 0000000000..522b16b25b
 +    m, k = x.shape
 +    bm, bn, bk, warps = tile
 +    assert k % bk == 0 and x.stride(1) == 1 and w.stride(1) == 1
-+    grid = (triton.cdiv(w.shape[0], bn), triton.cdiv(m, bm))
++    grid = (triton.cdiv(w.shape[0], bn), triton.cdiv(m, bm), 1)
 +    _w8_gemv_kernel[grid](
-+        x, w, w if scale is None else scale, out, m, w.shape[0], k,
++        x, w, w if scale is None else scale, out, m, w.shape[0], k, k,
 +        x.stride(0), w.stride(0), 0 if scale is None else scale.stride(0), out.stride(0),
-+        BM=bm, BN=bn, BK=bk, GROUP_K=GROUP, HAS_SCALE=scale is not None,
++        0, 0, 0,
++        BM=bm, BN=bn, BK=bk, GROUP_K=GROUP, HAS_SCALE=scale is not None, SPLIT=1,
 +        num_warps=warps, num_stages=1,
 +    )  # fmt: skip
 +    return out
++
++
++def bgemv_sm75(x, w, split=1):
++    """Batched `x (B, M, K) @ w (B, N, K).T` -> fp32 `(B, split, M, N)`, K cut
++    in `split` slices (summed by the caller; the loop controllers' rank-R down
++    projection has too few outputs to fill the GPU otherwise). `x` may be fp32."""
++    b, m, k = x.shape
++    n = w.shape[1]
++    assert w.shape == (b, n, k) and x.stride(2) == 1 and w.stride(2) == 1
++    bm, bn, bk, warps = sm75_gemv_tile(m, n)
++    while k % bk:  # same accumulator count with a K step that divides K
++        bk, bn = bk // 2, bn * 2
++    ks = triton.cdiv(triton.cdiv(k, split), bk) * bk
++    out = torch.empty((b, split, m, n), dtype=torch.float32, device=x.device)
++    grid = (triton.cdiv(n, bn), triton.cdiv(m, bm), b * split)
++    _w8_gemv_kernel[grid](
++        x, w, w, out, m, n, k, ks,
++        x.stride(1), w.stride(1), 0, out.stride(2), x.stride(0), w.stride(0), out.stride(1),
++        BM=bm, BN=bn, BK=bk, GROUP_K=GROUP, HAS_SCALE=False, SPLIT=split,
++        num_warps=warps, num_stages=1,
++    )  # fmt: skip
++    return out
++
++
++def controller_gemv_sm75(x, down, up):
++    """Turing: the loop controllers' `bmm(bmm(x, down.T), up.T)` in fp32 for
++    decode rows (as ops.bgemv.controller_gemv, whose `tl.dot` runs on FMA
++    through shared memory there): the down projection in 8 K slices, summed in
++    fp32, then the up projection on the fp32 sums."""
++    hidden = bgemv_sm75(x, down, split=8).sum(1)
++    return bgemv_sm75(hidden, up)[:, 0]
 +
 +
 +def w8_gemv_sm75(x, q, scale, out, tile):

@@ -158,10 +158,11 @@ def _k_groups():
 
 
 def _controllers():
-    bgemv = load("bgemv")
+    bgemv, w8 = load("bgemv"), load("linear_w8")
     for t in (1, 6, 16, 32, 64):
         down, up, pair = _r(3, 64, 2 * HID), _r(3, 2 * HID, 64), _r(3, t, 2 * HID)
         bgemv.controller_gemv(pair, down, up)
+        w8.controller_gemv_sm75(pair, down, up)
         bgemv.bgemv(bgemv.bgemv(pair, down), up, torch.float32)
 
 

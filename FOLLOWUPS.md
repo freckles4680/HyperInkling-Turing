@@ -65,7 +65,10 @@ T2. **Speed on the card**: Triton emits no tensor-core MMA for sm75, so every `t
     controllers' few rows (181 us a call); the 2.8 ms `_k_group_kernel` is the MoE router.
     `bench/sm75_w8_gemv.py` found tiles 2-4x faster (565 GB/s on the LM head), now
     `sm75_gemv_tile`'s; the controllers are back on Triton, and the router and the other
-    decode-size K-group linears run on the same GEMV with fp16 weights. Target: 70 tok/s at 1 request (~26 ms a step) with 90k+ context.
+    decode-size K-group linears run on the same GEMV with fp16 weights. Fifth: 32.7 ms,
+    58.4 tok/s; W8 GEMV 10.6 ms (149 calls with the router), Marlin 10.0, the controllers
+    2.7, the fp16 Markov fold on cuBLAS 1.4 (7 x 202 us). Since: the controllers on the
+    GEMV (batched, the down projection in 8 K slices), the fold in INT8 on Turing. Target: 70 tok/s at 1 request (~26 ms a step) with 90k+ context.
 T3. **DSpark on the card** (in code): the draft's attention runs in `block_decode_attention`
     (Triton `rel_attention` on sm75, compiled in `bench/sm75_compile.py`). Its KV write is
     vLLM's `reshape_and_cache_flash` (core op, no FlashAttention kernel), and its RMSNorms
