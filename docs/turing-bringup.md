@@ -32,7 +32,9 @@ scripts/setup-vllm.sh                 # vllm/ at patches/BASE + the patch
 ARCH=7.5 scripts/build-vllm.sh        # into venv/, sm75 only (30-60 min); CUDA_HOME=... for a side toolkit
 ```
 
-The last line prints the GPU's capability, which should be `(7, 5)`. If the build fails,
+The last line prints the GPU's capability, which should be `(7, 5)`. The build records its
+CUDA toolkit in `venv/cuda_home`, and `start.sh` serves with that toolkit. FlashInfer
+compiles kernels with `nvcc` at the first boot, and a CUDA 12 `nvcc` fails there. If the build fails,
 send the first `error:` lines.
 
 ## 2. Kernel tests on the card (no checkpoint)

@@ -3,6 +3,7 @@
 #   scripts/build-vllm.sh             # sm86 (RTX 3090 / 3090 Ti)
 #   ARCH=7.5 scripts/build-vllm.sh    # sm75 (Turing: RTX 20xx, 2080 Ti 22 GB mods)
 #   CUDA_HOME=/opt/cuda-13.2 ...      # a CUDA 13 toolkit kept beside the system one
+#                                     # (recorded in venv/cuda_home; start.sh uses it)
 # Everything goes into ./venv (uv, its own Python); the host's Python, CUDA toolkit
 # and PATH are not changed.
 set -euo pipefail
@@ -30,4 +31,6 @@ if command -v gcc-15 > /dev/null && command -v g++-15 > /dev/null; then
 	export CC=gcc-15 CXX=g++-15 CUDAHOSTCXX=g++-15 NVCC_CCBIN=g++-15
 fi
 uv pip install -e . --no-build-isolation -v
+# start.sh serves with the same toolkit (FlashInfer's JIT kernels compile at the first boot).
+echo "$CUDA_HOME" > ../venv/cuda_home
 python -c "import vllm, torch; print('vllm', vllm.__version__, 'torch', torch.__version__, torch.cuda.get_device_capability())"

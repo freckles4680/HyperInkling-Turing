@@ -110,7 +110,12 @@ CUDA_HOME=$HOME/cuda-13.2 ARCH=7.5 scripts/build-vllm.sh   # ARCH=7.5 on Turing,
 ```
 
 Afterwards, check that `/usr/local/cuda` still points where it did. The build refuses an
-`nvcc` that is not CUDA 13. To remove everything, run `rm -rf venv vllm $HOME/cuda-13.2`.
+`nvcc` that is not CUDA 13, and records the toolkit it used in `venv/cuda_home`. `start.sh`
+puts that toolkit first on `PATH` for the server, because FlashInfer compiles kernels with
+`nvcc` at the first boot. A system CUDA 12 `nvcc` fails there with
+`Unknown option '--compress-mode=size'`. For a venv built before this was recorded, run
+`echo $HOME/cuda-13.2 > venv/cuda_home` and then `rm -rf ~/.cache/flashinfer`. To remove
+everything, run `rm -rf venv vllm $HOME/cuda-13.2 ~/.cache/flashinfer`.
 
 ## Speed
 

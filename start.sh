@@ -208,6 +208,15 @@ echo "=================================================="
 
 # The native install's venv; the container has vllm on PATH.
 [ -f "$REPO/venv/bin/activate" ] && source "$REPO/venv/bin/activate"
+# The CUDA toolkit the venv was built with (scripts/build-vllm.sh records it): FlashInfer
+# compiles its JIT kernels at the first boot with $CUDA_HOME/bin/nvcc, else whatever nvcc
+# is first on PATH, which may be an older system CUDA. CUDA_HOME set by hand wins.
+if [ -z "${CUDA_HOME:-}" ] && [ -f "$REPO/venv/cuda_home" ]; then
+	CUDA_HOME=$(cat "$REPO/venv/cuda_home")
+fi
+if [ -n "${CUDA_HOME:-}" ]; then
+	export CUDA_HOME PATH="$CUDA_HOME/bin:$PATH"
+fi
 # Requests at the shapes vLLM's warmup leaves out, once /health answers: their kernels
 # compile (first boot after an update) or load from the JIT cache before real traffic.
 WARMUP=${WARMUP:-1}
