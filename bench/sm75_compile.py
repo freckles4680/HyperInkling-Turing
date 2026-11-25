@@ -243,6 +243,8 @@ def _dspark():
     for reqs in (1, 6):
         t = reqs * block
         ds.mix_rmsnorm(_r(t, 4, HID), torch.rand(4), _r(HID), 1e-6)
+        ds.add_rms_norm_(_r(t, HID), _r(t, HID), _r(HID), 1e-6)
+        ds.add_rms_norm_(_r(t, d), None, _r(d), 1e-6)
         qkv = _r(t, (hq + 2 * hkv) * d)
         inv_freq = torch.rand(d // 2)
         pos = torch.arange(t)

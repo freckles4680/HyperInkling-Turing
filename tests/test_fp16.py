@@ -170,6 +170,7 @@ def test_marlin_int4_fp16(tokens):
 def test_dspark_kernels(dtype):
     """The DSpark drafter's kernels in `dtype` against fp32 math."""
     from vllm.models.inkling2.nvidia.ops.dspark import (
+        add_rms_norm_,
         add_softcap,
         markov_gate,
         mix_rmsnorm,
@@ -185,6 +186,14 @@ def test_dspark_kernels(dtype):
     mixed = (targets.float() * alpha[:, None]).sum(1)
     want = mixed * torch.rsqrt(mixed.square().mean(-1, keepdim=True) + 1e-6) * weight.float()
     assert _rel(mix_rmsnorm(targets, alpha, weight, 1e-6), want) < 1e-2
+
+    x = torch.randn(rows, HIDDEN, device="cuda").to(dtype)
+    res = torch.randn(rows, HIDDEN, device="cuda").to(dtype)
+    total = x.float() + res.float()
+    want = total * torch.rsqrt(total.square().mean(-1, keepdim=True) + 1e-6) * weight.float()
+    got = add_rms_norm_(x, res, weight, 1e-6)
+    assert got.data_ptr() == x.data_ptr() and _rel(got, want) < 1e-2
+    assert _rel(res, total) < 1e-3
 
     qkv = torch.randn(rows, (hq + 2 * hk) * d, device="cuda").to(dtype)
     q_w = (torch.rand(d, device="cuda") + 0.5).to(dtype)

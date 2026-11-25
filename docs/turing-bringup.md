@@ -95,7 +95,8 @@ venv/bin/python bench/spec_bench.py 8080 256              # draft acceptance per
 
 Acceptance comparable to the README's DSpark rows means the drafter works in fp16. Drafts
 cannot change the output: the target verifies every one, so a weak drafter costs only
-speed. If the boot fails in `flashinfer` (the drafter's RMSNorms), send the traceback.
+speed. The drafter's RMSNorms run on a Triton kernel on sm75, so no `nvcc` is needed at
+boot.
 
 ## 5. Quality against the published scores
 

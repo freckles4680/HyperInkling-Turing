@@ -58,7 +58,7 @@ T2. **Tile speed on the card**: the tiles are the 3090's, shrunk only where shar
 T3. **DSpark on the card** (in code): the draft's attention runs in `block_decode_attention`
     (Triton `rel_attention` on sm75, compiled in `bench/sm75_compile.py`). Its KV write is
     vLLM's `reshape_and_cache_flash` (core op, no FlashAttention kernel), and its RMSNorms
-    are flashinfer's (sm75 supported upstream). Left: acceptance on the card
+    run on Triton on sm75 (flashinfer's JIT-compile with the host's nvcc). Left: acceptance on the card
     (`bench/spec_bench.py`, `docs/turing-bringup.md` step 4).
 T4. **A 22 GiB memory matrix**: `bench/memory_matrix.sh` on the card replaces the scaled
     estimate (it writes `gpu_gib`).
