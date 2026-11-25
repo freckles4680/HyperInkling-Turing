@@ -1,4 +1,4 @@
-From 8d48783e371a88ea656146cad9082c5ffc40caad Mon Sep 17 00:00:00 2001
+From e4c5f516af59ac75555bc5435e3e74226ec2ce27 Mon Sep 17 00:00:00 2001
 From: Pento95 <173375476+Pento95@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 05:39:42 +0100
 Subject: [PATCH] [hyperinkling] Inkling 2 Mini on Ampere (sm86)
@@ -126,7 +126,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/models/inkling2/nvidia/ops/e4m3.py       |  10 +
  vllm/models/inkling2/nvidia/ops/linear.py     |   2 +-
  vllm/models/inkling2/nvidia/ops/linear_w4.py  | 210 ++++++++++++++
- vllm/models/inkling2/nvidia/ops/linear_w8.py  | 213 ++++++++++++++
+ vllm/models/inkling2/nvidia/ops/linear_w8.py  | 216 ++++++++++++++
  .../inkling2/nvidia/ops/ll_gemm_sm120.py      |  25 +-
  vllm/models/inkling2/nvidia/ops/lookup.py     | 233 +++++++++++++++
  vllm/models/inkling2/nvidia/ops/loop.py       |   5 +-
@@ -147,7 +147,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/v1/engine/core.py                        |  84 ++++++
  vllm/v1/spec_decode/dynamic/adaptive_k.py     | 130 +++++++++
  vllm/v1/structured_output/backend_xgrammar.py |  41 ++-
- 43 files changed, 2458 insertions(+), 191 deletions(-)
+ 43 files changed, 2461 insertions(+), 191 deletions(-)
  create mode 100644 vllm/models/inkling2/nvidia/ops/bgemv.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/linear_w4.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/linear_w8.py
@@ -2433,10 +2433,10 @@ index 0000000000..8bcd77f4da
 +        return w4_matmul(x.contiguous(), self.packed, self.scale, self.zero, out)
 diff --git a/vllm/models/inkling2/nvidia/ops/linear_w8.py b/vllm/models/inkling2/nvidia/ops/linear_w8.py
 new file mode 100644
-index 0000000000..aa3a572c40
+index 0000000000..7148de8e5b
 --- /dev/null
 +++ b/vllm/models/inkling2/nvidia/ops/linear_w8.py
-@@ -0,0 +1,213 @@
+@@ -0,0 +1,216 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""HyperInkling W8A16 linears: bf16 weights quantized at load time to int8
@@ -2522,11 +2522,13 @@ index 0000000000..aa3a572c40
 +):  # fmt: skip
 +    """Turing: Triton emits no tensor-core MMA for sm75, and `tl.dot` there runs
 +    as FMA through shared memory (~2 ms per call, measured). Small row counts
-+    as broadcast products and sums instead: each weight tile is read once per
-+    `BM` rows, so the kernel stays bound by the int8 weight reads."""
++    as 2D products and row sums instead: each `[BN, BK]` weight tile is loaded
++    once and applied to the `BM` rows in turn (a 3D broadcast product was
++    still ~1 ms per call)."""
 +    pid_n = tl.program_id(0)
 +    pid_m = tl.program_id(1)
-+    rows = pid_m * BM + tl.arange(0, BM)
++    lane = tl.arange(0, BM)
++    rows = pid_m * BM + lane
 +    cols = pid_n * BN + tl.arange(0, BN)
 +    col_ok = cols < N
 +    row_ok = rows < M
@@ -2536,11 +2538,12 @@ index 0000000000..aa3a572c40
 +        w = tl.load(
 +            W + cols[:, None].to(tl.int64) * SW + ks[None, :], col_ok[:, None], other=0
 +        ).to(tl.float32)
-+        x = tl.load(
-+            X + rows[:, None].to(tl.int64) * SX + ks[None, :], row_ok[:, None], other=0
-+        ).to(tl.float32)
 +        s = tl.load(S + cols.to(tl.int64) * SS + g, col_ok, other=0).to(tl.float32)
-+        acc += tl.sum(x[:, None, :] * w[None, :, :], axis=2) * s[None, :]
++        for r in tl.static_range(BM):
++            row = pid_m * BM + r
++            x = tl.load(X + row.to(tl.int64) * SX + ks, (ks < K) & (row < M), other=0)
++            part = tl.sum(w * x.to(tl.float32)[None, :], axis=1) * s
++            acc += tl.where(lane[:, None] == r, part[None, :], 0.0)
 +    tl.store(
 +        Y + rows[:, None].to(tl.int64) * SY + cols[None, :],
 +        acc.to(Y.dtype.element_ty),
@@ -2558,13 +2561,13 @@ index 0000000000..aa3a572c40
 +    n = q.shape[0]
 +    if m <= SM75_GEMV_MAX_M:
 +        bm = min(triton.next_power_of_2(m), 16)
-+        # bm * bn * 128 products per program; narrow enough for ~256 programs.
-+        bn = max(8, min(128 // bm, triton.next_power_of_2(max(n // 512, 1))))
++        # 32 columns a program, 16 for narrow layers (~256 programs or more).
++        bn = 32 if n >= 8192 else 16
 +        grid = (triton.cdiv(n, bn), triton.cdiv(m, bm))
 +        _w8_gemv_kernel[grid](
 +            x, q, scale, out, m, n, k,
 +            x.stride(0), q.stride(0), scale.stride(0), out.stride(0),
-+            BM=bm, BN=bn, BK=GROUP, num_warps=8 if bm >= 4 else 4, num_stages=1,
++            BM=bm, BN=bn, BK=GROUP, num_warps=4, num_stages=1,
 +        )  # fmt: skip
 +        return out
 +    for start in range(0, n, 8192):
