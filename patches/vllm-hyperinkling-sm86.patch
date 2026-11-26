@@ -1,4 +1,4 @@
-From b9e75176c66316f02ddaed19d7a21bfd689d9cb1 Mon Sep 17 00:00:00 2001
+From 99fb16d8211d1f268af06ec889cab15726ec3c36 Mon Sep 17 00:00:00 2001
 From: Pento95 <173375476+Pento95@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 05:39:42 +0100
 Subject: [PATCH] [hyperinkling] Inkling 2 Mini on Ampere (sm86)
@@ -145,7 +145,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/models/inkling2/nvidia/ops/__init__.py   |  72 ++++
  vllm/models/inkling2/nvidia/ops/activation.py |  17 +-
  vllm/models/inkling2/nvidia/ops/attention.py  |  50 ++-
- .../inkling2/nvidia/ops/attention_sm75.py     | 322 +++++++++++++++++
+ .../inkling2/nvidia/ops/attention_sm75.py     | 322 ++++++++++++++++
  .../inkling2/nvidia/ops/attention_sm90.py     |  37 +-
  vllm/models/inkling2/nvidia/ops/bgemv.py      | 183 ++++++++++
  vllm/models/inkling2/nvidia/ops/conv_mix.py   |   2 +-
@@ -153,7 +153,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/models/inkling2/nvidia/ops/e4m3.py       |  10 +
  vllm/models/inkling2/nvidia/ops/linear.py     |  17 +-
  vllm/models/inkling2/nvidia/ops/linear_w4.py  | 210 +++++++++++
- vllm/models/inkling2/nvidia/ops/linear_w8.py  | 340 ++++++++++++++++++
+ vllm/models/inkling2/nvidia/ops/linear_w8.py  | 343 ++++++++++++++++++
  .../inkling2/nvidia/ops/ll_gemm_sm120.py      |  25 +-
  vllm/models/inkling2/nvidia/ops/lookup.py     | 233 ++++++++++++
  vllm/models/inkling2/nvidia/ops/loop.py       |   5 +-
@@ -174,7 +174,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/v1/engine/core.py                        |  84 +++++
  vllm/v1/spec_decode/dynamic/adaptive_k.py     | 130 +++++++
  vllm/v1/structured_output/backend_xgrammar.py |  41 ++-
- 44 files changed, 2993 insertions(+), 193 deletions(-)
+ 44 files changed, 2996 insertions(+), 193 deletions(-)
  create mode 100644 vllm/models/inkling2/nvidia/ops/attention_sm75.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/bgemv.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/linear_w4.py
@@ -2913,10 +2913,10 @@ index 0000000000..8bcd77f4da
 +        return w4_matmul(x.contiguous(), self.packed, self.scale, self.zero, out)
 diff --git a/vllm/models/inkling2/nvidia/ops/linear_w8.py b/vllm/models/inkling2/nvidia/ops/linear_w8.py
 new file mode 100644
-index 0000000000..6f5f95e58c
+index 0000000000..493b01973c
 --- /dev/null
 +++ b/vllm/models/inkling2/nvidia/ops/linear_w8.py
-@@ -0,0 +1,340 @@
+@@ -0,0 +1,343 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""HyperInkling W8A16 linears: bf16 weights quantized at load time to int8
@@ -2932,6 +2932,8 @@ index 0000000000..6f5f95e58c
 +Group-128 int8 round-to-nearest needs no calibration and works on the
 +released checkpoint as is.
 +"""
++
++import os
 +
 +import torch
 +
@@ -3222,7 +3224,8 @@ index 0000000000..6f5f95e58c
 +        """Three inputs of the same decode-size row count over column ranges
 +        that follow each other from 0 (`gemv3_sm75`)."""
 +        return (
-+            len(rows) == 3
++            os.environ.get("HYPERINKLING_SM75_GEMV3") != "0"  # 0: the stacked rows, to compare
++            and len(rows) == 3
 +            and rows[0] == rows[1] == rows[2]
 +            and 0 < rows[0] <= SM75_GEMV_MAX_M
 +            and col_ranges[0][0] == 0
