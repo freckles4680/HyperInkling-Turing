@@ -43,3 +43,15 @@ print(f'context $n tokens: {gen:.0f} tokens in {steps} steps ({gen / steps:.2f} 
 for r in rows[:${TOP:-30}]:
     print(f\"{float(r['Total Time (ns)']) / steps / 1e3:8.1f} us/step {int(r['Instances']) / steps:6.1f}x {float(r['Avg (ns)']) / 1e3:7.1f}us  {r['Name'][:90]}\")
 "
+# The GEMV kernel serves many shapes (attention projections, LM head, controllers, router,
+# K groups): its time by grid and block, which name the shape (grid = columns / BN,
+# rows / BM, batches x K slices).
+nsys stats -q --report cuda_gpu_kern_gb_sum --format csv ".local/prof/$name.nsys-rep" 2> /dev/null | python3 -c "
+import csv, sys
+rows = [r for r in csv.DictReader(sys.stdin) if '${SHAPES_OF:-gemv}' in r.get('Name', '')]
+steps = max($s1 - $s0, 1)
+dims = [k for k in (rows[0] if rows else {}) if 'Grid' in k or 'Block' in k]
+print('${SHAPES_OF:-gemv} kernels by ' + ', '.join(dims))
+for r in rows[:${TOP:-30}]:
+    print(f\"{float(r['Total Time (ns)']) / steps / 1e3:8.1f} us/step {int(r['Instances']) / steps:6.1f}x {float(r['Avg (ns)']) / 1e3:7.1f}us  \" + ' '.join(str(r[k]).strip() for k in dims) + '  ' + r['Name'][:40])
+"
