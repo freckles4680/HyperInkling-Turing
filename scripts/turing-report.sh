@@ -10,6 +10,7 @@
 # prefill: bench/profile_prefill.sh, kernel time of an 8k prefill
 # decode:  bench/profile_decode.sh, kernel time per decode step at 8k and at CONTEXT
 # bench:   bench/context_bench.sh at 8k and CONTEXT (prefill and decode tok/s, fitted context)
+# quality: bench/quality_battery.sh (not in the default steps: 600 answers, an hour or more)
 # The GPU's temperature, clock and power are sampled every 5 s meanwhile: a throttled card
 # shows in the summary at the end.
 set -uo pipefail
@@ -59,6 +60,10 @@ trap 'kill $sampler 2> /dev/null' EXIT
 		bench)
 			section "context bench"
 			SPECS=dspark CONTEXTS="8192 $CONTEXT" CONC=1 MAX_SEQS=1 bench/context_bench.sh "report-$name" 2>&1
+			;;
+		quality)
+			section "quality battery"
+			bench/quality_battery.sh "report-$name" 2>&1
 			;;
 		*) echo "unknown step $step" ;;
 		esac

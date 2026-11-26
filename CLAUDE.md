@@ -117,7 +117,7 @@ Benchmarks and quality (all need a running server):
   sampling setting; cases are chat requests (tools are declared, never run).
 - `bench/evalscope_perf.sh <name> [port]`: 10 minutes of AA-LCR prompts (256-64k tokens) with
   `metrics_window.py` alongside. `bench/profile_spec.sh`: kernel time per step under nsys.
-- `bench/quality_battery.py download|run`: GSM8K, Hermes tool calls, DocVQA as strict JSON,
+- `bench/quality_battery.py download|run` (`bench/quality_battery.sh <name>` boots its own server): GSM8K, Hermes tool calls, DocVQA as strict JSON,
   on public data (`bench/quality-data/`, not in git); compare two servers at the same settings.
 - `bench/extract_bench.py`: document extraction on public data (shared Italian system
   prompt, 1-3 DocVQA pages, JSON or summary), closed loop with `metrics_window.py` alongside.

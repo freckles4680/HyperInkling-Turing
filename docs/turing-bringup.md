@@ -108,13 +108,11 @@ boot.
 
 ## 5. Quality against the published scores
 
-Restart without the check (CUDA graphs back on) and run the same battery the README
-reports:
+Run the same battery the README reports, on its own server (CUDA graphs on, the GPU must
+be free), into one file to share:
 
 ```bash
-MAX_LEN=32768 ./start.sh                                   # in tmux
-venv/bin/python bench/quality_battery.py download
-venv/bin/python bench/quality_battery.py run gsm8k tools docvqa --n 200
+STEPS="system quality" scripts/turing-report.sh quality     # .local/turing-report-quality.txt
 ```
 
 Compare with README "Task accuracy", HyperInkling as served. GSM8K 0.970, tool calls 0.615
