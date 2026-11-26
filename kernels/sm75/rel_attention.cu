@@ -359,8 +359,17 @@ static DEV void phase_max(Shared<NW>& sm, int t) {
   ws.part_max[lane] = best;
 }
 
+// A row's reference for its probabilities: the first finite maximum, kept while the
+// logits stay within `HEADROOM` (log2) above it. Probabilities then reach 2^HEADROOM, well
+// inside fp16, and the accumulators are rescaled only on a larger jump. (With the running
+// maximum as the reference, some row of a block has a new maximum in most iterations, and
+// each one costs a round trip of all the accumulators through shared memory.)
+#ifndef HEADROOM
+#define HEADROOM 10.0f
+#endif
 static DEV float new_max(const WarpShared& ws, int r) {
-  return fmaxf(ws.m[r], fmaxf(ws.part_max[r], ws.part_max[r + ROWS]));
+  float part = fmaxf(ws.part_max[r], ws.part_max[r + ROWS]);
+  return part <= ws.m[r] + HEADROOM ? ws.m[r] : part;
 }
 
 // Probabilities relative to the new running max, as fp16.
@@ -386,7 +395,8 @@ static DEV void phase_state(Shared<NW>& sm, int t) {
   if (r >= ROWS) return;
   float m_new = new_max(ws, r);
   float m_safe = m_new == -INFINITY ? 0.0f : m_new;
-  float alpha = exp2f(ws.m[r] - m_safe);
+  // Nothing is accumulated before a row's first finite maximum.
+  float alpha = ws.m[r] == -INFINITY ? 1.0f : exp2f(ws.m[r] - m_safe);
   ws.alpha[r] = alpha;
   ws.l[r] = ws.l[r] * alpha + (ws.part_sum[r] + ws.part_sum[r + ROWS]);
   ws.m[r] = m_new;
@@ -445,6 +455,10 @@ static DEV void phase_lse(const Args& a, const Block& b, Shared<NW>& sm, int t) 
   }
 }
 
+#ifdef COUNT_RESCALES  // HOST_EMU: iterations that rescaled, of all (hi_sm75_rescales)
+static long rescales, iterations;
+#endif
+
 #ifdef HOST_EMU
 #define PHASE(call) \
   for (int t = 0; t < NW * 32; t++) { Lane& ln = lanes[t]; Frags& f = frags[t / 32]; \
@@ -468,6 +482,9 @@ KERNEL_HEAD {
     PHASE(phase_q(a, b, sm, w, t))
     PHASE(phase_q_frags(sm, f, w, t))
   }
+#ifdef COUNT_RESCALES
+  iterations += b.num_iters;
+#endif
   for (int i = 0; i < b.num_iters; i++) {
     const int n = b.n_lo + b.split + i * a.num_splits;
     PHASE(phase_load(a, b, sm, ln, n, t))
@@ -477,6 +494,9 @@ KERNEL_HEAD {
     PHASE(phase_probs(sm, t))
     PHASE(phase_state(sm, t))
     if (sm.rescale) {
+#ifdef COUNT_RESCALES
+      rescales++;
+#endif
       for (int dt = 0; dt < DT; dt++) {
         PHASE(store_row(sm.w[t / 32].scratch, f.acc[dt], 16, t % 32))
         PHASE(phase_scale(sm, t))
@@ -521,4 +541,7 @@ int hi_sm75_rel_attention(const Args* a, int num_reqs, int tiles, int warps, voi
 }
 #endif
 int hi_sm75_abi(void) { return 5; }
+#ifdef COUNT_RESCALES
+void hi_sm75_rescales(long* out) { out[0] = rescales; out[1] = iterations; }
+#endif
 }

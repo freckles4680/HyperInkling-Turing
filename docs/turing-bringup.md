@@ -128,6 +128,7 @@ precision somewhere: run step 3's check on a failing prompt and send its lines.
 bench/memory_matrix.sh .local/memory_matrix_22g.tsv     # one boot per combination, ~2 min each
 bench/context_bench.sh turing                           # the README speed table, on this card
 SPECS=dspark CONTEXTS="8192 90000" CONC=1 MAX_SEQS=1 bench/context_bench.sh turing90k  # one long request
+scripts/turing-report.sh <name>   # all of it in one file to share: .local/turing-report-<name>.txt
 venv/bin/python bench/sm75_w8_gemv.py                   # W8 GEMV tiles on this card (no server)
 MAX_LEN=8192 bench/profile_spec.sh t6 1 128             # kernel time per decode step
 ```

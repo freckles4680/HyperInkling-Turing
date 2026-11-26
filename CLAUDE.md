@@ -100,6 +100,10 @@ the wizard. Release side: `scripts/wizard.py` (questions -> `.env`, from `docs/m
 Benchmarks and quality (all need a running server):
 - `bench/context_bench.sh <name>`: the README speed table (8k/32k context, 1 and 6 requests,
   with and without DSpark; prefill on unseen prompts, decode on prefix hits).
+- `bench/profile_prefill.sh <name> [tokens]`, `bench/profile_decode.sh <name> [tokens]`: kernel
+  time of one prefill, and per decode step at a long context, under nsys.
+  `scripts/turing-report.sh <name>` (Turing): GPU state, kernel tests, both profiles and the
+  long-context bench in one file, `.local/turing-report-<name>.txt`.
 - `bench/metrics_window.py [seconds] [port]`: server-side throughput/TTFT; use this, not
   client-side numbers (client TTFT hides prefix-cache hits).
 - `scripts/quick_bench.py [concurrency] [max_tokens]`: quick client-side decode check.

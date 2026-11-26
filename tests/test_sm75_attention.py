@@ -34,7 +34,7 @@ LN2 = 0.6931471805599453
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
 
-def _inputs(seed, q_lens, seq_lens, extent, heads=24, kv_heads=8, page=16):
+def _inputs(seed, q_lens, seq_lens, extent, heads=24, kv_heads=8, page=16, unit=False):
     g = torch.Generator().manual_seed(seed)
     dim, tokens, reqs = 128, sum(q_lens), len(q_lens)
     pages = max(seq_lens) // page + 2
@@ -42,8 +42,13 @@ def _inputs(seed, q_lens, seq_lens, extent, heads=24, kv_heads=8, page=16):
     codes = torch.randint(
         0, 256, (2, blocks, page, kv_heads, dim), generator=g, dtype=torch.uint8
     )
-    # No NaN codes, magnitudes up to 1.75 (as normalized keys and values).
-    codes = torch.where((codes & 0x78) > 0x38, codes & 0xC7 | 0x38, codes)
+    # `unit`: magnitudes below 2, as the model's normalized keys and values (the timings).
+    # Else half of the codes at 256 to 480: logits hundreds apart, so that most iterations
+    # rescale their accumulators.
+    high = (codes & 0x78) > 0x38
+    codes = torch.where(
+        high, codes & 0x87 | 0x38 if unit else codes & 0xC7 | 0x38, codes
+    )
     table = torch.randperm(blocks, generator=g)[: reqs * pages].view(reqs, pages).int()
     return dict(
         q=(torch.randn(tokens, heads, dim, generator=g) * 0.5).half(),
@@ -123,7 +128,9 @@ def _compare(want, got, mode):
     (out_a, lse_a), (out_b, lse_b) = want, got
     finite = torch.isfinite(lse_a)
     assert torch.equal(finite, torch.isfinite(lse_b))
-    assert (out_a - out_b).norm() / out_a.norm() < 2e-4
+    # Both kernels round their probabilities to fp16 (2^-12 relative) against different
+    # references: the Triton one the running maximum, this one a kept one (HEADROOM).
+    assert (out_a - out_b).norm() / out_a.norm() < 5e-4
     assert (lse_a[finite] - lse_b[finite]).abs().max() < 2e-3
 
 
@@ -238,7 +245,7 @@ def test_speed():
     megabytes = seq * 8 * 128 * 2 / 1e6
     print(f"\n{sms} SMs; decode at {seq} tokens, {megabytes:.0f} MB of KV per call")
     for q_len in (1, 5, 8):  # blocks of one warp (up to 5 tokens) and of two
-        x = _device(_inputs(2, [q_len], [seq], 1024))
+        x = _device(_inputs(2, [q_len], [seq], 1024, unit=True))
         splits = max(2 * sms // 8, min(sms // 8, 6 * sms // 8))
         us = _time(lambda: _triton(x, splits, False))
         line = f"{q_len} tokens: Triton {us:8.0f} us ({splits} splits)"
@@ -249,7 +256,7 @@ def test_speed():
         print(line)
     # A local layer of a decode step (40 of them): 9 splits over the window.
     for q_len in (1, 5, 8):
-        x = _device(_inputs(4, [q_len], [8192], 1024))
+        x = _device(_inputs(4, [q_len], [8192], 1024, unit=True))
         old = _time(lambda: _triton(x, 9, False, 1024))
         new = _time(lambda: _sm75(x, 9, False, lib, 1024))
         print(
@@ -257,7 +264,7 @@ def test_speed():
         )
     print("prefill, a 2048-token chunk:")
     for seq in (8192, 32768):
-        x = _device(_inputs(3, [2048], [seq], 1024))
+        x = _device(_inputs(3, [2048], [seq], 1024, unit=True))
         for window in (0, 1024):
             old = _time(lambda: _triton(x, 1, False, window, OUT_LSE), reps=3)
             new = _time(lambda: _sm75(x, 1, False, lib, window, OUT_LSE), reps=3)
