@@ -234,6 +234,16 @@ def _time(fn, reps=20):
     return start.elapsed_time(end) / reps * 1e3  # us
 
 
+def _wide(x, lib, window, warps):
+    """Time of a prefill launch with larger blocks; nan if the card refuses the launch
+    (sixteen warps need a build with FLAGS=-maxrregcount=128, see `prefill_warps`)."""
+    try:
+        return _time(lambda: _sm75(x, 1, False, lib, window, OUT_LSE, warps=warps), reps=3)
+    except RuntimeError as error:
+        print(f"  {warps} warps: {error}")
+        return float("nan")
+
+
 def test_speed():
     """Decode: one full layer's attention at 90k tokens (9 of them run per step). Prefill:
     a 2048-token chunk at the end of 8k and of 32k tokens, full and sliding-window layers
@@ -269,10 +279,7 @@ def test_speed():
         for window in (0, 1024):
             old = _time(lambda: _triton(x, 1, False, window, OUT_LSE), reps=3)
             new = _time(lambda: _sm75(x, 1, False, lib, window, OUT_LSE), reps=3)
-            wide = [
-                _time(lambda: _sm75(x, 1, False, lib, window, OUT_LSE, warps=w), reps=3)
-                for w in (8, 16)
-            ]
+            wide = [_wide(x, lib, window, w) for w in (8, 16)]
             name = "full layer" if window == 0 else "window 1024"
             print(
                 f"  ending at {seq:5d} tokens, {name:11s}: Triton {old / 1e3:8.1f} ms, "

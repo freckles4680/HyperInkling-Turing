@@ -1,4 +1,4 @@
-From 4444c7862051f37555d5a8c40d704c8c1ce833d9 Mon Sep 17 00:00:00 2001
+From fa4868ee1a93bb037d62a233f5c87fa20bcc1ce0 Mon Sep 17 00:00:00 2001
 From: Pento95 <173375476+Pento95@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 05:39:42 +0100
 Subject: [PATCH] [hyperinkling] Inkling 2 Mini on Ampere (sm86)
@@ -110,7 +110,8 @@ gates PDL/TMA, e4m3 conversions and the native conv/mix kernels below SM90):
   and sliding-window layers) and the full layers' split decode partials
   (MODE_PARTIAL, at most 64 rows; any GQA group up to 16, the model has
   3 heads per KV head; blocks per SM by the block's warps, measured;
-  HYPERINKLING_SM75_PREFILL_WARPS=8 or 16 for larger prefill blocks; the local layers' short launches stay on
+  HYPERINKLING_SM75_PREFILL_WARPS=8 for larger prefill blocks (16 only from a
+  kernel build with -maxrregcount=128, probed with an empty launch, else 4); the local layers' short launches stay on
   Triton, and the first launch of each kind logs which kernel serves and
   why) over the E4M3 byte cache, from a CUDA wmma kernel
   of the HyperInkling repository (kernels/sm75, loaded through ctypes
@@ -133,32 +134,32 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  .../serve/middleware/authenticate.py          |  34 +-
  vllm/envs.py                                  |   6 +
  vllm/models/inkling/nvidia/ops/sconv.py       |  10 +-
- vllm/models/inkling/nvidia/sconv_swa_attn.py  | 147 ++++++++-
- vllm/models/inkling2/nvidia/attention.py      |  74 ++++-
- vllm/models/inkling2/nvidia/dspark.py         | 197 +++++++++---
- vllm/models/inkling2/nvidia/loop.py           |  54 +++-
+ vllm/models/inkling/nvidia/sconv_swa_attn.py  | 147 +++++++-
+ vllm/models/inkling2/nvidia/attention.py      |  74 +++-
+ vllm/models/inkling2/nvidia/dspark.py         | 197 +++++++++--
+ vllm/models/inkling2/nvidia/loop.py           |  54 ++-
  vllm/models/inkling2/nvidia/model.py          | 119 ++++++-
- vllm/models/inkling2/nvidia/moe.py            | 110 ++++++-
- vllm/models/inkling2/nvidia/ops/__init__.py   |  72 +++++
+ vllm/models/inkling2/nvidia/moe.py            | 110 +++++-
+ vllm/models/inkling2/nvidia/ops/__init__.py   |  72 ++++
  vllm/models/inkling2/nvidia/ops/activation.py |  17 +-
  vllm/models/inkling2/nvidia/ops/attention.py  |  50 ++-
- .../inkling2/nvidia/ops/attention_sm75.py     | 300 ++++++++++++++++++
- .../inkling2/nvidia/ops/attention_sm90.py     |  37 ++-
- vllm/models/inkling2/nvidia/ops/bgemv.py      | 183 +++++++++++
+ .../inkling2/nvidia/ops/attention_sm75.py     | 322 ++++++++++++++++++
+ .../inkling2/nvidia/ops/attention_sm90.py     |  37 +-
+ vllm/models/inkling2/nvidia/ops/bgemv.py      | 183 ++++++++++
  vllm/models/inkling2/nvidia/ops/conv_mix.py   |   2 +-
  vllm/models/inkling2/nvidia/ops/dspark.py     |  87 +++--
  vllm/models/inkling2/nvidia/ops/e4m3.py       |  10 +
  vllm/models/inkling2/nvidia/ops/linear.py     |  17 +-
  vllm/models/inkling2/nvidia/ops/linear_w4.py  | 210 ++++++++++++
- vllm/models/inkling2/nvidia/ops/linear_w8.py  | 289 +++++++++++++++++
+ vllm/models/inkling2/nvidia/ops/linear_w8.py  | 289 ++++++++++++++++
  .../inkling2/nvidia/ops/ll_gemm_sm120.py      |  25 +-
- vllm/models/inkling2/nvidia/ops/lookup.py     | 233 ++++++++++++++
+ vllm/models/inkling2/nvidia/ops/lookup.py     | 233 +++++++++++++
  vllm/models/inkling2/nvidia/ops/loop.py       |   5 +-
- vllm/models/inkling2/nvidia/ops/moe_marlin.py | 274 ++++++++++++++++
+ vllm/models/inkling2/nvidia/ops/moe_marlin.py | 274 +++++++++++++++
  vllm/models/inkling2/nvidia/ops/moe_sm120.py  |   6 +-
  vllm/models/inkling2/nvidia/ops/moe_sm90.py   |  13 +-
  vllm/models/inkling2/nvidia/ops/sconv.py      |   3 +-
- vllm/models/inkling2/nvidia/ops/vision.py     |  55 +++-
+ vllm/models/inkling2/nvidia/ops/vision.py     |  55 ++-
  vllm/models/inkling2/nvidia/sconv.py          |   3 +-
  vllm/models/inkling2/nvidia/vision.py         |  46 ++-
  vllm/models/inkling2/processing.py            |  50 ++-
@@ -169,9 +170,9 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/v1/core/sched/scheduler.py               |  38 ++-
  vllm/v1/core/single_type_kv_cache_manager.py  |   4 +
  vllm/v1/engine/core.py                        |  84 +++++
- vllm/v1/spec_decode/dynamic/adaptive_k.py     | 130 ++++++++
+ vllm/v1/spec_decode/dynamic/adaptive_k.py     | 130 +++++++
  vllm/v1/structured_output/backend_xgrammar.py |  41 ++-
- 44 files changed, 2920 insertions(+), 193 deletions(-)
+ 44 files changed, 2942 insertions(+), 193 deletions(-)
  create mode 100644 vllm/models/inkling2/nvidia/ops/attention_sm75.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/bgemv.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/linear_w4.py
@@ -1833,10 +1834,10 @@ index c8bc213285..640502e870 100644
      )
 diff --git a/vllm/models/inkling2/nvidia/ops/attention_sm75.py b/vllm/models/inkling2/nvidia/ops/attention_sm75.py
 new file mode 100644
-index 0000000000..252990e372
+index 0000000000..f3f6b5470a
 --- /dev/null
 +++ b/vllm/models/inkling2/nvidia/ops/attention_sm75.py
-@@ -0,0 +1,300 @@
+@@ -0,0 +1,322 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""HyperInkling, Turing (sm75): relative-bias paged attention on the fp16
@@ -1970,9 +1971,30 @@ index 0000000000..252990e372
 +
 +def prefill_warps() -> int:
 +    """Warps of a prefill block: four (64 rows, two blocks per SM), or
-+    HYPERINKLING_SM75_PREFILL_WARPS=8 or 16 (one block per SM; sixteen warps
-+    fill Turing's 64 KB of shared memory and double the warps per SM)."""
-+    return int(os.environ.get("HYPERINKLING_SM75_PREFILL_WARPS", "4"))
++    HYPERINKLING_SM75_PREFILL_WARPS=8 or 16 (one block per SM). The kernel
++    takes about 210 registers a thread, so an SM's 65536 hold 9 warps: sixteen
++    launch only from a build with FLAGS=-maxrregcount=128 (which spills), and
++    are refused here otherwise rather than at the first prefill."""
++    warps = int(os.environ.get("HYPERINKLING_SM75_PREFILL_WARPS", "4"))
++    if warps == 16 and not _launches_sixteen():
++        logger.warning(
++            "HyperInkling: sm75 attention, 16 prefill warps do not launch with "
++            "this build (FLAGS=-maxrregcount=128 scripts/build-sm75-kernels.sh): "
++            "using 4"
++        )
++        return 4
++    return warps
++
++
++@functools.cache
++def _launches_sixteen() -> bool:
++    """One empty block (a request of no tokens returns at once)."""
++    lib = _library()
++    if lib is None:
++        return False
++    empty = torch.zeros(2, dtype=torch.int32, device="cuda")
++    args = _Args(cu_seqlens_q=empty.data_ptr(), num_splits=1, num_kv_heads=1, group=1)
++    return lib.hi_sm75_rel_attention(ctypes.byref(args), 1, 1, 16, None) == 0
 +
 +
 +def _refusal(
@@ -2136,7 +2158,8 @@ index 0000000000..252990e372
 +        ctypes.c_void_p(stream),
 +    )
 +    if error:
-+        raise RuntimeError(f"hi_sm75_rel_attention: CUDA error {error}")
++        hint = " (launch out of resources: see prefill_warps)" if error == 701 else ""
++        raise RuntimeError(f"hi_sm75_rel_attention: CUDA error {error}{hint}")
 diff --git a/vllm/models/inkling2/nvidia/ops/attention_sm90.py b/vllm/models/inkling2/nvidia/ops/attention_sm90.py
 index 3cac9b9605..fa6dc91683 100644
 --- a/vllm/models/inkling2/nvidia/ops/attention_sm90.py

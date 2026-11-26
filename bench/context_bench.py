@@ -20,6 +20,7 @@ import argparse
 import json
 import random
 import statistics
+import sys
 import sysconfig
 import threading
 import time
@@ -176,7 +177,15 @@ ROWS = [("prefill_per_request", "prefill, per request"),
 
 def table(args):
     """Markdown: a row per metric and context, a column per label x concurrency."""
-    data = {lb: json.loads((OUT / f"{lb}.json").read_text()) for lb in args.labels}
+    data = {}
+    for lb in args.labels:  # a run whose server failed left no file
+        if (OUT / f"{lb}.json").exists():
+            data[lb] = json.loads((OUT / f"{lb}.json").read_text())
+        else:
+            print(f"no results for {lb} (see its server log)", file=sys.stderr)
+    args.labels = list(data)
+    if not data:
+        sys.exit(1)
     keys = sorted({k for d in data.values() for k in d},
                   key=lambda k: tuple(map(int, k.split("x"))))
     concs = sorted({int(k.split("x")[1]) for k in keys})
