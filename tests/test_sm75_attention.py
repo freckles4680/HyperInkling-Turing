@@ -181,8 +181,8 @@ def test_device(heads, case):
     lib = attention_sm75.load_library(str(LIB))
     want = _triton(x, splits, draft, window, mode)
     _compare(want, _sm75(x, splits, draft, lib, window, mode), mode)
-    if mode == OUT_LSE:  # the eight-warp block
-        _compare(want, _sm75(x, splits, draft, lib, window, mode, warps=8), mode)
+    for warps in (8, 16) if mode == OUT_LSE else ():  # the larger prefill blocks
+        _compare(want, _sm75(x, splits, draft, lib, window, mode, warps=warps), mode)
 
 
 @pytest.mark.parametrize(
@@ -218,8 +218,8 @@ def test_cpu_phases(heads, case, tmp_path_factory):
     want = [t.cpu() for t in want]
     lib = attention_sm75.load_library(str(path))
     _compare(want, _sm75(x, splits, draft, lib, window, mode), mode)
-    if mode == OUT_LSE:
-        _compare(want, _sm75(x, splits, draft, lib, window, mode, warps=8), mode)
+    for warps in (8, 16) if mode == OUT_LSE else ():
+        _compare(want, _sm75(x, splits, draft, lib, window, mode, warps=warps), mode)
 
 
 def _time(fn, reps=20):
@@ -269,13 +269,15 @@ def test_speed():
         for window in (0, 1024):
             old = _time(lambda: _triton(x, 1, False, window, OUT_LSE), reps=3)
             new = _time(lambda: _sm75(x, 1, False, lib, window, OUT_LSE), reps=3)
-            wide = _time(
-                lambda: _sm75(x, 1, False, lib, window, OUT_LSE, warps=8), reps=3
-            )
+            wide = [
+                _time(lambda: _sm75(x, 1, False, lib, window, OUT_LSE, warps=w), reps=3)
+                for w in (8, 16)
+            ]
             name = "full layer" if window == 0 else "window 1024"
             print(
                 f"  ending at {seq:5d} tokens, {name:11s}: Triton {old / 1e3:8.1f} ms, "
-                f"tensor cores {new / 1e3:7.1f} ms, eight warps {wide / 1e3:7.1f} ms"
+                f"tensor cores {new / 1e3:7.1f} ms, 8 warps {wide[0] / 1e3:7.1f} ms, "
+                f"16 warps {wide[1] / 1e3:7.1f} ms"
             )
 
 

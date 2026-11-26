@@ -1,4 +1,4 @@
-From 53453a366c29c1cc4877f88d486b3e7e0f8b44bd Mon Sep 17 00:00:00 2001
+From 4444c7862051f37555d5a8c40d704c8c1ce833d9 Mon Sep 17 00:00:00 2001
 From: Pento95 <173375476+Pento95@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 05:39:42 +0100
 Subject: [PATCH] [hyperinkling] Inkling 2 Mini on Ampere (sm86)
@@ -110,8 +110,7 @@ gates PDL/TMA, e4m3 conversions and the native conv/mix kernels below SM90):
   and sliding-window layers) and the full layers' split decode partials
   (MODE_PARTIAL, at most 64 rows; any GQA group up to 16, the model has
   3 heads per KV head; blocks per SM by the block's warps, measured;
-  HYPERINKLING_SM75_PREFILL_WARPS=8 for 128-row prefill blocks on the
-  full layers; the local layers' short launches stay on
+  HYPERINKLING_SM75_PREFILL_WARPS=8 or 16 for larger prefill blocks; the local layers' short launches stay on
   Triton, and the first launch of each kind logs which kernel serves and
   why) over the E4M3 byte cache, from a CUDA wmma kernel
   of the HyperInkling repository (kernels/sm75, loaded through ctypes
@@ -143,7 +142,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/models/inkling2/nvidia/ops/__init__.py   |  72 +++++
  vllm/models/inkling2/nvidia/ops/activation.py |  17 +-
  vllm/models/inkling2/nvidia/ops/attention.py  |  50 ++-
- .../inkling2/nvidia/ops/attention_sm75.py     | 304 ++++++++++++++++++
+ .../inkling2/nvidia/ops/attention_sm75.py     | 300 ++++++++++++++++++
  .../inkling2/nvidia/ops/attention_sm90.py     |  37 ++-
  vllm/models/inkling2/nvidia/ops/bgemv.py      | 183 +++++++++++
  vllm/models/inkling2/nvidia/ops/conv_mix.py   |   2 +-
@@ -172,7 +171,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/v1/engine/core.py                        |  84 +++++
  vllm/v1/spec_decode/dynamic/adaptive_k.py     | 130 ++++++++
  vllm/v1/structured_output/backend_xgrammar.py |  41 ++-
- 44 files changed, 2924 insertions(+), 193 deletions(-)
+ 44 files changed, 2920 insertions(+), 193 deletions(-)
  create mode 100644 vllm/models/inkling2/nvidia/ops/attention_sm75.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/bgemv.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/linear_w4.py
@@ -1834,10 +1833,10 @@ index c8bc213285..640502e870 100644
      )
 diff --git a/vllm/models/inkling2/nvidia/ops/attention_sm75.py b/vllm/models/inkling2/nvidia/ops/attention_sm75.py
 new file mode 100644
-index 0000000000..56171c666b
+index 0000000000..252990e372
 --- /dev/null
 +++ b/vllm/models/inkling2/nvidia/ops/attention_sm75.py
-@@ -0,0 +1,304 @@
+@@ -0,0 +1,300 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""HyperInkling, Turing (sm75): relative-bias paged attention on the fp16
@@ -1865,12 +1864,12 @@ index 0000000000..56171c666b
 +
 +logger = init_logger(__name__)
 +
-+ROWS = 16  # of a warp; a block has 1, 2, 4 or 8 warps
++ROWS = 16  # of a warp; a block has 1, 2, 4, 8 or 16 warps
 +MAX_ROWS = 64
 +HEAD_DIM = 128
 +MODE_OUT_LSE = 0
 +MODE_PARTIAL = 2
-+_ABI = 5
++_ABI = 6
 +
 +
 +class _Args(ctypes.Structure):
@@ -1959,7 +1958,7 @@ index 0000000000..56171c666b
 +
 +def splits_per_sm(max_query_len: int, group: int) -> int:
 +    """Blocks per SM of a full layer's decode attention, by the block's warps
-+    (12.7, 17 and 26 KB of Turing's 64 KB of shared memory): measured on a
++    (11.7, 15.3 and 22.3 KB of Turing's 64 KB of shared memory): measured on a
 +    2080 Ti at 90k tokens, five one-warp blocks (1.5 ms a launch; four: 1.9 ms)
 +    and three two-warp blocks (2.0 ms; four: 2.8 ms). HYPERINKLING_SM75_ATTN_CTAS
 +    to measure others."""
@@ -1969,15 +1968,11 @@ index 0000000000..56171c666b
 +    return {1: 5, 2: 3, 4: 2}[decode_warps(max_query_len, group)]
 +
 +
-+def prefill_warps(window: int) -> int:
-+    """Warps of a prefill block: four (64 rows), or with
-+    HYPERINKLING_SM75_PREFILL_WARPS=8 eight for the full layers, whose blocks
-+    then read each key half as often."""
-+    return (
-+        int(os.environ.get("HYPERINKLING_SM75_PREFILL_WARPS", "4"))
-+        if window == 0
-+        else 4
-+    )
++def prefill_warps() -> int:
++    """Warps of a prefill block: four (64 rows, two blocks per SM), or
++    HYPERINKLING_SM75_PREFILL_WARPS=8 or 16 (one block per SM; sixteen warps
++    fill Turing's 64 KB of shared memory and double the warps per SM)."""
++    return int(os.environ.get("HYPERINKLING_SM75_PREFILL_WARPS", "4"))
 +
 +
 +def _refusal(
@@ -2096,8 +2091,8 @@ index 0000000000..56171c666b
 +        if mode == MODE_PARTIAL:
 +            warps = decode_warps(max_query_len, group)
 +        else:
-+            warps = prefill_warps(window)
-+    assert warps in (1, 2, 4, 8)
++            warps = prefill_warps()
++    assert warps in (1, 2, 4, 8, 16)
 +    tokens_per_block = warps * ROWS // group
 +    args = _Args(
 +        q=q.data_ptr(),

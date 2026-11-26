@@ -113,19 +113,20 @@ typedef struct HiSm75AttnArgs Args;
 
 // A warp's part of the block's shared memory.
 struct alignas(32) WarpShared {
-  float s[ROWS * BN];       // scaled, biased, masked logits (log2 units)
+  float s[ROWS * BN];       // scaled, biased, masked logits (log2 units); once the
+                            // probabilities are final, room for an accumulator fragment
   uint16_t p[ROWS * BN];    // fp16 probabilities relative to the running max
-  float scratch[ROWS * 16]; // one accumulator fragment
   float part_max[32];
   float part_sum[32];
   float m[ROWS];            // running max (log2 units)
   float l[ROWS];            // running sum
-  float alpha[ROWS];
-  int32_t changed[ROWS];    // rows with a new reference in this iteration
+  float alpha[ROWS];        // negative: the row has a new reference in this iteration
 };
 
-// 12.8 KB for one warp (five blocks per SM in Turing's 64 KB), 26.7 KB for four (two),
-// 45.1 KB for eight (one).
+// 11.7 KB for one warp (five blocks per SM in Turing's 64 KB), 15.3 for two (four), 22.3
+// for four (two), 36.4 for eight and 64.5 for sixteen (one). The warps of an SM, not its
+// tensor cores, bound the kernel (an iteration takes about as long with 5 warps on the SM
+// as with 8), so a block's warps per KB matter.
 template <int NW>
 struct alignas(32) Shared {
   uint16_t kv[BN * D];      // fp16 bits: a warp's Q at start, then K and V of the iteration
@@ -304,22 +305,23 @@ static DEV void phase_q_frags(Shared<NW>& sm, Frags& f, int w, int t) {
 // Keys `n * BN ..`, a key at a time for a warp: K decoded into `kv`, V kept as bytes.
 template <int NW>
 static DEV void phase_load(const Args& a, const Block& b, Shared<NW>& sm, Lane& ln, int n, int t) {
-  const int keys = BN / NW, lane = t % 32;
+  const int keys = BN / NW, lane = t % 32, first = (t / 32) * keys;
+  // Every read before the first store: with a store to shared memory between them, each
+  // key's reads would wait for the key before (40% of a decode launch at 90k tokens).
+  uint32_t kraw[BN / NW];
   for (int i = 0; i < keys; i++) {
-    int j = (t / 32) * keys + i;
-    int32_t key = n * BN + j;
-    uint32_t kw = 0, vw = 0;
+    int32_t key = n * BN + first + i;
+    kraw[i] = ln.vraw[i] = 0;
     if (!(ABLATE & NO_LOADS) && key < b.seqlen_k) {
       int32_t page = a.block_table[(int64_t)b.req * a.stride_bt + (key >> a.page_shift)];
       int64_t off = (int64_t)page * a.stride_kv_blk +
                     (int64_t)(key & (a.page - 1)) * a.stride_kv_slot +
                     (int64_t)b.kv_head * a.stride_kv_h;
-      kw = ((const uint32_t*)(a.k + off))[lane];
-      vw = ((const uint32_t*)(a.v + off))[lane];
+      kraw[i] = ((const uint32_t*)(a.k + off))[lane];
+      ln.vraw[i] = ((const uint32_t*)(a.v + off))[lane];
     }
-    store_decoded(sm.kv, j, lane, kw);
-    ln.vraw[i] = vw;
   }
+  for (int i = 0; i < keys; i++) store_decoded(sm.kv, first + i, lane, kraw[i]);
 }
 
 // S = Q K^T of the warp's rows for the 32 keys.
@@ -415,14 +417,12 @@ static DEV void phase_state(Shared<NW>& sm, int t) {
   float m = ws.m[r];
   if (part <= m + HEADROOM) {
     ws.alpha[r] = 1.0f;
-    ws.changed[r] = 0;
     ws.l[r] += ws.part_sum[r] + ws.part_sum[r + ROWS];
     return;
   }
   // Nothing is accumulated before a row's first finite maximum.
   float alpha = m == -INFINITY ? 1.0f : exp2f(m - part);
-  ws.alpha[r] = alpha;
-  ws.changed[r] = 1;
+  ws.alpha[r] = -alpha;
   ws.m[r] = part;
   sm.redo = 1;  // every writer stores the same value
   if (alpha != 1.0f) sm.rescale = 1;
@@ -432,15 +432,15 @@ template <int NW>
 static DEV void phase_state_redo(Shared<NW>& sm, int t) {
   WarpShared& ws = sm.w[t / 32];
   int r = t % 32;
-  if (r >= ROWS || !ws.changed[r]) return;
-  ws.l[r] = ws.l[r] * ws.alpha[r] + (ws.part_sum[r] + ws.part_sum[r + ROWS]);
+  if (r >= ROWS || ws.alpha[r] > 0.0f) return;
+  ws.l[r] = ws.l[r] * -ws.alpha[r] + (ws.part_sum[r] + ws.part_sum[r + ROWS]);
 }
 
 template <int NW>
 static DEV void phase_scale(Shared<NW>& sm, int t) {
   WarpShared& ws = sm.w[t / 32];
   int lane = t % 32;
-  for (int i = lane * 8; i < lane * 8 + 8; i++) ws.scratch[i] *= ws.alpha[i / 16];
+  for (int i = lane * 8; i < lane * 8 + 8; i++) ws.s[i] *= fabsf(ws.alpha[i / 16]);
 }
 
 // acc += P V.
@@ -462,7 +462,7 @@ static DEV void phase_out(const Args& a, const Block& b, Shared<NW>& sm, int dt,
     Row row = row_of(a, b, w, r);
     if (!row.valid) continue;
     float l = ws.l[r];
-    float o = ws.scratch[i] * 256.0f / (l == 0.0f ? 1.0f : l);
+    float o = ws.s[i] * 256.0f / (l == 0.0f ? 1.0f : l);
     int d = dt * 16 + i % 16;
     if (a.mode == MODE_PARTIAL) {
       int64_t part = ((int64_t)b.split * a.num_tokens + row.token) * a.num_heads + row.head;
@@ -505,8 +505,11 @@ static long rescales, iterations;
 // What only the same warp reads next.
 #define WARP_PHASE(call) { call; __syncwarp(); }
 #define KERNEL_HEAD template <int NW> __global__ void rel_attention_kernel(const Args a)
+// Dynamic shared memory: a kernel's static `__shared__` data stops at 48 KB, and the
+// sixteen-warp block takes 64.5 KB (opted into at its first launch).
 #define KERNEL_STATE \
-  __shared__ Shared<NW> sm; Lane ln; Frags f; \
+  extern __shared__ __align__(32) unsigned char shared_bytes[]; \
+  Shared<NW>& sm = *reinterpret_cast<Shared<NW>*>(shared_bytes); Lane ln; Frags f; \
   const int t = threadIdx.x, bx = blockIdx.x, by = blockIdx.y, bz = blockIdx.z;
 #endif
 
@@ -539,22 +542,38 @@ KERNEL_HEAD {
       rescales++;
 #endif
       for (int dt = 0; dt < DT; dt++) {
-        PHASE(store_row(sm.w[t / 32].scratch, f.acc[dt], 16, t % 32))
+        PHASE(store_row(sm.w[t / 32].s, f.acc[dt], 16, t % 32))
         PHASE(phase_scale(sm, t))
-        PHASE(load_acc_row(f.acc[dt], sm.w[t / 32].scratch, 16, t % 32))
+        PHASE(load_acc_row(f.acc[dt], sm.w[t / 32].s, 16, t % 32))
       }
     }
     if (!(ABLATE & NO_PV)) PHASE(phase_pv(sm, f, t))
   }
   for (int dt = 0; dt < DT; dt++) {
-    PHASE(store_row(sm.w[t / 32].scratch, f.acc[dt], 16, t % 32))
+    PHASE(store_row(sm.w[t / 32].s, f.acc[dt], 16, t % 32))
     PHASE(phase_out(a, b, sm, dt, t))
   }
   PHASE(phase_lse(a, b, sm, t))
 }
 
+#ifndef HOST_EMU
+template <int NW>
+static int launch(const Args& a, dim3 grid, cudaStream_t stream) {
+  static bool opted_in = false;
+  if (sizeof(Shared<NW>) > 48 * 1024 && !opted_in) {
+    cudaError_t error = cudaFuncSetAttribute(
+        rel_attention_kernel<NW>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        (int)sizeof(Shared<NW>));
+    if (error != cudaSuccess) return (int)error;
+    opted_in = true;
+  }
+  rel_attention_kernel<NW><<<grid, NW * 32, sizeof(Shared<NW>), stream>>>(a);
+  return (int)cudaGetLastError();
+}
+#endif
+
 extern "C" {
-// `tiles`: blocks along the query tokens (`warps * 16 / group` tokens each); `warps` 1, 2, 4 or 8.
+// `tiles`: blocks along the query tokens (`warps * 16 / group` tokens each); `warps` 1, 2, 4, 8 or 16.
 #ifdef HOST_EMU
 int hi_sm75_rel_attention(const Args* a, int num_reqs, int tiles, int warps, void*) {
   for (int bz = 0; bz < num_reqs; bz++)
@@ -563,25 +582,25 @@ int hi_sm75_rel_attention(const Args* a, int num_reqs, int tiles, int warps, voi
         if (warps == 1) run_block<1>(*a, bx, by, bz);
         else if (warps == 2) run_block<2>(*a, bx, by, bz);
         else if (warps == 4) run_block<4>(*a, bx, by, bz);
-        else run_block<8>(*a, bx, by, bz);
+        else if (warps == 8) run_block<8>(*a, bx, by, bz);
+        else run_block<16>(*a, bx, by, bz);
       }
   return 0;
 }
 #else
 int hi_sm75_rel_attention(const Args* a, int num_reqs, int tiles, int warps, void* stream) {
   dim3 grid(tiles, a->num_kv_heads * a->num_splits, num_reqs);
-  if (warps == 1)
-    rel_attention_kernel<1><<<grid, 32, 0, (cudaStream_t)stream>>>(*a);
-  else if (warps == 2)
-    rel_attention_kernel<2><<<grid, 64, 0, (cudaStream_t)stream>>>(*a);
-  else if (warps == 4)
-    rel_attention_kernel<4><<<grid, 128, 0, (cudaStream_t)stream>>>(*a);
-  else
-    rel_attention_kernel<8><<<grid, 256, 0, (cudaStream_t)stream>>>(*a);
-  return (int)cudaGetLastError();
+  cudaStream_t s = (cudaStream_t)stream;
+  switch (warps) {
+    case 1: return launch<1>(*a, grid, s);
+    case 2: return launch<2>(*a, grid, s);
+    case 4: return launch<4>(*a, grid, s);
+    case 8: return launch<8>(*a, grid, s);
+    default: return launch<16>(*a, grid, s);
+  }
 }
 #endif
-int hi_sm75_abi(void) { return 5; }
+int hi_sm75_abi(void) { return 6; }
 #ifdef COUNT_RESCALES
 void hi_sm75_rescales(long* out) { out[0] = rescales; out[1] = iterations; }
 #endif
