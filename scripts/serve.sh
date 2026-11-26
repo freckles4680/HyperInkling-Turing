@@ -4,7 +4,7 @@
 # (Open WebUI, Unsloth Studio, any OpenAI client) at  http://<this machine>:<PORT>/v1
 #
 #   scripts/serve.sh                          # foreground; run it inside tmux to keep it up
-#   PORT=9000 API_KEY=secret scripts/serve.sh # anything below can be set on the command line
+#   BIND=127.0.0.1 PORT=9000 API_KEY=secret scripts/serve.sh   # anything below can be set on the command line
 #
 # This is a thin wrapper: it sets the variables below and runs ./start.sh, which holds the
 # full list of knobs with their measurements. Edit the defaults here to keep a change.
@@ -24,8 +24,11 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 # --- network ---------------------------------------------------------------------------
-# 0.0.0.0 listens on every interface (the LAN). 127.0.0.1 = this machine only.
-export HOST=${HOST:-0.0.0.0}
+# 0.0.0.0 listens on every interface (the LAN). 127.0.0.1 = this machine only. (Not named
+# HOST: some shells and login setups already set HOST to the machine's name, which would
+# override the value here.)
+BIND=${BIND:-0.0.0.0}
+export HOST=$BIND
 # The port clients connect to. Change it if 8080 is taken (start.sh refuses a busy port).
 export PORT=${PORT:-8080}
 # A shared secret every client must send ("Authorization: Bearer <key>"; front ends call it
@@ -90,7 +93,13 @@ if [ -n "$API_KEY" ]; then export VLLM_API_KEY=$API_KEY; fi
 if nvidia-smi --query-compute-apps=name --format=csv,noheader 2> /dev/null | grep -q .; then
 	echo "serve: other programs are computing on the GPU (nvidia-smi); the server shares it" >&2
 fi
-address=$(hostname -I 2> /dev/null | awk '{print $1}')
+if [ "$BIND" = 0.0.0.0 ]; then
+	address=$(hostname -I 2> /dev/null | awk '{print $1}')
+	echo "serve: listening on every interface"
+else
+	address=$BIND
+	echo "serve: listening on $BIND only"
+fi
 echo "serve: http://${address:-<this machine>}:$PORT/v1  model '$SERVED_NAME'" \
 	"$([ -n "$API_KEY" ] && echo '(API key required)' || echo '(no API key)')"
 echo "serve: ready when  curl -sf http://127.0.0.1:$PORT/health  succeeds (a minute or two)"
