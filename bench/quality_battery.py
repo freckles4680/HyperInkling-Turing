@@ -11,7 +11,8 @@
 
 Greedy (temperature 0) and reasoning at the template default, so two servers are
 comparable; batching still moves a few answers (about +-1 point at n=200). Results are
-printed and saved to bench/quality-data/result-<label>.json.
+printed and saved to bench/quality-data/result-<label>.json; every answer goes to
+bench/quality-data/answers-<label>.jsonl as it arrives (tail -f it to follow a run).
 """
 
 import argparse
@@ -21,6 +22,7 @@ import math
 import re
 import subprocess
 import sys
+import threading
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -78,7 +80,8 @@ def gsm8k_one(port, item):
     msg = _post(port, {"messages": [{"role": "user", "content": q + "\n\nEnd with the final "
                                      "answer as a plain number on its own line."}]})
     got = _number(msg.get("content"))
-    return {"ok": got is not None and math.isclose(got, gold, abs_tol=1e-6)}
+    return {"ok": got is not None and math.isclose(got, gold, abs_tol=1e-6),
+            "question": q, "gold": gold, "answer": msg.get("content")}
 
 
 # --- tools ---------------------------------------------------------------------------
@@ -132,7 +135,8 @@ def tools_one(port, item):
             calls.append("invalid")
     names = sorted(json.loads(k)[0] for k in gold)
     got_names = sorted(json.loads(k)[0] if k != "invalid" else k for k in calls)
-    return {"ok": sorted(calls) == gold, "names": got_names == names}
+    return {"ok": sorted(calls) == gold, "names": got_names == names,
+            "question": user, "gold": gold, "answer": sorted(calls) or msg.get("content")}
 
 
 # --- docvqa --------------------------------------------------------------------------
@@ -187,8 +191,10 @@ def docvqa_one(port, item):
     try:
         ans = json.loads(msg.get("content") or "")["answer"]
     except (json.JSONDecodeError, KeyError, TypeError):
-        return {"ok": 0.0, "json": False}
-    return {"ok": _anls(str(ans), golds), "json": True}
+        return {"ok": 0.0, "json": False, "question": q, "gold": list(golds),
+                "answer": msg.get("content")}
+    return {"ok": _anls(str(ans), golds), "json": True, "question": q, "gold": list(golds),
+            "answer": ans}
 
 
 TASKS = {"gsm8k": (gsm8k_items, gsm8k_one), "tools": (tools_items, tools_one),
@@ -197,11 +203,22 @@ TASKS = {"gsm8k": (gsm8k_items, gsm8k_one), "tools": (tools_items, tools_one),
 
 def run(args):
     report = {}
+    # Every answer as it arrives, to follow a run: tail -f bench/quality-data/answers-<label>.jsonl
+    answers = (DATA / f"answers-{args.label}.jsonl").open("w")
+    lock = threading.Lock()
+
+    def logged(name, one, item):
+        r = one(args.port, item)
+        with lock:
+            answers.write(json.dumps({"task": name, **r}, ensure_ascii=False, default=str) + "\n")
+            answers.flush()
+        return r
+
     for name in args.tasks:
         items_fn, one = TASKS[name]
         items = items_fn(args.n)
         with ThreadPoolExecutor(args.jobs) as ex:
-            res = list(ex.map(lambda it, one=one: one(args.port, it), items))
+            res = list(ex.map(lambda it, name=name, one=one: logged(name, one, it), items))
         n = len(res)
         score = sum(float(r["ok"]) for r in res) / n
         stderr = math.sqrt(max(score * (1 - score), 1e-9) / n)
