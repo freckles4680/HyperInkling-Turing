@@ -8,6 +8,7 @@ the Triton kernel it replaces, on random paged E4M3 caches.
 - test_cpu_phases: the same source compiled for the CPU (g++, HOST_EMU: the kernel's phases
   one lane after the other) against Triton. If this passes and test_device fails, the fault
   is in what only the GPU build has (tensor-core fragments, warp timing), not in the math.
+- test_phases (-s): the kernel rebuilt without one part each, timed (several minutes).
 - test_speed (-s): both kernels for decode at 90k tokens (and blocks per SM for the new
   one), for a local layer of a decode step, and for a prefill chunk.
 
@@ -276,3 +277,51 @@ def test_speed():
                 f"  ending at {seq:5d} tokens, {name:11s}: Triton {old / 1e3:8.1f} ms, "
                 f"tensor cores {new / 1e3:7.1f} ms, eight warps {wide / 1e3:7.1f} ms"
             )
+
+
+def test_phases(tmp_path):
+    """Where the kernel's time goes (-s): builds without one part each (-DABLATE, wrong
+    results), for a decode launch at 90k tokens and a prefill chunk ending at 32k."""
+    if not LIB.exists():
+        pytest.skip(f"{LIB} is not built (scripts/build-sm75-kernels.sh)")
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    decode = _device(_inputs(2, [1], [90000], 1024, unit=True))
+    prefill = _device(_inputs(3, [2048], [32768], 1024, unit=True))
+    parts = {
+        "nothing": 0,
+        "KV loads": 1,
+        "QK": 2,
+        "logits": 4,
+        "softmax": 8,
+        "PV": 16,
+        "both products": 18,
+        "everything": 31,
+    }
+    base = {}
+    print()
+    for name, bits in parts.items():
+        path = tmp_path / f"ablate{bits}.so"
+        subprocess.run(
+            [str(REPO / "scripts/build-sm75-kernels.sh")],
+            check=True,
+            capture_output=True,
+            env={**os.environ, "OUT": str(path), "FLAGS": f"-DABLATE={bits}"},
+        )
+        lib = attention_sm75.load_library(str(path))
+        times = {
+            "decode": _time(lambda: _sm75(decode, 5 * sms // 8, False, lib)) / 1e3,
+            "prefill": _time(lambda: _sm75(prefill, 1, False, lib, 0, OUT_LSE), reps=3)
+            / 1e3,
+            "window": _time(
+                lambda: _sm75(prefill, 1, False, lib, 1024, OUT_LSE), reps=3
+            )
+            / 1e3,
+        }
+        base = base or times
+        print(
+            f"without {name:13s}: "
+            + ", ".join(
+                f"{kind} {ms:7.2f} ms ({(1 - ms / base[kind]) * 100:3.0f}% less)"
+                for kind, ms in times.items()
+            )
+        )

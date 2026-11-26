@@ -63,6 +63,16 @@ static DEV uint16_t float_to_half_bits(float x) {
 #define NT (BN / 16)
 #define LOG2E 1.4426950408889634f
 #define LN2 0.6931471805599453f
+// -DABLATE=<bits>: a build that leaves parts out, for timing them on the card
+// (tests/test_sm75_attention.py::test_phases); its results are wrong.
+#ifndef ABLATE
+#define ABLATE 0
+#endif
+#define NO_LOADS 1    // the K and V reads from the cache
+#define NO_QK 2       // the Q K^T products
+#define NO_LOGITS 4   // scale, bias and mask
+#define NO_SOFTMAX 8  // max, probabilities, running state
+#define NO_PV 16      // the P V products
 #define MODE_OUT_LSE 0
 #define MODE_PARTIAL 2
 
@@ -292,7 +302,7 @@ static DEV void phase_load(const Args& a, const Block& b, Shared<NW>& sm, Lane& 
     int j = (t / 32) * keys + i;
     int32_t key = n * BN + j;
     uint32_t kw = 0, vw = 0;
-    if (key < b.seqlen_k) {
+    if (!(ABLATE & NO_LOADS) && key < b.seqlen_k) {
       int32_t page = a.block_table[(int64_t)b.req * a.stride_bt + (key >> a.page_shift)];
       int64_t off = (int64_t)page * a.stride_kv_blk +
                     (int64_t)(key & (a.page - 1)) * a.stride_kv_slot +
@@ -326,6 +336,7 @@ static DEV void phase_logits(const Args& a, const Block& b, Shared<NW>& sm, cons
   const int keys = BN / NW, w = t / 32, c = t % 32;
   for (int i = 0; i < keys; i++) store_decoded(sm.kv, w * keys + i, c, ln.vraw[i]);
   WarpShared& ws = sm.w[w];
+  if (ABLATE & NO_LOGITS) return;
   const int32_t key = n * BN + c;
   const int32_t e_pad = a.extent + 256;
   for (int r = 0; r < ROWS; r++) {
@@ -488,12 +499,14 @@ KERNEL_HEAD {
   for (int i = 0; i < b.num_iters; i++) {
     const int n = b.n_lo + b.split + i * a.num_splits;
     PHASE(phase_load(a, b, sm, ln, n, t))
-    PHASE(phase_qk(sm, f, t))
+    if (!(ABLATE & NO_QK)) PHASE(phase_qk(sm, f, t))
     PHASE(phase_logits(a, b, sm, ln, n, t))
-    PHASE(phase_max(sm, t))
-    PHASE(phase_probs(sm, t))
-    PHASE(phase_state(sm, t))
-    if (sm.rescale) {
+    if (!(ABLATE & NO_SOFTMAX)) {
+      PHASE(phase_max(sm, t))
+      PHASE(phase_probs(sm, t))
+      PHASE(phase_state(sm, t))
+    }
+    if (sm.rescale && !ABLATE) {
 #ifdef COUNT_RESCALES
       rescales++;
 #endif
@@ -503,7 +516,7 @@ KERNEL_HEAD {
         PHASE(load_acc_row(f.acc[dt], sm.w[t / 32].scratch, 16, t % 32))
       }
     }
-    PHASE(phase_pv(sm, f, t))
+    if (!(ABLATE & NO_PV)) PHASE(phase_pv(sm, f, t))
   }
   for (int dt = 0; dt < DT; dt++) {
     PHASE(store_row(sm.w[t / 32].scratch, f.acc[dt], 16, t % 32))

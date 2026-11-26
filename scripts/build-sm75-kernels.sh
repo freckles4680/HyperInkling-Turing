@@ -15,9 +15,9 @@ nvcc=$CUDA_HOME/bin/nvcc
 ccbin=()
 # nvcc 13.3 rejects gcc 16 (the Fedora 44 default), as in build-vllm.sh.
 if command -v g++-15 > /dev/null; then ccbin=(-ccbin g++-15); fi
-out=venv/hyperinkling_sm75.so
+out=${OUT:-venv/hyperinkling_sm75.so}  # OUT, FLAGS: other builds (the tests' -DABLATE ones)
 # --cudart shared: the CUDA runtime torch has already loaded, not a second static copy.
-"$nvcc" "${ccbin[@]}" -O3 -arch=sm_75 -shared --cudart shared -Xcompiler -fPIC \
+"$nvcc" "${ccbin[@]}" -O3 -arch=sm_75 -shared --cudart shared -Xcompiler -fPIC ${FLAGS:-} \
 	-o "$out.tmp" kernels/sm75/rel_attention.cu
 mv "$out.tmp" "$out"
 echo "built $out ($("$nvcc" --version | grep -o 'release [0-9.]*'))"
