@@ -1,4 +1,4 @@
-From fa4868ee1a93bb037d62a233f5c87fa20bcc1ce0 Mon Sep 17 00:00:00 2001
+From b9e75176c66316f02ddaed19d7a21bfd689d9cb1 Mon Sep 17 00:00:00 2001
 From: Pento95 <173375476+Pento95@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 05:39:42 +0100
 Subject: [PATCH] [hyperinkling] Inkling 2 Mini on Ampere (sm86)
@@ -98,7 +98,9 @@ gates PDL/TMA, e4m3 conversions and the native conv/mix kernels below SM90):
   as FMA through shared memory (80% of a 2080 Ti decode step, ~2 ms a
   call). Up to 64 rows: _w8_gemv_kernel (3D tiles of rows x outputs x K,
   products accumulated elementwise, one K reduction at the end; tiles
-  measured on a 2080 Ti in sm75_gemv_tile); above: dequantized 8192-row
+  measured on a 2080 Ti in sm75_gemv_tile; 3 and 4 rows on the 8-row tile);
+  a full layer's q/k/v from three inputs in one launch whose columns pick
+  their input (gemv3_sm75), not three times the rows; above: dequantized 8192-row
   blocks on cuBLAS. The same kernel without scales (gemv_sm75) serves
   k_group_partials up to 64 rows on sm75 (MoE router, sconv taps, already
   summed), and linear_k_groups above that runs on cuBLAS; the K-group
@@ -136,26 +138,26 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/models/inkling/nvidia/ops/sconv.py       |  10 +-
  vllm/models/inkling/nvidia/sconv_swa_attn.py  | 147 +++++++-
  vllm/models/inkling2/nvidia/attention.py      |  74 +++-
- vllm/models/inkling2/nvidia/dspark.py         | 197 +++++++++--
+ vllm/models/inkling2/nvidia/dspark.py         | 197 ++++++++--
  vllm/models/inkling2/nvidia/loop.py           |  54 ++-
- vllm/models/inkling2/nvidia/model.py          | 119 ++++++-
+ vllm/models/inkling2/nvidia/model.py          | 119 +++++-
  vllm/models/inkling2/nvidia/moe.py            | 110 +++++-
  vllm/models/inkling2/nvidia/ops/__init__.py   |  72 ++++
  vllm/models/inkling2/nvidia/ops/activation.py |  17 +-
  vllm/models/inkling2/nvidia/ops/attention.py  |  50 ++-
- .../inkling2/nvidia/ops/attention_sm75.py     | 322 ++++++++++++++++++
+ .../inkling2/nvidia/ops/attention_sm75.py     | 322 +++++++++++++++++
  .../inkling2/nvidia/ops/attention_sm90.py     |  37 +-
  vllm/models/inkling2/nvidia/ops/bgemv.py      | 183 ++++++++++
  vllm/models/inkling2/nvidia/ops/conv_mix.py   |   2 +-
  vllm/models/inkling2/nvidia/ops/dspark.py     |  87 +++--
  vllm/models/inkling2/nvidia/ops/e4m3.py       |  10 +
  vllm/models/inkling2/nvidia/ops/linear.py     |  17 +-
- vllm/models/inkling2/nvidia/ops/linear_w4.py  | 210 ++++++++++++
- vllm/models/inkling2/nvidia/ops/linear_w8.py  | 289 ++++++++++++++++
+ vllm/models/inkling2/nvidia/ops/linear_w4.py  | 210 +++++++++++
+ vllm/models/inkling2/nvidia/ops/linear_w8.py  | 340 ++++++++++++++++++
  .../inkling2/nvidia/ops/ll_gemm_sm120.py      |  25 +-
- vllm/models/inkling2/nvidia/ops/lookup.py     | 233 +++++++++++++
+ vllm/models/inkling2/nvidia/ops/lookup.py     | 233 ++++++++++++
  vllm/models/inkling2/nvidia/ops/loop.py       |   5 +-
- vllm/models/inkling2/nvidia/ops/moe_marlin.py | 274 +++++++++++++++
+ vllm/models/inkling2/nvidia/ops/moe_marlin.py | 274 ++++++++++++++
  vllm/models/inkling2/nvidia/ops/moe_sm120.py  |   6 +-
  vllm/models/inkling2/nvidia/ops/moe_sm90.py   |  13 +-
  vllm/models/inkling2/nvidia/ops/sconv.py      |   3 +-
@@ -167,12 +169,12 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/models/inkling2/speculator.py            |  24 +-
  vllm/models/inkling2/speculator_config.py     |  19 +-
  vllm/v1/core/kv_cache_manager.py              |   3 +
- vllm/v1/core/sched/scheduler.py               |  38 ++-
+ vllm/v1/core/sched/scheduler.py               |  38 +-
  vllm/v1/core/single_type_kv_cache_manager.py  |   4 +
  vllm/v1/engine/core.py                        |  84 +++++
  vllm/v1/spec_decode/dynamic/adaptive_k.py     | 130 +++++++
  vllm/v1/structured_output/backend_xgrammar.py |  41 ++-
- 44 files changed, 2942 insertions(+), 193 deletions(-)
+ 44 files changed, 2993 insertions(+), 193 deletions(-)
  create mode 100644 vllm/models/inkling2/nvidia/ops/attention_sm75.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/bgemv.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/linear_w4.py
@@ -2911,10 +2913,10 @@ index 0000000000..8bcd77f4da
 +        return w4_matmul(x.contiguous(), self.packed, self.scale, self.zero, out)
 diff --git a/vllm/models/inkling2/nvidia/ops/linear_w8.py b/vllm/models/inkling2/nvidia/ops/linear_w8.py
 new file mode 100644
-index 0000000000..e1aaa136c7
+index 0000000000..6f5f95e58c
 --- /dev/null
 +++ b/vllm/models/inkling2/nvidia/ops/linear_w8.py
-@@ -0,0 +1,289 @@
+@@ -0,0 +1,340 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""HyperInkling W8A16 linears: bf16 weights quantized at load time to int8
@@ -2995,7 +2997,7 @@ index 0000000000..e1aaa136c7
 +
 +@triton.jit
 +def _w8_gemv_kernel(
-+    X, W, S, Y, M, N, K, KS, SX, SW, SS, SY, BX, BW, BY, XP,
++    X, W, S, Y, M, N, K, KS, SX, SW, SS, SY, BX, BW, BY, XP, C1, C2,
 +    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, GROUP_K: tl.constexpr,
 +    HAS_SCALE: tl.constexpr, SPLIT: tl.constexpr, NX: tl.constexpr,
 +):  # fmt: skip
@@ -3007,11 +3009,15 @@ index 0000000000..e1aaa136c7
 +    plain bf16/fp16 weight (the K-group linears and the router). Axis 2 runs
 +    batches (strides BX, BW) times SPLIT slices of KS along K; each writes its
 +    own `[M, N]` at Y + axis 2 * BY (the loop controllers). x is the sum, in
-+    order, of NX partials XP apart (the previous call's K slices)."""
++    order, of NX partials XP apart (the previous call's K slices). Columns from
++    C1 and from C2 on take the second and third M rows of X (`gemv3_sm75`)."""
 +    pid_n = tl.program_id(0)
 +    pid_m = tl.program_id(1)
 +    pid_b = tl.program_id(2)
 +    X += (pid_b // SPLIT).to(tl.int64) * BX
++    first_col = pid_n * BN
++    segment = (first_col >= C1).to(tl.int64) + (first_col >= C2).to(tl.int64)
++    X += segment * M * SX
 +    W += (pid_b // SPLIT).to(tl.int64) * BW
 +    Y += pid_b.to(tl.int64) * BY
 +    k_lo = (pid_b % SPLIT) * KS
@@ -3052,14 +3058,39 @@ index 0000000000..e1aaa136c7
 +    """(BM, BN, BK, warps) of `_w8_gemv_kernel`, from bench/sm75_w8_gemv.py on a
 +    2080 Ti (L2-cold INT8 weights, K 2304): few accumulators (1-2k fp32) beat
 +    big tiles 2-4x, as many blocks keep more loads in flight. 1 row: 565 GB/s
-+    on the LM head (the card's peak is 616). 3-4 rows were not measured."""
++    on the LM head (the card's peak is 616). 3 and 4 rows take the 8-row tile:
++    in a decode profile the four-warp `(4, 4, 64)` tile took 3.0 ms on the LM
++    head against 1.7 for 8 rows, and 111 us against 69 on qkvr."""
 +    if m == 1:
 +        return 1, 8, 128, 8
 +    if m == 2:
 +        return 2, 8, 64, 8
-+    if m <= 4:
-+        return 4, 4, 64, 4
 +    return 8, 4 if n >= 32768 else 2, 128, 1
++
++
++_NO_SEGMENT = 1 << 30  # C1, C2 past any column: every column takes X's first M rows
++
++
++def gemv3_sm75(x3, w, scale, out, c1, c2, tile):
++    """`out [M, N]`: columns below `c1` are `x3[:M] @ w.T`, columns up to `c2`
++    `x3[M:2M] @ w.T`, the rest `x3[2M:] @ w.T` (attention's q side, k and v
++    from three inputs). One launch that reads the weight once and computes
++    each column for its own rows only: stacking the inputs as rows computed
++    every column three times, on a kernel that FMAs bound (150 us against 69
++    for a decode step's qkvr on a 2080 Ti)."""
++    m, k = x3.shape[0] // 3, x3.shape[1]
++    bm, bn, bk, warps = tile
++    assert k % bk == 0 and x3.stride(1) == 1 and w.stride(1) == 1
++    assert c1 % bn == 0 and c2 % bn == 0 and x3.shape[0] == 3 * m
++    grid = (triton.cdiv(w.shape[0], bn), triton.cdiv(m, bm), 1)
++    _w8_gemv_kernel[grid](
++        x3, w, scale, out, m, w.shape[0], k, k,
++        x3.stride(0), w.stride(0), scale.stride(0), out.stride(0),
++        0, 0, 0, 0, c1, c2,
++        BM=bm, BN=bn, BK=bk, GROUP_K=GROUP, HAS_SCALE=True, SPLIT=1, NX=1,
++        num_warps=warps, num_stages=1,
++    )  # fmt: skip
++    return out
 +
 +
 +def gemv_sm75(x, w, scale, out, tile):
@@ -3072,7 +3103,7 @@ index 0000000000..e1aaa136c7
 +    _w8_gemv_kernel[grid](
 +        x, w, w if scale is None else scale, out, m, w.shape[0], k, k,
 +        x.stride(0), w.stride(0), 0 if scale is None else scale.stride(0), out.stride(0),
-+        0, 0, 0, 0,
++        0, 0, 0, 0, _NO_SEGMENT, _NO_SEGMENT,
 +        BM=bm, BN=bn, BK=bk, GROUP_K=GROUP, HAS_SCALE=scale is not None, SPLIT=1, NX=1,
 +        num_warps=warps, num_stages=1,
 +    )  # fmt: skip
@@ -3097,7 +3128,7 @@ index 0000000000..e1aaa136c7
 +    _w8_gemv_kernel[grid](
 +        x, w, w, out, m, n, k, ks,
 +        x4.stride(2), w.stride(1), 0, out.stride(2), x4.stride(0), w.stride(0), out.stride(1),
-+        x4.stride(1),
++        x4.stride(1), _NO_SEGMENT, _NO_SEGMENT,
 +        BM=bm, BN=bn, BK=bk, GROUP_K=GROUP, HAS_SCALE=False, SPLIT=split, NX=nx,
 +        num_warps=warps, num_stages=1,
 +    )  # fmt: skip
@@ -3187,12 +3218,34 @@ index 0000000000..e1aaa136c7
 +    ) -> torch.Tensor:
 +        return w8_matmul(x.contiguous(), self.q, self.scale, out)
 +
++    def _one_launch(self, rows: list[int], col_ranges: list[tuple[int, int]]) -> bool:
++        """Three inputs of the same decode-size row count over column ranges
++        that follow each other from 0 (`gemv3_sm75`)."""
++        return (
++            len(rows) == 3
++            and rows[0] == rows[1] == rows[2]
++            and 0 < rows[0] <= SM75_GEMV_MAX_M
++            and col_ranges[0][0] == 0
++            and col_ranges[0][1] == col_ranges[1][0]
++            and col_ranges[1][1] == col_ranges[2][0]
++            and col_ranges[2][1] <= self.size_n
++        )
++
 +    def multi(
 +        self, inputs: list[torch.Tensor], col_ranges: list[tuple[int, int]]
 +    ) -> list[torch.Tensor]:
 +        """`inputs[i] @ weight[col_ranges[i]].T` for each i, reading the weight
 +        once when the stacked rows fit one decode tile, else one launch each."""
 +        rows = [x.shape[0] for x in inputs]
++        if is_sm75() and self._one_launch(rows, col_ranges):
++            m, bn = rows[0], sm75_gemv_tile(rows[0], self.size_n)[1]
++            c1, c2 = col_ranges[1][0], col_ranges[2][0]
++            if c1 % bn == 0 and c2 % bn == 0:
++                x3 = torch.cat(inputs)
++                y = torch.empty((m, self.size_n), dtype=x3.dtype, device=x3.device)
++                tile = sm75_gemv_tile(m, self.size_n)
++                gemv3_sm75(x3, self.q, self.scale, y, c1, c2, tile)
++                return [y[:, lo:hi] for lo, hi in col_ranges]
 +        if sum(rows) <= 32:
 +            y = w8_matmul(torch.cat(inputs), self.q, self.scale)
 +            out, start = [], 0
