@@ -134,6 +134,16 @@ MAX_LEN=8192 bench/profile_spec.sh t6 1 128             # kernel time per decode
 The matrix rows carry `gpu_gib` 22. Append them to `docs/memory_matrix.tsv`, and the
 wizard then uses them in place of the 24 GiB estimate.
 
+### A desktop on the same card
+
+A compositor on the 2080 Ti takes turns with the server: measured at a fixed verify length
+(`HYPERINKLING_SPEC_ADAPTIVE=`), a decode step took 39.7 ms with the desktop running and
+36.5 ms without it at 90k context (31.0 and 28.0 ms at 8k), prefill was 11% faster, and the
+fitted context rose from 120k to 145k tokens. For a server that should be as fast as the
+card allows, stop the display manager (`sudo systemctl isolate multi-user.target`, which
+closes the graphical session; `graphical.target` brings it back) or drive the display
+from another GPU.
+
 ## What is not done
 
 - DSpark in fp16 has not run yet (step 4).
