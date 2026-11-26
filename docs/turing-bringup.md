@@ -144,6 +144,14 @@ card allows, stop the display manager (`sudo systemctl isolate multi-user.target
 closes the graphical session; `graphical.target` brings it back) or drive the display
 from another GPU.
 
+### Serving a front end, with its speed shown
+
+`scripts/serve.sh` runs `start.sh` on the LAN with this card's settings (every knob is a
+commented variable at its top) and, on port 8081, `scripts/speed_proxy.py`: the same API
+with one line under each streamed chat answer, prefill and decode in tokens per second,
+measured per request. Open WebUI, Unsloth or any OpenAI client: base URL
+`http://<machine>:8081/v1` (8080 for the plain API), model `inkling-2-mini`.
+
 ## What is not done
 
 - DSpark in fp16 has not run yet (step 4).
