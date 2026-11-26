@@ -12,7 +12,8 @@
 //
 // A block owns the whole tokens that fit in `NW * 16` rows (tokens x GQA group: 5, 10 or
 // 21 tokens of the model's 3 heads per KV head) of one request and KV head: one or two
-// warps for decode, four for prefill, so a prefill tile reads its keys once for 64 rows. Each
+// warps for decode, four or eight for prefill, so a prefill tile reads its keys once for 64
+// or 128 rows (a full layer over a long context is bound by those reads). Each
 // warp keeps its 16 rows' Q and output accumulators in tensor-core fragments; the block
 // shares the decoded keys and values, 32 keys an iteration. A key's 128 bytes are read by
 // a whole warp (lane `l` takes word `l`): one contiguous transaction a key. (A lane
@@ -60,7 +61,6 @@ static DEV uint16_t float_to_half_bits(float x) {
 #define BN 32      // keys per iteration
 #define DT (D / 16)
 #define NT (BN / 16)
-#define MAX_NW 4
 #define LOG2E 1.4426950408889634f
 #define LN2 0.6931471805599453f
 #define MODE_OUT_LSE 0
@@ -113,7 +113,8 @@ struct alignas(32) WarpShared {
   float alpha[ROWS];
 };
 
-// 12.7 KB for one warp (five blocks per SM in Turing's 64 KB), 26.4 KB for four (two).
+// 12.7 KB for one warp (five blocks per SM in Turing's 64 KB), 26.4 KB for four (two),
+// 44.6 KB for eight (one).
 template <int NW>
 struct alignas(32) Shared {
   uint16_t kv[BN * D];      // fp16 bits: a warp's Q at start, then K and V of the iteration
@@ -492,7 +493,7 @@ KERNEL_HEAD {
 }
 
 extern "C" {
-// `tiles`: blocks along the query tokens (`warps * 16 / group` tokens each); `warps` 1, 2 or 4.
+// `tiles`: blocks along the query tokens (`warps * 16 / group` tokens each); `warps` 1, 2, 4 or 8.
 #ifdef HOST_EMU
 int hi_sm75_rel_attention(const Args* a, int num_reqs, int tiles, int warps, void*) {
   for (int bz = 0; bz < num_reqs; bz++)
@@ -500,7 +501,8 @@ int hi_sm75_rel_attention(const Args* a, int num_reqs, int tiles, int warps, voi
       for (int bx = 0; bx < tiles; bx++) {
         if (warps == 1) run_block<1>(*a, bx, by, bz);
         else if (warps == 2) run_block<2>(*a, bx, by, bz);
-        else run_block<MAX_NW>(*a, bx, by, bz);
+        else if (warps == 4) run_block<4>(*a, bx, by, bz);
+        else run_block<8>(*a, bx, by, bz);
       }
   return 0;
 }
@@ -511,10 +513,12 @@ int hi_sm75_rel_attention(const Args* a, int num_reqs, int tiles, int warps, voi
     rel_attention_kernel<1><<<grid, 32, 0, (cudaStream_t)stream>>>(*a);
   else if (warps == 2)
     rel_attention_kernel<2><<<grid, 64, 0, (cudaStream_t)stream>>>(*a);
+  else if (warps == 4)
+    rel_attention_kernel<4><<<grid, 128, 0, (cudaStream_t)stream>>>(*a);
   else
-    rel_attention_kernel<MAX_NW><<<grid, MAX_NW * 32, 0, (cudaStream_t)stream>>>(*a);
+    rel_attention_kernel<8><<<grid, 256, 0, (cudaStream_t)stream>>>(*a);
   return (int)cudaGetLastError();
 }
 #endif
-int hi_sm75_abi(void) { return 4; }
+int hi_sm75_abi(void) { return 5; }
 }

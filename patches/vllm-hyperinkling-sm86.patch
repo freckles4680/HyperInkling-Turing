@@ -1,4 +1,4 @@
-From 6a8bd8d9f062242657b778709a91366fa2012c6a Mon Sep 17 00:00:00 2001
+From 53453a366c29c1cc4877f88d486b3e7e0f8b44bd Mon Sep 17 00:00:00 2001
 From: Pento95 <173375476+Pento95@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 05:39:42 +0100
 Subject: [PATCH] [hyperinkling] Inkling 2 Mini on Ampere (sm86)
@@ -109,7 +109,9 @@ gates PDL/TMA, e4m3 conversions and the native conv/mix kernels below SM90):
 - Attention on sm75 (ops/attention_sm75.py): prefill (MODE_OUT_LSE, full
   and sliding-window layers) and the full layers' split decode partials
   (MODE_PARTIAL, at most 64 rows; any GQA group up to 16, the model has
-  3 heads per KV head; the local layers' short launches stay on
+  3 heads per KV head; blocks per SM by the block's warps, measured;
+  HYPERINKLING_SM75_PREFILL_WARPS=8 for 128-row prefill blocks on the
+  full layers; the local layers' short launches stay on
   Triton, and the first launch of each kind logs which kernel serves and
   why) over the E4M3 byte cache, from a CUDA wmma kernel
   of the HyperInkling repository (kernels/sm75, loaded through ctypes
@@ -129,35 +131,35 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/config/vllm.py                           |   4 +
  vllm/entrypoints/common/cli_args.py           |   7 +-
  .../openai/chat_completion/serving.py         |   1 +
- .../serve/middleware/authenticate.py          |  34 ++-
+ .../serve/middleware/authenticate.py          |  34 +-
  vllm/envs.py                                  |   6 +
  vllm/models/inkling/nvidia/ops/sconv.py       |  10 +-
  vllm/models/inkling/nvidia/sconv_swa_attn.py  | 147 ++++++++-
  vllm/models/inkling2/nvidia/attention.py      |  74 ++++-
  vllm/models/inkling2/nvidia/dspark.py         | 197 +++++++++---
  vllm/models/inkling2/nvidia/loop.py           |  54 +++-
- vllm/models/inkling2/nvidia/model.py          | 119 +++++++-
+ vllm/models/inkling2/nvidia/model.py          | 119 ++++++-
  vllm/models/inkling2/nvidia/moe.py            | 110 ++++++-
  vllm/models/inkling2/nvidia/ops/__init__.py   |  72 +++++
  vllm/models/inkling2/nvidia/ops/activation.py |  17 +-
- vllm/models/inkling2/nvidia/ops/attention.py  |  49 ++-
- .../inkling2/nvidia/ops/attention_sm75.py     | 279 +++++++++++++++++
+ vllm/models/inkling2/nvidia/ops/attention.py  |  50 ++-
+ .../inkling2/nvidia/ops/attention_sm75.py     | 304 ++++++++++++++++++
  .../inkling2/nvidia/ops/attention_sm90.py     |  37 ++-
  vllm/models/inkling2/nvidia/ops/bgemv.py      | 183 +++++++++++
  vllm/models/inkling2/nvidia/ops/conv_mix.py   |   2 +-
- vllm/models/inkling2/nvidia/ops/dspark.py     |  87 ++++--
+ vllm/models/inkling2/nvidia/ops/dspark.py     |  87 +++--
  vllm/models/inkling2/nvidia/ops/e4m3.py       |  10 +
  vllm/models/inkling2/nvidia/ops/linear.py     |  17 +-
- vllm/models/inkling2/nvidia/ops/linear_w4.py  | 210 +++++++++++++
- vllm/models/inkling2/nvidia/ops/linear_w8.py  | 289 ++++++++++++++++++
+ vllm/models/inkling2/nvidia/ops/linear_w4.py  | 210 ++++++++++++
+ vllm/models/inkling2/nvidia/ops/linear_w8.py  | 289 +++++++++++++++++
  .../inkling2/nvidia/ops/ll_gemm_sm120.py      |  25 +-
  vllm/models/inkling2/nvidia/ops/lookup.py     | 233 ++++++++++++++
  vllm/models/inkling2/nvidia/ops/loop.py       |   5 +-
- vllm/models/inkling2/nvidia/ops/moe_marlin.py | 274 +++++++++++++++++
+ vllm/models/inkling2/nvidia/ops/moe_marlin.py | 274 ++++++++++++++++
  vllm/models/inkling2/nvidia/ops/moe_sm120.py  |   6 +-
  vllm/models/inkling2/nvidia/ops/moe_sm90.py   |  13 +-
  vllm/models/inkling2/nvidia/ops/sconv.py      |   3 +-
- vllm/models/inkling2/nvidia/ops/vision.py     |  55 ++--
+ vllm/models/inkling2/nvidia/ops/vision.py     |  55 +++-
  vllm/models/inkling2/nvidia/sconv.py          |   3 +-
  vllm/models/inkling2/nvidia/vision.py         |  46 ++-
  vllm/models/inkling2/processing.py            |  50 ++-
@@ -170,7 +172,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/v1/engine/core.py                        |  84 +++++
  vllm/v1/spec_decode/dynamic/adaptive_k.py     | 130 ++++++++
  vllm/v1/structured_output/backend_xgrammar.py |  41 ++-
- 44 files changed, 2898 insertions(+), 193 deletions(-)
+ 44 files changed, 2924 insertions(+), 193 deletions(-)
  create mode 100644 vllm/models/inkling2/nvidia/ops/attention_sm75.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/bgemv.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/linear_w4.py
@@ -1743,7 +1745,7 @@ index 9c78f1fa49..c8f8ad1928 100644
  
  @triton.jit
 diff --git a/vllm/models/inkling2/nvidia/ops/attention.py b/vllm/models/inkling2/nvidia/ops/attention.py
-index c8bc213285..53f020ed89 100644
+index c8bc213285..640502e870 100644
 --- a/vllm/models/inkling2/nvidia/ops/attention.py
 +++ b/vllm/models/inkling2/nvidia/ops/attention.py
 @@ -20,8 +20,9 @@ from vllm.triton_utils import gl, gluon, tl, tldevice, triton
@@ -1766,7 +1768,7 @@ index c8bc213285..53f020ed89 100644
      not the KV lengths, so it holds for every replay of a CUDA graph.
      """
      if max_query_len > _VERIFY_BLOCK_M // (num_heads // num_kv_heads):
-@@ -401,7 +402,15 @@ def plan_decode_attention(
+@@ -401,7 +402,16 @@ def plan_decode_attention(
          if work <= (16 if max_query_len <= 2 else 8):
              return triton.cdiv(rel_extent - 1, _FA4_BLOCK_N) + 1
          return 5 if work <= 16 else 3 if work <= 32 else 2 if work <= 64 else 1
@@ -1776,14 +1778,15 @@ index c8bc213285..53f020ed89 100644
 +        # SM; at least two splits, as a single split takes the Triton kernel. (Only
 +        # when that kernel serves: Triton with these 34 splits instead of its 17
 +        # ran decode at 8k at 63 instead of 86 tok/s on a 2080 Ti.)
-+        return max(attention_sm75.splits_per_sm() * num_sms // work, 2)
++        per_sm = attention_sm75.splits_per_sm(max_query_len, num_heads // num_kv_heads)
++        return max(per_sm * num_sms // work, 2)
 +    # HyperInkling: at least two CTAs per SM (one request: 21 splits instead of 10,
 +    # +3% decode at 32k, +10% at 128k on sm86; more splits gain nothing).
 +    return max(2 * num_sms // work, min(num_sms // 8, 6 * num_sms // work))
  
  
  _EX2_ASM = tl.constexpr("ex2.approx.ftz.f32 $0, $1;")
-@@ -1251,6 +1260,38 @@ def _decode_attention(
+@@ -1251,6 +1261,38 @@ def _decode_attention(
              num_splits,
              draft,
          )
@@ -1822,7 +1825,7 @@ index c8bc213285..53f020ed89 100644
      else:
          rel_attention(
              q,
-@@ -1378,5 +1419,5 @@ def _launch_rel_verify(
+@@ -1378,5 +1420,5 @@ def _launch_rel_verify(
          DRAFT=draft,
          WINDOW=window,
          num_warps=4,
@@ -1831,10 +1834,10 @@ index c8bc213285..53f020ed89 100644
      )
 diff --git a/vllm/models/inkling2/nvidia/ops/attention_sm75.py b/vllm/models/inkling2/nvidia/ops/attention_sm75.py
 new file mode 100644
-index 0000000000..2cbcffbdc5
+index 0000000000..56171c666b
 --- /dev/null
 +++ b/vllm/models/inkling2/nvidia/ops/attention_sm75.py
-@@ -0,0 +1,279 @@
+@@ -0,0 +1,304 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""HyperInkling, Turing (sm75): relative-bias paged attention on the fp16
@@ -1862,12 +1865,12 @@ index 0000000000..2cbcffbdc5
 +
 +logger = init_logger(__name__)
 +
-+ROWS = 16  # of a warp; a block has 1, 2 or 4 warps
++ROWS = 16  # of a warp; a block has 1, 2, 4 or 8 warps
 +MAX_ROWS = 64
 +HEAD_DIM = 128
 +MODE_OUT_LSE = 0
 +MODE_PARTIAL = 2
-+_ABI = 4
++_ABI = 5
 +
 +
 +class _Args(ctypes.Structure):
@@ -1949,12 +1952,32 @@ index 0000000000..2cbcffbdc5
 +    )
 +
 +
-+def splits_per_sm() -> int:
-+    """Blocks per SM of a full layer's decode attention: 12.5 KB of shared
-+    memory for a one-warp block (five fit in Turing's 64 KB), 17 KB for two
-+    warps; four hide the latency of the KV loads (HYPERINKLING_SM75_ATTN_CTAS
-+    to measure others)."""
-+    return int(os.environ.get("HYPERINKLING_SM75_ATTN_CTAS", "4"))
++def decode_warps(max_query_len: int, group: int) -> int:
++    """Warps of a decode block: the fewest whose rows hold a request's tokens."""
++    return next((w for w in (1, 2) if max_query_len <= w * ROWS // group), 4)
++
++
++def splits_per_sm(max_query_len: int, group: int) -> int:
++    """Blocks per SM of a full layer's decode attention, by the block's warps
++    (12.7, 17 and 26 KB of Turing's 64 KB of shared memory): measured on a
++    2080 Ti at 90k tokens, five one-warp blocks (1.5 ms a launch; four: 1.9 ms)
++    and three two-warp blocks (2.0 ms; four: 2.8 ms). HYPERINKLING_SM75_ATTN_CTAS
++    to measure others."""
++    forced = os.environ.get("HYPERINKLING_SM75_ATTN_CTAS")
++    if forced:
++        return int(forced)
++    return {1: 5, 2: 3, 4: 2}[decode_warps(max_query_len, group)]
++
++
++def prefill_warps(window: int) -> int:
++    """Warps of a prefill block: four (64 rows), or with
++    HYPERINKLING_SM75_PREFILL_WARPS=8 eight for the full layers, whose blocks
++    then read each key half as often."""
++    return (
++        int(os.environ.get("HYPERINKLING_SM75_PREFILL_WARPS", "4"))
++        if window == 0
++        else 4
++    )
 +
 +
 +def _refusal(
@@ -2026,14 +2049,15 @@ index 0000000000..2cbcffbdc5
 +    num_splits: int,
 +    mode: int,
 +    lib: ctypes.CDLL | None = None,
++    warps: int | None = None,
 +) -> None:
 +    """`ops.attention_sm90.rel_attention` in MODE_PARTIAL (fp32 `out`
 +    `(S, T, H, D)` and log2 `lse` `(S, T, H)` partials) or MODE_OUT_LSE (fp32
 +    `out` `(T, H, D)` and natural-log `lse` `(H, T)`, one split); `rel_logits`
 +    None is the DSpark draft, `window` 0 a full layer. A block holds the whole
 +    tokens of 16, 32 or 64 rows (tokens x heads per KV head): the fewest warps
-+    that take a request's tokens (decode), else four (prefill). `lib`
-+    is for tests (a CPU build of the kernel takes CPU tensors)."""
++    that take a request's tokens (decode), `prefill_warps` for prefill. `lib`
++    and `warps` are for tests (a CPU build of the kernel takes CPU tensors)."""
 +    lib = lib or _library()
 +    assert lib is not None
 +    num_tokens, num_heads, head_dim = q.shape
@@ -2068,8 +2092,12 @@ index 0000000000..2cbcffbdc5
 +        assert rel_logits.stride(1) == rel_logits.shape[2]
 +        assert rel_logits.stride(2) == 1
 +        rel = rel_logits
-+    # The fewest warps whose rows hold a request's tokens, else four.
-+    warps = next((w for w in (1, 2) if max_query_len <= w * ROWS // group), 4)
++    if warps is None:
++        if mode == MODE_PARTIAL:
++            warps = decode_warps(max_query_len, group)
++        else:
++            warps = prefill_warps(window)
++    assert warps in (1, 2, 4, 8)
 +    tokens_per_block = warps * ROWS // group
 +    args = _Args(
 +        q=q.data_ptr(),
