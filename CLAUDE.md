@@ -120,6 +120,11 @@ Benchmarks and quality (all need a running server):
   `metrics_window.py` alongside. `bench/profile_spec.sh`: kernel time per step under nsys.
 - `bench/quality_battery.py download|run` (`bench/quality_battery.sh <name>` boots its own server): GSM8K, Hermes tool calls, DocVQA as strict JSON,
   on public data (`bench/quality-data/`, not in git); compare two servers at the same settings.
+- `bench/intelligence.sh <name>`: general chatbot intelligence of a server that is already up (8080,
+  not the 8081 proxy): IFEval and MMLU-Pro via lm-evaluation-harness (own venv `.local/eval-venv`),
+  MT-Bench-style chat judged by `JUDGE_MODEL`/`JUDGE_BASE_URL`/`JUDGE_API_KEY` (`bench/mtbench.py`;
+  no judge = answers only, flagged SKIPPED). `PRESET=quick|standard|full`; one report,
+  `.local/intelligence-<name>.txt`.
 - `bench/extract_bench.py`: document extraction on public data (shared Italian system
   prompt, 1-3 DocVQA pages, JSON or summary), closed loop with `metrics_window.py` alongside.
 - `bench/greedy_ref.py save|compare`, `bench/copy_test.py`: output and acceptance checks.
