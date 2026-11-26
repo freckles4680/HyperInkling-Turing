@@ -1,4 +1,4 @@
-From 99fb16d8211d1f268af06ec889cab15726ec3c36 Mon Sep 17 00:00:00 2001
+From dc0fc55ea30aa0a6459e83ec4fff6996fa58e6ec Mon Sep 17 00:00:00 2001
 From: Pento95 <173375476+Pento95@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 05:39:42 +0100
 Subject: [PATCH] [hyperinkling] Inkling 2 Mini on Ampere (sm86)
@@ -147,13 +147,13 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/models/inkling2/nvidia/ops/attention.py  |  50 ++-
  .../inkling2/nvidia/ops/attention_sm75.py     | 322 ++++++++++++++++
  .../inkling2/nvidia/ops/attention_sm90.py     |  37 +-
- vllm/models/inkling2/nvidia/ops/bgemv.py      | 183 ++++++++++
+ vllm/models/inkling2/nvidia/ops/bgemv.py      | 183 +++++++++
  vllm/models/inkling2/nvidia/ops/conv_mix.py   |   2 +-
  vllm/models/inkling2/nvidia/ops/dspark.py     |  87 +++--
  vllm/models/inkling2/nvidia/ops/e4m3.py       |  10 +
- vllm/models/inkling2/nvidia/ops/linear.py     |  17 +-
+ vllm/models/inkling2/nvidia/ops/linear.py     |  22 +-
  vllm/models/inkling2/nvidia/ops/linear_w4.py  | 210 +++++++++++
- vllm/models/inkling2/nvidia/ops/linear_w8.py  | 343 ++++++++++++++++++
+ vllm/models/inkling2/nvidia/ops/linear_w8.py  | 346 ++++++++++++++++++
  .../inkling2/nvidia/ops/ll_gemm_sm120.py      |  25 +-
  vllm/models/inkling2/nvidia/ops/lookup.py     | 233 ++++++++++++
  vllm/models/inkling2/nvidia/ops/loop.py       |   5 +-
@@ -174,7 +174,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/v1/engine/core.py                        |  84 +++++
  vllm/v1/spec_decode/dynamic/adaptive_k.py     | 130 +++++++
  vllm/v1/structured_output/backend_xgrammar.py |  41 ++-
- 44 files changed, 2996 insertions(+), 193 deletions(-)
+ 44 files changed, 3004 insertions(+), 193 deletions(-)
  create mode 100644 vllm/models/inkling2/nvidia/ops/attention_sm75.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/bgemv.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/linear_w4.py
@@ -2654,7 +2654,7 @@ index 11465fa902..152349eeea 100644
 +    bits = ((x & 0x7F) << 7) | ((x & 0x80) << 8)
 +    return bits.to(tl.uint16).to(tl.float16, bitcast=True)
 diff --git a/vllm/models/inkling2/nvidia/ops/linear.py b/vllm/models/inkling2/nvidia/ops/linear.py
-index 57aa7937d2..9268b74538 100644
+index 57aa7937d2..8835df413b 100644
 --- a/vllm/models/inkling2/nvidia/ops/linear.py
 +++ b/vllm/models/inkling2/nvidia/ops/linear.py
 @@ -9,7 +9,8 @@ from vllm.platforms import current_platform
@@ -2667,7 +2667,7 @@ index 57aa7937d2..9268b74538 100644
  from .ll_gemm_sm120 import sm12x_bf16_ll_gemm, use_sm12x_bf16_ll_gemm
  from .pdl import gdc_launch_dependents, gdc_wait
  
-@@ -214,6 +215,18 @@ def k_group_partials(
+@@ -214,6 +215,23 @@ def k_group_partials(
      assert x.is_contiguous() and weight.is_contiguous()
      tokens, hidden = x.shape
      n = weight.shape[0]
@@ -2678,7 +2678,12 @@ index 57aa7937d2..9268b74538 100644
 +        # summed (G = 1), the K-group summation order is not kept.
 +        if tokens <= SM75_GEMV_MAX_M and hidden % 128 == 0:
 +            out = torch.empty((1, tokens, n), dtype=out_dtype, device=x.device)
-+            gemv_sm75(x, weight, None, out[0], sm75_gemv_tile(tokens, n))
++            tile = sm75_gemv_tile(tokens, n)
++            if tokens >= 3 and n <= 256:
++                # The router's few outputs: one column a block, eight warps
++                # (8 us against 13 at 256 outputs, bench/sm75_w8_gemv.py).
++                tile = (8, 1, 128, 8)
++            gemv_sm75(x, weight, None, out[0], tile)
 +            return out
 +        if out_dtype == x.dtype:
 +            return torch.mm(x, weight.T)[None]
@@ -2686,7 +2691,7 @@ index 57aa7937d2..9268b74538 100644
      sm120 = current_platform.is_device_capability_family(120)
      # SM12x and SM8x have ~100 KB of shared memory per block; SM8x has no TMA.
      small_smem = sm120 or not use_pdl()
-@@ -237,7 +250,7 @@ def k_group_partials(
+@@ -237,7 +255,7 @@ def k_group_partials(
              num_warps=4 if block_n == 64 else 8,
              num_stages=2 if sm120 else 4 if block_n == 64 else 3,
              enable_fp_fusion=False,
@@ -2913,10 +2918,10 @@ index 0000000000..8bcd77f4da
 +        return w4_matmul(x.contiguous(), self.packed, self.scale, self.zero, out)
 diff --git a/vllm/models/inkling2/nvidia/ops/linear_w8.py b/vllm/models/inkling2/nvidia/ops/linear_w8.py
 new file mode 100644
-index 0000000000..493b01973c
+index 0000000000..be3807872e
 --- /dev/null
 +++ b/vllm/models/inkling2/nvidia/ops/linear_w8.py
-@@ -0,0 +1,343 @@
+@@ -0,0 +1,346 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""HyperInkling W8A16 linears: bf16 weights quantized at load time to int8
@@ -3060,13 +3065,16 @@ index 0000000000..493b01973c
 +    """(BM, BN, BK, warps) of `_w8_gemv_kernel`, from bench/sm75_w8_gemv.py on a
 +    2080 Ti (L2-cold INT8 weights, K 2304): few accumulators (1-2k fp32) beat
 +    big tiles 2-4x, as many blocks keep more loads in flight. 1 row: 565 GB/s
-+    on the LM head (the card's peak is 616). 3 and 4 rows take the 8-row tile:
-+    in a decode profile the four-warp `(4, 4, 64)` tile took 3.0 ms on the LM
-+    head against 1.7 for 8 rows, and 111 us against 69 on qkvr."""
++    on the LM head (the card's peak is 616). 3 and 4 rows: one warp over four
++    rows (the four-warp `(4, 4, 64)` tile took 3.0 ms on the LM head in a decode
++    profile; searched again at 3 rows: 1.05 ms against 1.37 for the 8-row tile,
++    53 us against 62 on qkvr). 5 and 8 rows: the 8-row tile is the best found."""
 +    if m == 1:
 +        return 1, 8, 128, 8
 +    if m == 2:
 +        return 2, 8, 64, 8
++    if m <= 4:
++        return 4, 8 if n >= 32768 else 4, 128, 1
 +    return 8, 4 if n >= 32768 else 2, 128, 1
 +
 +
