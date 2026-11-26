@@ -6,6 +6,7 @@ fetched with `hf download --include` only when chosen.
 
 | phase | items |
 |---|---|
+| T, Turing (sm75) | T1, T2, T3, T4 (fp16 and shared memory in code) |
 | 2, the checkpoint (new files on HF) | 33 |
 | 3, context (best effort) | 18, 13, 55 |
 | 4, speed and upstream | 10, 7, 21, 22, 32 |
@@ -24,6 +25,75 @@ Where each idea comes from: **[HQ]** HyperQwen (github.com/syv-ai/HyperQwen, `pa
 **[CD]** crazydiamond-on-ampere (github.com/Mr-Moonsilver/crazydiamond-on-ampere, KV in
 host RAM), **[LC]** [llm-compressor](https://github.com/vllm-project/llm-compressor), **[IK]** the model's
 own structure, **[NS]** ours (measurements in this repo, nsys profiles).
+
+## Phase T: Turing (sm75, a 22 GB 2080 Ti)
+
+In place: `is_sm75()` routes sm75 like sm8x, the quant config admits 7.5, the vision tower
+runs on per-image SDPA (FlashAttention 2 is SM80+), `ARCH=7.5` for `scripts/build-vllm.sh`
+and `scripts/build-image.sh`, and the wizard scales the context to the card's memory
+(`--gpu-gib`, `gpu_gib` column of `docs/memory_matrix.tsv`).
+
+**fp16 activations** (T1, T2 done in code): `ops.use_fp16()` (Turing, or
+`HYPERINKLING_FP16=1` on any GPU) and `ops.act_dtype()`; buffers, norms, controllers, the
+router, vision and Marlin's activations and INT4 scales follow it, the Triton kernels take
+the dtype from their pointers (bitwise the same code on bf16), `_situ` unpacks fp16 pairs,
+the vision rounding uses `cvt.rn.f16.f32`, and bf16 checkpoint tensors are cast at load,
+clamped at 65504 (logged). `start.sh` passes `--dtype float16` on that path. DSpark runs in fp16
+too: its bf16 weights cast at load, its kernels storing in the activation dtype (the Markov
+gate keeps the reference's bf16 roundings, as bit operations). Unsloth's llama.cpp DSpark
+GGUFs run the same drafter on RTX 20xx in F16/F32 math. `tests/test_fp16.py` checks each changed kernel in fp16 against fp32 (W8/W4/bgemv
+also ran in Triton's CPU interpreter). Shared memory (64 KB per block on Turing against
+Ampere's ~100 KB) is checked offline by `bench/sm75_compile.py`: the attention tiles
+(72-96 KB) and the W8 prefill tile (128 KB) were over and are smaller on sm75 (attention
+BLOCK_M <= 64 and BLOCK_N 64/32, W8 BN <= 128); every kernel now fits. Nothing has run on a
+Turing GPU yet. The bring-up on the card, step by step, is `docs/turing-bringup.md`. Left:
+
+T1. **fp16 on the card**: there is no bf16 GPU to compare against, so the check is fp16's
+    own range and the published scores. `HYPERINKLING_FP16_CHECK=1` (eager) logs each new
+    record of the residual stream's max |value| above 4096 and any non-finite value, by
+    layer and pass; `bench/quality_battery.py` against README "Task accuracy". If the
+    residual overflows, keep the residual blocks in fp32 in `Inkling2LoopModel.forward`.
+T2. **Speed on the card**: Triton emits no tensor-core MMA for sm75, so every `tl.dot`
+    runs as FMA. First profile (2080 Ti, DSpark, 1 request): 275 ms a step, 218 ms in
+    `_w8_kernel` and 39 ms in the drafter's W4 kernels. W8 now has a dot-free GEMV (<= 64
+    rows) and cuBLAS above; on Turing the drafter runs fp16 on cuBLAS
+    (`HYPERINKLING_DRAFT_W4=0`, `HYPERINKLING_DSPARK_FOLD=bf16`). Third profile: 37 ms a
+    step, 50.5 tok/s (1 request, 8k, DSpark), of which `_w8_gemv_kernel` 13.8 ms (138 us a
+    call against ~10 us at the bandwidth bound), Marlin 8.3, `_k_group_kernel` 2.9, the
+    controller GEMVs 2.8, `_rel_attention_kernel` 1.5. Fourth (3D-tile GEMV at untuned
+    tiles, controllers on cuBLAS): 42.7 ms, worse. cuBLAS picks a 128x128 tile for the
+    controllers' few rows (181 us a call); the 2.8 ms `_k_group_kernel` is the MoE router.
+    `bench/sm75_w8_gemv.py` found tiles 2-4x faster (565 GB/s on the LM head), now
+    `sm75_gemv_tile`'s; the controllers are back on Triton, and the router and the other
+    decode-size K-group linears run on the same GEMV with fp16 weights. Fifth: 32.7 ms,
+    58.4 tok/s; W8 GEMV 10.6 ms (149 calls with the router), Marlin 10.0, the controllers
+    2.7, the fp16 Markov fold on cuBLAS 1.4 (7 x 202 us). Since: the controllers on the
+    GEMV (batched, the down projection in 8 K slices), the fold in INT8 on Turing. Sixth:
+    31.7 ms, 64.6 tok/s (GEMV 13.0 ms over 250 calls, Marlin 9.5). All of these are at a
+    128-token context: decode at 90k (attention over the whole KV, `tl.dot` on FMA) is not
+    measured yet (`CONTEXTS="8192 90000"` on `bench/context_bench.sh`). Measured then (one
+    request, DSpark, prompts of code): 97.5k tokens fit; decode 85 tok/s at 8k and 35 at
+    90k, prefill 692 and 159 tok/s. The 9 full-attention launches of a step (8 global layer
+    visits and the draft's) read 1.6 GB of KV at 90k, ~3 ms at the card's bandwidth, and
+    take ~43 ms on Triton's FMA dots. Since: `kernels/sm75/rel_attention.cu`, the split
+    decode attention on `wmma` (one-warp blocks, 32 keys an iteration, 4 blocks per SM),
+    checked on the CPU against the Triton kernel. On the card its tests pass; first timing
+    2.2 ms a call at 90k (85 GB/s) against Triton's 3.5-5.2 ms, decode at 90k 41 tok/s: each
+    lane read its own key, 32 scattered rows a load. Now the warp reads a key row at a time
+    (one contiguous transaction), not yet timed. Prefill profile at 8k (668 tok/s, 1491 ms
+    of kernels per 1000 tokens): `_rel_attention_kernel` 1097, Marlin 149, the router on
+    `_k_group_kernel` 97, cuBLAS (W8 above 64 rows, dequantized) ~58, `_qr_rel_kernel` 24.
+    Since: the wmma kernel also does prefill (MODE_OUT_LSE, four-warp blocks of 64 rows
+    sharing the decoded keys, sliding-window layers) and the decode partials of local
+    layers; K-group linears above 64 rows on cuBLAS. Not yet timed. Target (prefill:
+    1000 tok/s): 70 tok/s at 1 request (~26 ms a step) with 90k+ context.
+T3. **DSpark on the card** (in code): the draft's attention runs in `block_decode_attention`
+    (Triton `rel_attention` on sm75, compiled in `bench/sm75_compile.py`). Its KV write is
+    vLLM's `reshape_and_cache_flash` (core op, no FlashAttention kernel), and its RMSNorms
+    run on Triton on sm75 (flashinfer's JIT-compile with the host's nvcc). Left: acceptance on the card
+    (`bench/spec_bench.py`, `docs/turing-bringup.md` step 4).
+T4. **A 22 GiB memory matrix**: `bench/memory_matrix.sh` on the card replaces the scaled
+    estimate (it writes `gpu_gib`).
 
 ## Phase 2: the checkpoint
 

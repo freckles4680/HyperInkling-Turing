@@ -1,5 +1,6 @@
 #!/bin/bash
 # HyperInkling: Inkling 2 Mini on one RTX 3090 / 3090 Ti (sm86), single entry point.
+# Turing (sm75, e.g. a 22 GB 2080 Ti) runs in fp16, untested on hardware: see GPU_CC below.
 #
 #   ./start.sh                      # runs in the foreground
 #   PORT=18020 KV_OFFLOAD_GB=0 ./start.sh
@@ -21,6 +22,31 @@ if [ -n "$ENV_FILE" ] && [ -f "$ENV_FILE" ]; then
 		case "$key" in ''|'#'*|UID|GID) continue ;; esac
 		if [ -z "${!key+set}" ]; then export "$key=$value"; fi
 	done < "$ENV_FILE"
+fi
+
+# The GPU's compute capability (nvidia-smi; GPU_CC=7.5 forces it). Turing (sm75: RTX 20xx,
+# 2080 Ti 22 GB mods) has no bf16 tensor cores: the model runs in fp16 there
+# (HYPERINKLING_FP16=1 forces that path on any GPU). docs/turing-bringup.md: how to check it.
+# DSpark runs in fp16 there too (its bf16 weights cast at load, as the target's).
+GPU_CC=${GPU_CC:-$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 || true)}
+if [ "$GPU_CC" = 7.5 ]; then
+	export HYPERINKLING_FP16=1
+	# Triton has no tensor-core MMA on sm75: the drafter's INT4 Triton linears took
+	# ~40 ms a step on a 2080 Ti. fp16 weights on cuBLAS instead (~0.4 GB more), and
+	# the Markov fold in INT8 on the dot-free GEMV (half the bytes of fp16).
+	: "${HYPERINKLING_DRAFT_W4:=0}" "${HYPERINKLING_DSPARK_FOLD:=w8}"
+	# Attention on the fp16 tensor cores, when scripts/build-sm75-kernels.sh has built
+	# it (HYPERINKLING_SM75_LIB= for the Triton kernel: 74% of an 8k prefill and
+	# ~43 ms of a decode step at 90k tokens on a 2080 Ti).
+	if [ -z "${HYPERINKLING_SM75_LIB+x}" ] && [ -f "$REPO/venv/hyperinkling_sm75.so" ]; then
+		export HYPERINKLING_SM75_LIB=$REPO/venv/hyperinkling_sm75.so
+	fi
+fi
+export HYPERINKLING_FP16=${HYPERINKLING_FP16:-0}
+DTYPE=auto
+if [ "$HYPERINKLING_FP16" = 1 ]; then
+	DTYPE=float16
+	echo "fp16 activations (GPU ${GPU_CC:-?}): validate it as docs/turing-bringup.md says" >&2
 fi
 
 MODEL=${MODEL:-$REPO/models/Inkling-2-Mini-W4A16-g128-gptq}
@@ -151,6 +177,9 @@ if [ "$HOST" != 127.0.0.1 ] && [ "$HOST" != localhost ] && [ -z "${VLLM_API_KEY:
 fi
 [ "$LONG_PREFILL" != 0 ] && args+=(--long-prefill-token-threshold "$LONG_PREFILL")
 [ "$ASYNC" = 0 ] && args+=(--no-async-scheduling)
+# HYPERINKLING_FP16_CHECK=1: log how close the fp16 residual stream runs to fp16's limit
+# (loop.py); it syncs after every layer visit, so no CUDA graphs. Diagnostics only.
+[ "${HYPERINKLING_FP16_CHECK:-0}" = 1 ] && args+=(--enforce-eager)
 # Decode CUDA graphs by request count: every count up to 8, then coarser steps up to
 # MAX_SEQS (a batch runs in the next larger graph; one without a graph runs eagerly).
 if [ -z "${GRAPH_SIZES:-}" ]; then
@@ -186,11 +215,21 @@ else verify="by batch size $SPEC_K"; fi
 echo "Speculation: $SPEC$([ "$SPEC" = dspark ] && echo ", $SPEC_DRAFT drafts, verify k $verify, context lookup $HYPERINKLING_LOOKUP")"
 echo "INT8: attention=$HYPERINKLING_ATTN_W8 head=$HYPERINKLING_HEAD_W8" \
 	"embed=$HYPERINKLING_EMBED_W8 (host RAM: $HYPERINKLING_EMBED_UVA)"
+[ "$GPU_CC" = 7.5 ] && echo "Turing: fp16, tensor-core attention ${HYPERINKLING_SM75_LIB:-not built (scripts/build-sm75-kernels.sh)}"
 echo "Images: up to $IMAGES/request, ${IMAGE_MAX_W}x${IMAGE_MAX_H} profiled, larger ones scaled to $HYPERINKLING_IMAGE_MAX_CELLS cells, vision tower $([ "$HYPERINKLING_VISION_HOST" = 1 ] && echo 'in host RAM' || echo 'on the GPU')"
 echo "=================================================="
 
 # The native install's venv; the container has vllm on PATH.
 [ -f "$REPO/venv/bin/activate" ] && source "$REPO/venv/bin/activate"
+# The CUDA toolkit the venv was built with (scripts/build-vllm.sh records it): FlashInfer
+# compiles its JIT kernels at the first boot with $CUDA_HOME/bin/nvcc, else whatever nvcc
+# is first on PATH, which may be an older system CUDA. CUDA_HOME set by hand wins.
+if [ -z "${CUDA_HOME:-}" ] && [ -f "$REPO/venv/cuda_home" ]; then
+	CUDA_HOME=$(cat "$REPO/venv/cuda_home")
+fi
+if [ -n "${CUDA_HOME:-}" ]; then
+	export CUDA_HOME PATH="$CUDA_HOME/bin:$PATH"
+fi
 # Requests at the shapes vLLM's warmup leaves out, once /health answers: their kernels
 # compile (first boot after an update) or load from the JIT cache before real traffic.
 WARMUP=${WARMUP:-1}
@@ -200,7 +239,7 @@ fi
 exec taskset -c "$CPUS" "${wrap[@]}" vllm serve "$MODEL" \
 	--served-model-name "$SERVED_NAME" $SERVED_ALIASES --host "$HOST" --port "$PORT" \
 	--max-model-len "$([ "$MAX_LEN" = auto ] && echo -1 || echo "$MAX_LEN")" --max-num-seqs "$MAX_SEQS" \
-	--max-num-batched-tokens "$NBT" --gpu-memory-utilization "$GPU_UTIL" \
+	--max-num-batched-tokens "$NBT" --gpu-memory-utilization "$GPU_UTIL" --dtype "$DTYPE" \
 	--kv-cache-dtype "$KV_DTYPE" --enable-prefix-caching \
 	--reasoning-parser inkling --enable-auto-tool-choice --tool-call-parser inkling \
 	--structured-outputs-config '{"backend":"xgrammar","disable_any_whitespace":true}' \

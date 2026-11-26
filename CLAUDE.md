@@ -56,6 +56,17 @@ Key mechanisms of the port (spread across several files):
   default on): `ops/lookup.py`.
 - Images over the profiled page are scaled down in `processing.py` (`fit_to_budget`);
   `HYPERINKLING_VISION_HOST=1` streams the vision tower from host RAM per layer (`model.py`).
+- Turing (sm75, a 22 GB 2080 Ti): fp16 activations (`ops.use_fp16`, `ops.act_dtype`;
+  `HYPERINKLING_FP16=1` forces the path elsewhere). Kernels take their dtype from their
+  pointers, so the bf16 path is the same code; DSpark too (weights cast at load). Tiles over Turing's
+  64 KB of shared memory per block are smaller under `is_sm75()`; `bench/sm75_compile.py`
+  checks every kernel offline (no GPU). `HYPERINKLING_FP16_CHECK=1` logs the residual
+  stream's fp16 headroom. Bring-up on the card: `docs/turing-bringup.md`.
+  Triton emits no tensor-core MMA for sm75 (`tl.dot` runs on FMA): decode-size linears go
+  through the dot-free GEMV (`ops/linear_w8.py`, `gemv_sm75`), and attention (prefill and
+  split decode) through a CUDA `wmma` kernel outside the vLLM build (`kernels/sm75/`,
+  `scripts/build-sm75-kernels.sh` -> `venv/hyperinkling_sm75.so`, `ops/attention_sm75.py`;
+  it also compiles for the CPU, `tests/test_sm75_attention.py`).
 - The small loop kernels carry the reference numerics (fixed summation orders, no FMA
   contraction): any fusion must be checked bitwise against the unfused path.
 
@@ -67,13 +78,13 @@ Long-running work is pinned to CPUs 0-30 with `taskset`.
 
 ```bash
 scripts/setup-vllm.sh                 # recreate vllm/ from BASE + patch
-scripts/build-vllm.sh                 # build into venv/ (sm86 only, ~30-60 min)
+scripts/build-vllm.sh                 # build into venv/ (sm86, ~30-60 min; ARCH=7.5 for Turing)
 ./start.sh                            # production server, port 8080; every knob is an env var
 PORT=18030 ./start.sh                 # test instance on another port
 PROFILE=<name> ./start.sh             # Nsight Systems; POST /start_profile, /stop_profile
 scripts/serve-try.sh <log> [args]     # short-context eager boot of the original checkpoint, :18030
 
-venv/bin/python -m pytest -q tests/                          # kernel tests (GPU; test_auth.py not)
+venv/bin/python -m pytest -q tests/                          # kernel tests (GPU; test_auth.py, test_wizard.py not)
 venv/bin/python -m pytest -q -s tests/test_bgemv.py -k <name>  # one test, with timings
 ruff check bench prepare tests scripts                        # lint: ruff 0.17.6 (as CI), rules in ruff.toml
 ```
@@ -89,6 +100,10 @@ the wizard. Release side: `scripts/wizard.py` (questions -> `.env`, from `docs/m
 Benchmarks and quality (all need a running server):
 - `bench/context_bench.sh <name>`: the README speed table (8k/32k context, 1 and 6 requests,
   with and without DSpark; prefill on unseen prompts, decode on prefix hits).
+- `bench/profile_prefill.sh <name> [tokens]`, `bench/profile_decode.sh <name> [tokens]`: kernel
+  time of one prefill, and per decode step at a long context, under nsys.
+  `scripts/turing-report.sh <name>` (Turing): GPU state, kernel tests, both profiles and the
+  long-context bench in one file, `.local/turing-report-<name>.txt`.
 - `bench/metrics_window.py [seconds] [port]`: server-side throughput/TTFT; use this, not
   client-side numbers (client TTFT hides prefix-cache hits).
 - `scripts/quick_bench.py [concurrency] [max_tokens]`: quick client-side decode check.
@@ -102,7 +117,7 @@ Benchmarks and quality (all need a running server):
   sampling setting; cases are chat requests (tools are declared, never run).
 - `bench/evalscope_perf.sh <name> [port]`: 10 minutes of AA-LCR prompts (256-64k tokens) with
   `metrics_window.py` alongside. `bench/profile_spec.sh`: kernel time per step under nsys.
-- `bench/quality_battery.py download|run`: GSM8K, Hermes tool calls, DocVQA as strict JSON,
+- `bench/quality_battery.py download|run` (`bench/quality_battery.sh <name>` boots its own server): GSM8K, Hermes tool calls, DocVQA as strict JSON,
   on public data (`bench/quality-data/`, not in git); compare two servers at the same settings.
 - `bench/extract_bench.py`: document extraction on public data (shared Italian system
   prompt, 1-3 DocVQA pages, JSON or summary), closed loop with `metrics_window.py` alongside.
