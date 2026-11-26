@@ -80,6 +80,7 @@ Long-running work is pinned to CPUs 0-30 with `taskset`.
 scripts/setup-vllm.sh                 # recreate vllm/ from BASE + patch
 scripts/build-vllm.sh                 # build into venv/ (sm86, ~30-60 min; ARCH=7.5 for Turing)
 ./start.sh                            # production server, port 8080; every knob is an env var
+scripts/serve.sh                      # Turing: start.sh on the LAN with the 2080 Ti settings, commented
 PORT=18030 ./start.sh                 # test instance on another port
 PROFILE=<name> ./start.sh             # Nsight Systems; POST /start_profile, /stop_profile
 scripts/serve-try.sh <log> [args]     # short-context eager boot of the original checkpoint, :18030

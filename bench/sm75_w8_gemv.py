@@ -19,9 +19,10 @@ from vllm.models.inkling2.nvidia.ops.linear_w8 import (
 )
 
 K = 2304
-MS = (1, 2, 4, 8, 16)
+# A decode step has 1 + k rows: k = 2, 4 or 7 verified drafts (start.sh).
+MS = (1, 2, 3, 5, 8)
 # INT8 (attention, LM head); fp16 weights (router, sconv taps, loop down projections).
-SHAPES = [("int8", m, n) for n in (1024, 2304, 4608, 201024) for m in MS]
+SHAPES = [("int8", m, n) for n in (2304, 8600, 201024) for m in MS]
 SHAPES += [("fp16", m, n) for n in (256, 2304) for m in MS]
 
 
@@ -52,9 +53,9 @@ def main():
         reps = 5 if n > 100000 else 30
         default = sm75_gemv_tile(m, n)
         results = {}
-        bm = min(1 << (m - 1).bit_length(), 8)
-        for bk, acc, warps in itertools.product((16, 32, 64, 128), (256, 512, 1024, 2048, 4096, 8192),
-                                                (1, 2, 4, 8)):
+        bms = {min(1 << (m - 1).bit_length(), 8), 8}  # the row tile that fits, and 8
+        for bm, bk, acc, warps in itertools.product(
+                sorted(bms), (16, 32, 64, 128), (256, 512, 1024, 2048, 4096, 8192), (1, 2, 4, 8)):
             bn = acc // (bm * bk)
             if bn < 1 or acc // (32 * warps) > 128:
                 continue
