@@ -296,6 +296,7 @@ def test_phases(tmp_path):
         "PV": 16,
         "both products": 18,
         "everything": 31,
+        "nothing, again": 0,
     }
     base = {}
     print()
@@ -308,6 +309,10 @@ def test_phases(tmp_path):
             env={**os.environ, "OUT": str(path), "FLAGS": f"-DABLATE={bits}"},
         )
         lib = attention_sm75.load_library(str(path))
+        # The clocks of an idle card take a moment to rise (the first decode timing read
+        # 1.85 ms for 1.3), and each build idles it: a second of work first.
+        for _ in range(10):
+            _sm75(prefill, 1, False, attention_sm75.load_library(str(LIB)), 0, OUT_LSE)
         times = {
             "decode": _time(lambda: _sm75(decode, 5 * sms // 8, False, lib)) / 1e3,
             "prefill": _time(lambda: _sm75(prefill, 1, False, lib, 0, OUT_LSE), reps=3)
@@ -319,7 +324,7 @@ def test_phases(tmp_path):
         }
         base = base or times
         print(
-            f"without {name:13s}: "
+            f"without {name:14s}: "
             + ", ".join(
                 f"{kind} {ms:7.2f} ms ({(1 - ms / base[kind]) * 100:3.0f}% less)"
                 for kind, ms in times.items()

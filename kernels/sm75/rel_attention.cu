@@ -121,15 +121,16 @@ struct alignas(32) WarpShared {
   float m[ROWS];            // running max (log2 units)
   float l[ROWS];            // running sum
   float alpha[ROWS];
+  int32_t changed[ROWS];    // rows with a new reference in this iteration
 };
 
-// 12.7 KB for one warp (five blocks per SM in Turing's 64 KB), 26.4 KB for four (two),
-// 44.6 KB for eight (one).
+// 12.8 KB for one warp (five blocks per SM in Turing's 64 KB), 26.7 KB for four (two),
+// 45.1 KB for eight (one).
 template <int NW>
 struct alignas(32) Shared {
   uint16_t kv[BN * D];      // fp16 bits: a warp's Q at start, then K and V of the iteration
   WarpShared w[NW];
-  int32_t rescale;
+  int32_t redo, rescale;
 };
 
 // Per-thread registers: word `lane` of the V bytes of this thread's keys, decoded after
@@ -144,6 +145,9 @@ struct FragH { float e[16][16]; };
 struct FragF { float e[16][16]; };
 #define ONCE if (lane == 0)
 static inline void frag_zero(FragF& f, int lane) { ONCE memset(&f, 0, sizeof f); }
+static inline void frag_add(FragF& f, const FragF& g, int lane) {
+  ONCE for (int i = 0; i < 16; i++) for (int j = 0; j < 16; j++) f.e[i][j] += g.e[i][j];
+}
 static inline void load_a_row(FragH& f, const uint16_t* ptr, int ldm, int lane) {
   ONCE for (int i = 0; i < 16; i++) for (int j = 0; j < 16; j++)
     f.e[i][j] = half_bits_to_float(ptr[i * ldm + j]);
@@ -174,6 +178,9 @@ static inline void load_acc_row(FragF& f, const float* ptr, int ldm, int lane) {
 typedef wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> FragH;
 typedef wmma::fragment<wmma::accumulator, 16, 16, 16, float> FragF;
 static DEV void frag_zero(FragF& f, int) { wmma::fill_fragment(f, 0.0f); }
+static DEV void frag_add(FragF& f, const FragF& g, int) {
+  for (int i = 0; i < f.num_elements; i++) f.x[i] += g.x[i];
+}
 static DEV void load_a_row(FragH& f, const uint16_t* ptr, int ldm, int) {
   wmma::load_matrix_sync(f, (const __half*)ptr, ldm);
 }
@@ -319,12 +326,20 @@ static DEV void phase_load(const Args& a, const Block& b, Shared<NW>& sm, Lane& 
 template <int NW>
 static DEV void phase_qk(Shared<NW>& sm, Frags& f, int t) {
   WarpShared& ws = sm.w[t / 32];
+  // Four accumulators (two per key tile), interleaved: one accumulator's 8 products depend
+  // on each other, and that chain took a third of a prefill launch (2080 Ti, twice the
+  // P V products, which have 8 accumulators).
+  FragF c[NT][2];
   for (int j = 0; j < NT; j++) {
-    FragF c;
-    frag_zero(c, t % 32);
-    for (int dt = 0; dt < DT; dt++)
-      mma_col_b(c, f.q[dt], sm.kv + j * 16 * D + dt * 16, D, t % 32);
-    store_row(ws.s + j * 16, c, BN, t % 32);
+    frag_zero(c[j][0], t % 32);
+    frag_zero(c[j][1], t % 32);
+  }
+  for (int dt = 0; dt < DT; dt++)
+    for (int j = 0; j < NT; j++)
+      mma_col_b(c[j][dt & 1], f.q[dt], sm.kv + j * 16 * D + dt * 16, D, t % 32);
+  for (int j = 0; j < NT; j++) {
+    frag_add(c[j][0], c[j][1], t % 32);
+    store_row(ws.s + j * 16, c[j][0], BN, t % 32);
   }
 }
 
@@ -357,17 +372,7 @@ static DEV void phase_logits(const Args& a, const Block& b, Shared<NW>& sm, cons
     }
     ws.s[r * BN + c] = visible ? s : -INFINITY;
   }
-  if (t == 0) sm.rescale = 0;
-}
-
-// Lane `l`: the max of 16 logits of row `l % 16`.
-template <int NW>
-static DEV void phase_max(Shared<NW>& sm, int t) {
-  WarpShared& ws = sm.w[t / 32];
-  int lane = t % 32, r = lane % ROWS, c0 = (lane / ROWS) * 16;
-  float best = -INFINITY;
-  for (int c = c0; c < c0 + 16; c++) best = fmaxf(best, ws.s[r * BN + c]);
-  ws.part_max[lane] = best;
+  if (t == 0) sm.redo = sm.rescale = 0;
 }
 
 // A row's reference for its probabilities: the first finite maximum, kept while the
@@ -378,40 +383,57 @@ static DEV void phase_max(Shared<NW>& sm, int t) {
 #ifndef HEADROOM
 #define HEADROOM 10.0f
 #endif
-static DEV float new_max(const WarpShared& ws, int r) {
-  float part = fmaxf(ws.part_max[r], ws.part_max[r + ROWS]);
-  return part <= ws.m[r] + HEADROOM ? ws.m[r] : part;
-}
 
-// Probabilities relative to the new running max, as fp16.
+// Lane `l`, for 16 logits of row `l % 16`: their maximum, and their probabilities
+// relative to the row's reference, as fp16, with their sum.
 template <int NW>
 static DEV void phase_probs(Shared<NW>& sm, int t) {
   WarpShared& ws = sm.w[t / 32];
   int lane = t % 32, r = lane % ROWS, c0 = (lane / ROWS) * 16;
-  float m_new = new_max(ws, r);
-  float m_safe = m_new == -INFINITY ? 0.0f : m_new;
-  float sum = 0.0f;
+  float m_safe = ws.m[r] == -INFINITY ? 0.0f : ws.m[r];
+  float best = -INFINITY, sum = 0.0f;
   for (int c = c0; c < c0 + 16; c++) {
-    float p = exp2f(ws.s[r * BN + c] - m_safe);
+    float logit = ws.s[r * BN + c];
+    best = fmaxf(best, logit);
+    float p = exp2f(logit - m_safe);
     sum += p;
     ws.p[r * BN + c] = float_to_half_bits(p);
   }
+  ws.part_max[lane] = best;
   ws.part_sum[lane] = sum;
 }
 
+// A row whose reference holds adds its sum. Else it takes the new maximum as its
+// reference and asks for the redo (`sm.redo`): the probabilities again, then
+// `phase_state_redo`, and the accumulators rescaled if any row had some (`sm.rescale`).
 template <int NW>
 static DEV void phase_state(Shared<NW>& sm, int t) {
   WarpShared& ws = sm.w[t / 32];
   int r = t % 32;
   if (r >= ROWS) return;
-  float m_new = new_max(ws, r);
-  float m_safe = m_new == -INFINITY ? 0.0f : m_new;
+  float part = fmaxf(ws.part_max[r], ws.part_max[r + ROWS]);
+  float m = ws.m[r];
+  if (part <= m + HEADROOM) {
+    ws.alpha[r] = 1.0f;
+    ws.changed[r] = 0;
+    ws.l[r] += ws.part_sum[r] + ws.part_sum[r + ROWS];
+    return;
+  }
   // Nothing is accumulated before a row's first finite maximum.
-  float alpha = ws.m[r] == -INFINITY ? 1.0f : exp2f(ws.m[r] - m_safe);
+  float alpha = m == -INFINITY ? 1.0f : exp2f(m - part);
   ws.alpha[r] = alpha;
-  ws.l[r] = ws.l[r] * alpha + (ws.part_sum[r] + ws.part_sum[r + ROWS]);
-  ws.m[r] = m_new;
-  if (alpha != 1.0f) sm.rescale = 1;  // every writer stores the same value
+  ws.changed[r] = 1;
+  ws.m[r] = part;
+  sm.redo = 1;  // every writer stores the same value
+  if (alpha != 1.0f) sm.rescale = 1;
+}
+
+template <int NW>
+static DEV void phase_state_redo(Shared<NW>& sm, int t) {
+  WarpShared& ws = sm.w[t / 32];
+  int r = t % 32;
+  if (r >= ROWS || !ws.changed[r]) return;
+  ws.l[r] = ws.l[r] * ws.alpha[r] + (ws.part_sum[r] + ws.part_sum[r + ROWS]);
 }
 
 template <int NW>
@@ -474,11 +496,14 @@ static long rescales, iterations;
 #define PHASE(call) \
   for (int t = 0; t < NW * 32; t++) { Lane& ln = lanes[t]; Frags& f = frags[t / 32]; \
     (void)ln; (void)f; call; }
+#define WARP_PHASE(call) PHASE(call)
 #define KERNEL_HEAD template <int NW> static void run_block(const Args& a, int bx, int by, int bz)
 #define KERNEL_STATE \
   static Shared<NW> sm; static Lane lanes[NW * 32]; static Frags frags[NW];
 #else
 #define PHASE(call) { call; __syncthreads(); }
+// What only the same warp reads next.
+#define WARP_PHASE(call) { call; __syncwarp(); }
 #define KERNEL_HEAD template <int NW> __global__ void rel_attention_kernel(const Args a)
 #define KERNEL_STATE \
   __shared__ Shared<NW> sm; Lane ln; Frags f; \
@@ -502,9 +527,12 @@ KERNEL_HEAD {
     if (!(ABLATE & NO_QK)) PHASE(phase_qk(sm, f, t))
     PHASE(phase_logits(a, b, sm, ln, n, t))
     if (!(ABLATE & NO_SOFTMAX)) {
-      PHASE(phase_max(sm, t))
-      PHASE(phase_probs(sm, t))
+      WARP_PHASE(phase_probs(sm, t))
       PHASE(phase_state(sm, t))
+    }
+    if (sm.redo && !ABLATE) {
+      WARP_PHASE(phase_probs(sm, t))
+      PHASE(phase_state_redo(sm, t))
     }
     if (sm.rescale && !ABLATE) {
 #ifdef COUNT_RESCALES
