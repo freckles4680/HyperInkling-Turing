@@ -10,7 +10,8 @@ first, cut to the exact token count with /tokenize):
 - decode: the same prompts again, now prefix-cache hits, so every request starts generating
   together; 512 tokens each (min_tokens = max_tokens, temperature 0). Measured only in the
   window where all of them generate (from the last first token to the first finish), from
-  the streamed usage: no prefill inside.
+  the streamed usage: no prefill inside. With the tokens accepted per engine step and the
+  step time (/metrics): compare step times between runs, as acceptance follows the text.
 Each shape runs once unmeasured first (kernels compile on first use). Results:
 .local/context_bench/<label>.json.
 """
@@ -19,6 +20,7 @@ import argparse
 import json
 import random
 import statistics
+import sysconfig
 import threading
 import time
 import urllib.request
@@ -41,9 +43,12 @@ class Prompts:
     def __init__(self, base):
         self.base = base
         self.text = "\n\n".join(f.read_text(errors="ignore") for f in sorted(SRC.rglob("*.txt")))
-        if not self.text:  # no AA-LCR download: vLLM's own sources (code accepts more drafts)
-            print(f"no documents under {SRC}: prompts from vllm/vllm/**/*.py instead")
-            files = sorted(Path("vllm/vllm").rglob("*.py"))
+        if not self.text:
+            # No AA-LCR download: Python's own library (code accepts more drafts). Not
+            # vLLM's sources, which every patch changes, and the prompts with them.
+            lib = Path(sysconfig.get_paths()["stdlib"])
+            print(f"no documents under {SRC}: prompts from {lib}/*.py instead")
+            files = sorted(lib.glob("*.py"))
             self.text = "\n\n".join(f.read_text(errors="ignore") for f in files)
 
     def count(self, content):
@@ -95,6 +100,17 @@ def _at_once(base, contents, max_tokens):
     return recs
 
 
+def _steps(base):
+    """Engine steps and generated tokens so far (/metrics)."""
+    text = urllib.request.urlopen(f"{base}/metrics", timeout=30).read().decode()
+
+    def total(name):
+        return sum(float(line.rsplit(" ", 1)[1]) for line in text.splitlines()
+                   if line.startswith(name + "{"))
+
+    return total("vllm:iteration_tokens_total_count"), total("vllm:generation_tokens_total")
+
+
 def _tokens_at(points, t):
     return max([n for s, n in points if s <= t], default=0)
 
@@ -104,7 +120,10 @@ def measure(base, prompts, ctx, conc, seed, gen):
     pre = _at_once(base, contents, 1)
     ttft = [r["points"][0][0] for r in pre]
     prompt_tokens = [r["prompt"] for r in pre]
+    steps0, tokens0 = _steps(base)
     dec = _at_once(base, contents, gen)
+    steps1, tokens1 = _steps(base)
+    per_step = (tokens1 - tokens0) / max(steps1 - steps0, 1)
     start = max(r["points"][0][0] for r in dec)
     end = min(r["points"][-1][0] for r in dec)
     assert end > start, "no window where every request decodes"
@@ -116,6 +135,10 @@ def measure(base, prompts, ctx, conc, seed, gen):
         "prefill_aggregate": sum(prompt_tokens) / max(ttft),
         "decode_per_request": statistics.mean(rates),
         "decode_aggregate": sum(rates),
+        # What a code change moves is the step time; the tokens a step accepts follow the
+        # text (and DSpark's generation does not repeat), and tok/s is their ratio.
+        "tokens_per_step": per_step,
+        "ms_per_step": per_step / sum(rates) * 1e3,
     }
 
 
@@ -137,7 +160,8 @@ def run(args):
                 continue
             results[f"{ctx}x{conc}"] = r
             print(f"{ctx:6d} tokens x{conc}: " + ", ".join(
-                f"{k} {v:,.0f}" for k, v in r.items()), flush=True)
+                f"{k} {v:,.2f}" if "step" in k else f"{k} {v:,.0f}" for k, v in r.items()),
+                flush=True)
     OUT.mkdir(parents=True, exist_ok=True)
     (OUT / f"{args.label}.json").write_text(json.dumps(results, indent=1))
 
@@ -145,7 +169,9 @@ def run(args):
 ROWS = [("prefill_per_request", "prefill, per request"),
         ("prefill_aggregate", "prefill, aggregate"),
         ("decode_per_request", "decode, per request (no prefill)"),
-        ("decode_aggregate", "decode, aggregate (no prefill)")]
+        ("decode_aggregate", "decode, aggregate (no prefill)"),
+        ("tokens_per_step", "decode, tokens per step"),
+        ("ms_per_step", "decode, ms per step")]
 
 
 def table(args):
@@ -167,7 +193,12 @@ def table(args):
             cells = []
             for c, lb in cols:
                 r = data[lb].get(f"{ctx}x{c}")
-                cells.append(f"{r[key]:,.0f} tok/s" if r else "")
+                if not r or key not in r:
+                    cells.append("")
+                elif "step" in key:
+                    cells.append(f"{r[key]:.2f}")
+                else:
+                    cells.append(f"{r[key]:,.0f} tok/s")
             print(f"| {name}, {ctx // 1024}k context | " + " | ".join(cells) + " |")
 
 
