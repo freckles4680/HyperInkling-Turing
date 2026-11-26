@@ -8,6 +8,11 @@ cd "$(dirname "$0")/.."
 source scripts/server-lib.sh
 name=${1:?usage: bench/quality_battery.sh <name> [tasks]}; shift
 PORT=${PORT:-18030}
+# The data are parquet files; pyarrow is not among vLLM's requirements.
+venv/bin/python -c "import pyarrow" 2> /dev/null \
+	|| uv pip install --python venv/bin/python pyarrow \
+	|| venv/bin/python -m pip install pyarrow \
+	|| { echo "install pyarrow into venv/ first" >&2; exit 1; }
 [ -d bench/quality-data/gsm8k ] || venv/bin/python bench/quality_battery.py download || exit 1
 log=.local/quality-$name.log
 start_server "$PORT" "$log" PORT=$PORT MAX_LEN=${MAX_LEN:-32768} KV_OFFLOAD_GB=0 WARMUP=0 ENV_FILE= ./start.sh

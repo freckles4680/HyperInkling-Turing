@@ -31,7 +31,7 @@ if command -v gcc-15 > /dev/null && command -v g++-15 > /dev/null; then
 	export CC=gcc-15 CXX=g++-15 CUDAHOSTCXX=g++-15 NVCC_CCBIN=g++-15
 fi
 uv pip install -e . --no-build-isolation -v
-uv pip install pytest   # tests/ (the kernel tests run in this venv)
+uv pip install pytest pyarrow   # tests/ (the kernel tests run in this venv)
 # start.sh serves with the same toolkit (FlashInfer's JIT kernels compile at the first boot).
 echo "$CUDA_HOME" > ../venv/cuda_home
 python -c "import vllm, torch; print('vllm', vllm.__version__, 'torch', torch.__version__, torch.cuda.get_device_capability())"
