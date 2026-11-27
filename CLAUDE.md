@@ -123,7 +123,8 @@ Benchmarks and quality (all need a running server):
 - `bench/intelligence.sh <name>`: general chatbot intelligence of a server that is already up (8080,
   not the 8081 proxy): IFEval and MMLU-Pro via lm-evaluation-harness (own venv `.local/eval-venv`),
   MT-Bench-style chat judged by `JUDGE_MODEL`/`JUDGE_BASE_URL`/`JUDGE_API_KEY` (`bench/mtbench.py`;
-  no judge = answers only, flagged SKIPPED). `PRESET=quick|standard|full`; one report,
+  no judge = flagged SKIPPED and exported to paste into a chat, `mtbench.py import` reads the
+  scores back). `PRESET=quick|standard|full`; one report,
   `.local/intelligence-<name>.txt`.
 - `bench/extract_bench.py`: document extraction on public data (shared Italian system
   prompt, 1-3 DocVQA pages, JSON or summary), closed loop with `metrics_window.py` alongside.

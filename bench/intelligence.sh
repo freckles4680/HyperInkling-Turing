@@ -14,7 +14,11 @@
 #           chain of thought. lm-evaluation-harness. LIMIT counts per subject.
 # mtbench:  MT-Bench-style two-turn chat in 8 categories, scored 1-10 by a JUDGE model you
 #           choose (bench/mtbench.py). Without JUDGE_MODEL the answers are saved but NOT
-#           scored, and the report says so in capitals.
+#           scored, the report says so in capitals, and they are exported as Markdown files
+#           to paste into a chat (Claude Opus, ...) for grading by hand:
+#             bench/quality-data/mt_bench/export/<name>/batch-NN.md
+#           Save the chat's replies into one text file, then put the scores in the report:
+#             python3 bench/mtbench.py import --label <name> replies.txt --judge-name "Opus chat"
 #
 # lm-evaluation-harness goes into its own venv (.local/eval-venv, ~300 MB, no torch), so the
 # server's venv/ is never touched. The machine needs internet for the first run: Hugging
@@ -67,6 +71,8 @@ export JUDGE_MODEL=${JUDGE_MODEL:-}
 export JUDGE_BASE_URL=${JUDGE_BASE_URL:-https://api.openai.com/v1}
 export JUDGE_API_KEY=${JUDGE_API_KEY:-}
 JUDGE_JOBS=${JUDGE_JOBS:-4}
+# Questions per exported file when grading by hand (10 = roughly 15-30k tokens, one paste).
+MTBENCH_BATCH=${MTBENCH_BATCH:-10}
 # lm-evaluation-harness version (pinned so two runs score the same way).
 LM_EVAL_VERSION=${LM_EVAL_VERSION:-0.4.13}
 EVAL_VENV=${EVAL_VENV:-.local/eval-venv}
@@ -136,7 +142,7 @@ run_lm_eval() {
 	git log --oneline -1
 	echo "server $base, model $MODEL, jobs $JOBS, max_tokens $MAX_TOKENS${GEN_EXTRA:+, extra $GEN_EXTRA}"
 	echo "limits: ifeval $IFEVAL_LIMIT, mmlu_pro $MMLU_PRO_LIMIT per subject, mtbench $MTBENCH_LIMIT per category (0 = all)"
-	echo "judge: ${JUDGE_MODEL:-NONE (MT-Bench judging will be SKIPPED)}${JUDGE_MODEL:+ at $JUDGE_BASE_URL}"
+	echo "judge: ${JUDGE_MODEL:-NONE (MT-Bench judging SKIPPED: answers exported for grading in a chat)}${JUDGE_MODEL:+ at $JUDGE_BASE_URL}"
 	[ "$PORT" = 8081 ] && echo "WARNING: port 8081 is the speed-display proxy: its extra line is scored. Use 8080."
 	if ! models=$(curl -sf --max-time 10 "${auth[@]}" "$base/models"); then
 		echo "the server does not answer at $base/models (not started, wrong PORT, or API_KEY needed)"
@@ -160,7 +166,7 @@ run_lm_eval() {
 			t0=$SECONDS
 			API_KEY=$API_KEY python3 bench/mtbench.py run --label "$name" --host "$HOST" --port "$PORT" \
 				--model "$MODEL" --limit "$MTBENCH_LIMIT" --jobs "$JOBS" --judge-jobs "$JUDGE_JOBS" \
-				--max-tokens "$MAX_TOKENS" > "$raw/mtbench.log" 2>&1
+				--max-tokens "$MAX_TOKENS" --batch "$MTBENCH_BATCH" > "$raw/mtbench.log" 2>&1
 			echo "mtbench exit $?, $(((SECONDS - t0) / 60)) min; log: $raw/mtbench.log"
 			# The summary (everything after the per-answer progress lines).
 			sed -n '/^MT-Bench (/,$p' "$raw/mtbench.log"
