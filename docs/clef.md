@@ -15,10 +15,25 @@ It writes no text, so there is nothing to stream and nothing to parse. Its model
 | attention | 3 Gated DeltaNet (linear) layers to 1 full GQA layer (4 KV heads, head 256) | same |
 | extra | vision tower (27 blocks), joint schema head (256 MB) | same |
 | bf16 download | 55 GB | ~19 GB |
-| here (NF4) | ~19 GB on the GPU (~16.5 with `CLEF_EMBED_CPU=1`) | ~8.5 GB |
+| on the GPU here, before any input | 15.6 GiB | 6.7 GiB |
+| + one 16k-token input | 2.7 GiB (18.2 total, 3.8 free on 22 GiB) | 1.9 GiB |
 
-The memory figures are estimates from the parameter counts. They have not been measured on
-the card yet, and the boot log prints the real number.
+Everything stays on the GPU; nothing is offloaded to host RAM. The figures come from
+`bench/clef_memory.py`, which builds the released module tree (it reproduces the 27B's
+27,356,728,560 parameters) and runs a 16k-token forward on PyTorch's meta device, counting
+every tensor alive at each step. It assumes 0.4 GiB of CUDA context. The boot fit check
+below measures the real peak on the card.
+
+27B budget, in GiB:
+
+| part | GiB |
+|---|---|
+| 24.35B layer weights in NF4 | 11.70 |
+| token embeddings + LM head as INT8 tables (fp16 would be 4.74) | 2.37 |
+| vision tower (fp16) | 0.86 |
+| joint schema head (fp16) | 0.24 |
+| CUDA context (assumed) | 0.40 |
+| activations at 4k / 8k / 16k tokens | 0.8 / 1.4 / 2.7 |
 
 The API is Jev/SystemOne (`POST /v1/systemone`), not OpenAI chat. Open WebUI cannot use it
 for chat, so the switcher keeps it out of `/v1/models` and refuses a chat sent to it.
@@ -44,12 +59,25 @@ what the 2080 Ti needs added in `scripts/clef_server.py`:
   each decoder layer outputs. An answer whose layers overflowed fp16 (65504) is refused,
   not returned.
 - **NF4 weights** through bitsandbytes, the 4-bit path that runs on Turing. The Marlin and
-  NVFP4 kernels need sm80 or newer. The LM head and the vision tower stay in fp16.
-- **Optional token embeddings in host RAM** (`CLEF_EMBED_CPU=1`).
+  NVFP4 kernels need sm80 or newer. The vision tower stays in fp16.
+- **Token embeddings and LM head as INT8 tables** (2.4 GiB less). Clef only looks rows up
+  in both: the decision head averages LM-head rows of each option's tokens and never
+  computes logits. Each row keeps one fp16 scale, and the error is under 0.4% of the row's
+  largest value.
+- **The DeltaNet layers 8 heads at a time.** These are 48 of the 64 layers. Without fla
+  kernels, Transformers' PyTorch path makes about eight float32 copies of q, k and v for all
+  48 heads: 4.9 GiB of activations at 16k tokens. The heads are independent, so splitting
+  them gives the same answer bit for bit (`tests/test_clef_memory.py`) and uses 2.65 GiB.
+- **Full attention on the memory-efficient SDPA kernel.** K and V are repeated to the 24
+  query heads. With `enable_gqa` instead, sm75 has no flash kernel and PyTorch would fall
+  back to the math kernel, which builds the whole 16k x 16k matrix (13 GB).
+- **A fit check at boot.** It runs the longest input once (16384 tokens, then shorter until
+  one fits with `CLEF_HEADROOM_GB`, default 1, still free). That length becomes the server's
+  limit, so a request can't run out of memory later. The log says `FIT: clef takes inputs
+  up to N tokens on this card`. If even 2048 tokens don't fit, it says `DOES NOT FIT` and
+  exits. `setup-clef.sh` refuses before the download when the card is too small: about
+  17.8 GiB for the 27B, 8.7 GiB for the 9B.
 - **A one-time NF4 copy on disk**, so a model switch does not quantize 27B again.
-- Full attention through PyTorch SDPA, whose memory-efficient kernel runs in fp16 on sm75.
-  The DeltaNet layers use Transformers' PyTorch path. It is slower than the fla kernels,
-  but it has no Triton tile limits.
 
 ## Setup (once)
 
@@ -60,13 +88,14 @@ DROP_ORIGINAL=1 scripts/setup-clef.sh          # delete the bf16 download after 
 ```
 
 The script needs the GPU free for the NF4 step, so stop Inkling first. Everything it prints
-goes to `.local/setup-clef.log`. It checks four things before it downloads anything:
+goes to `.local/setup-clef.log`. It checks five things before it downloads anything:
 
+- the card has enough memory for the model chosen;
 - the torch wheel has sm_75 kernels (if not, rerun with
   `TORCH_INDEX=https://download.pytorch.org/whl/cu126`);
 - the Qwen3.5 class imports;
 - a bitsandbytes NF4 matmul runs on the card;
-- fp16 SDPA runs with head 256 and GQA.
+- the memory-efficient SDPA kernel runs with head 256.
 
 ## Serving both models on one address
 
@@ -132,9 +161,9 @@ Videos are not accepted over HTTP; send frames as images instead. The input is c
 
 1. `.local/setup-clef.log`.
 2. `.local/model-switch.log` after: Inkling chat in Open WebUI, then the curl above, then
-   chat again (two switches). The Clef boot runs a self-test, whose expected answers are
-   `technical`, urgency near 2 and outage true. `CLEF_SELFTEST_TOKENS=8000` in
-   `scripts/clef.sh` adds one long request, with its time and peak memory.
+   chat again (two switches). The Clef boot logs the fit check (its `FIT:` line, with the
+   peak memory and the prefill speed at that length), then a self-test whose expected
+   answers are `technical`, urgency near 2 and outage true.
 
-The log answers what is still open: load time, GPU memory, prefill speed and fp16 headroom
-on the card.
+The log answers what is still open: load time, the measured peak against the
+`bench/clef_memory.py` estimate, prefill speed and fp16 headroom on the card.

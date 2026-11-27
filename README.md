@@ -176,8 +176,10 @@ streamed answer giving the prefill and decode speed of that request. Point the f
 **Several models on one address.** `scripts/serve-switch.sh` replaces `serve.sh` with the
 same ports. It loads whichever model a request names, one at a time, because only one fits
 on the card. Open WebUI keeps chatting with `inkling-2-mini`. Cloudflare's
-[Clef](https://huggingface.co/Cloudflare/clef), a decision model with no chat (27B in NF4, or
-the 9B Clef-Flash), answers `POST /v1/systemone` on the same address. `docs/clef.md` covers
+[Clef](https://huggingface.co/Cloudflare/clef), a decision model with no chat, answers
+`POST /v1/systemone` on the same address. The 27B takes 15.6 GiB plus 2.7 GiB at 16k
+tokens, all on the GPU, and a fit check at boot confirms it; the 9B Clef-Flash is the
+smaller option. `docs/clef.md` covers
 the setup, the request format and the single log to send back.
 
 **Sampling:** temperature 1.0 is the model's default. Its card says it can get stuck in long

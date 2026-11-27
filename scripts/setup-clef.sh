@@ -23,23 +23,39 @@ case "$CLEF_MODEL" in
 esac
 VENV=${VENV:-.local/clef-venv}
 PYTHON=${PYTHON:-python3}
-# PyTorch wheels built for CUDA 13.0, which still include Turing (sm_75); checked below.
-# If the check fails: TORCH_INDEX=https://download.pytorch.org/whl/cu126
-TORCH_INDEX=${TORCH_INDEX:-https://download.pytorch.org/whl/cu130}
+# PyTorch from PyPI: its CUDA wheels include Turing (sm_75; checked below). Another build:
+# TORCH_INDEX=https://download.pytorch.org/whl/cu126
+TORCH_INDEX=${TORCH_INDEX:-}
 QUANTIZE=${QUANTIZE:-1}
 DROP_ORIGINAL=${DROP_ORIGINAL:-0}
 
 echo "== setup-clef $(date -Is): $CLEF_MODEL ($REPO_ID)"
-nvidia-smi --query-gpu=name,compute_cap,memory.total,driver_version --format=csv || true
+nvidia-smi --query-gpu=name,compute_cap,memory.total,memory.used,driver_version --format=csv || true
 df -h models | tail -1
+
+# Will it fit? Served sizes from bench/clef_memory.py: 27B 15.6 GiB before any input,
+# +0.8 GiB at 4k tokens, +1 GiB kept free; 9B 6.7 GiB. Checked before the download.
+case "$CLEF_MODEL" in
+	clef) need_mib=17800 ;;
+	clef-flash) need_mib=8700 ;;
+esac
+total_mib=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2> /dev/null \
+	| head -1 | tr -d ' ' || true)
+if [ -n "$total_mib" ] && [ "$total_mib" -lt "$need_mib" ]; then
+	echo "DOES NOT FIT: $CLEF_MODEL needs about $need_mib MiB on the GPU and this card has" \
+		"$total_mib MiB. CLEF_MODEL=clef-flash scripts/setup-clef.sh sets up the 9B." >&2
+	exit 1
+fi
+echo "fits: $CLEF_MODEL needs about $need_mib MiB of the card's ${total_mib:-?} MiB" \
+	"(the server's boot fit check measures it)"
 
 if [ ! -x "$VENV/bin/python" ]; then
 	echo "== venv $VENV"
 	"$PYTHON" -m venv "$VENV"
 fi
 "$VENV/bin/pip" install -q --upgrade pip
-echo "== torch from $TORCH_INDEX"
-"$VENV/bin/pip" install -q torch --index-url "$TORCH_INDEX"
+echo "== torch from ${TORCH_INDEX:-PyPI}"
+"$VENV/bin/pip" install -q torch ${TORCH_INDEX:+--index-url "$TORCH_INDEX"}
 echo "== transformers and the rest (the release was tested with transformers 5.10.2)"
 "$VENV/bin/pip" install -q "transformers==5.10.2" accelerate bitsandbytes safetensors \
 	pillow "huggingface_hub>=0.34"
@@ -56,6 +72,7 @@ print("GPU", torch.cuda.get_device_name(), arch, "wheel archs", torch.cuda.get_a
 assert arch in torch.cuda.get_arch_list(), (
     f"this torch wheel has no {arch} kernels: rerun with "
     "TORCH_INDEX=https://download.pytorch.org/whl/cu126")
+assert torch.cuda.get_device_properties(0).total_memory > 0
 from transformers import Qwen3_5ForConditionalGeneration  # noqa: F401 (the release's class)
 layer = bnb.nn.Linear4bit(5120, 5120, compute_dtype=torch.float16, quant_type="nf4").cuda()
 x = torch.randn(8, 5120, device="cuda", dtype=torch.float16)
@@ -64,10 +81,13 @@ w = bnb.functional.dequantize_4bit(layer.weight.data, layer.weight.quant_state)
 ref = x.float() @ w.float().t()
 print("bitsandbytes NF4 on the GPU: ok, relative error",
       float((y.float() - ref).norm() / ref.norm()))
-q = torch.randn(1, 24, 512, 256, device="cuda", dtype=torch.float16)
-k = torch.randn(1, 4, 512, 256, device="cuda", dtype=torch.float16)
-out = torch.nn.functional.scaled_dot_product_attention(q, k, k, is_causal=True, enable_gqa=True)
-print("fp16 SDPA (GQA, head 256): ok", tuple(out.shape))
+# Clef's full attention as clef_server.py runs it: K/V repeated to 24 heads, head 256, on
+# the memory-efficient kernel only (the math fallback would build a 13 GB matrix at 16k).
+from torch.nn.attention import SDPBackend, sdpa_kernel
+q = torch.randn(1, 24, 4096, 256, device="cuda", dtype=torch.float16)
+with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION]):
+    out = torch.nn.functional.scaled_dot_product_attention(q, q, q, is_causal=True)
+print("fp16 memory-efficient SDPA (24 heads, head 256, 4k tokens): ok", tuple(out.shape))
 EOF
 
 if [ ! -f "models/$CLEF_MODEL/joint_schema_model.py" ]; then

@@ -29,17 +29,30 @@ export CLEF_PATH
 export CLEF_NAME=${CLEF_NAME:-$CLEF_MODEL}
 
 # --- memory ---------------------------------------------------------------------------
-# Weights: nf4 (4-bit, ~19 GB for the 27B, ~8.5 GB for the 9B), int8 (~30 / ~12 GB: the
-# 27B does not fit), none (fp16: only the 9B, ~19 GB). The LM head and the vision tower
-# stay fp16 in every mode (the decision head reads the LM head's rows). Ignored for a
-# pre-quantized CLEF_PATH. Estimates from the parameter counts, not measured on the card.
+# Everything stays on the GPU. For the 27B on a 22 GiB card (bench/clef_memory.py, from the
+# real module tree; the boot log has the measured numbers):
+#   NF4 layers 11.70 + INT8 embeddings/LM head 2.37 + vision 0.86 + joint head 0.24
+#   + CUDA context ~0.4 = 15.6 GiB before any input; a 16k-token input adds 2.7 GiB
+#   (4k: 0.8, 8k: 1.4), so 18.2 GiB at 16k with 3.8 GiB free. The 9B: 6.7 + 1.9 GiB.
+# Weights of the layers: nf4. int8 (8-bit) does not fit the 27B (24 GiB of layers);
+# none (fp16) only fits the 9B. Ignored for a pre-quantized CLEF_PATH (the -nf4 copy).
 export CLEF_QUANT=${CLEF_QUANT:-nf4}
-# Token embeddings in host RAM (1 = 2.5 GB less on the GPU for the 27B, 2 GB for the 9B;
-# the lookup is a few rows per token). The first thing to try on "out of GPU memory".
-export CLEF_EMBED_CPU=${CLEF_EMBED_CPU:-0}
-# Longest input in tokens (state + questions + images). Longer states are cut at the end,
-# as the release does; its default is 16384. Memory for one forward grows with it.
-export CLEF_MAX_LEN=${CLEF_MAX_LEN:-16384}
+# Token embeddings and LM head as INT8 tables (int8, 2.4 GiB less for the 27B) or fp16.
+# Clef only looks rows up in both (its decision head reads LM head rows, no logits).
+export CLEF_TABLES=${CLEF_TABLES:-int8}
+# Longest input in tokens (state + questions + images); longer states are cut at the end,
+# as the release does (its default: 16384). auto = at boot, run the longest input that
+# fits (16384, then 12288, 8192, ... 2048) and keep that, so no request can run out of
+# memory later; the log says "FIT: ... up to N tokens", or "DOES NOT FIT" and stops. A
+# number = that length or stop.
+export CLEF_MAX_LEN=${CLEF_MAX_LEN:-auto}
+# GPU memory that must stay free at the longest input (a desktop's windows, a browser).
+export CLEF_HEADROOM_GB=${CLEF_HEADROOM_GB:-1.0}
+# Linear-attention heads computed at once (8 of 48: 2.3 GiB less at 16k than all at once,
+# bitwise the same answer). 0 = all at once.
+export CLEF_DELTA_HEADS=${CLEF_DELTA_HEADS:-8}
+# Images larger than this are scaled down (one token per 32x32 pixels: 1 MP = 1,024).
+export CLEF_IMAGE_PIXELS=${CLEF_IMAGE_PIXELS:-1048576}
 # float16 on Turing (no bf16 tensor cores). Every answer checks the largest value the
 # layers produce and refuses one that overflowed; bfloat16 avoids that, much slower here.
 export CLEF_DTYPE=${CLEF_DTYPE:-float16}
@@ -51,10 +64,8 @@ export PORT=${PORT:-18090}
 export API_KEY=${API_KEY:-}
 
 # --- checks in the log ----------------------------------------------------------------
-# A fixed request at boot (expected: technical / urgency ~2 / outage true), and optionally
-# one of about this many tokens, with its time and peak memory: what to send back.
+# A fixed request after the fit check (expected: technical / urgency ~2 / outage true).
 export CLEF_SELFTEST=${CLEF_SELFTEST:-1}
-export CLEF_SELFTEST_TOKENS=${CLEF_SELFTEST_TOKENS:-0}
 
 PY=${CLEF_PYTHON:-.local/clef-venv/bin/python}
 if [ ! -x "$PY" ]; then
