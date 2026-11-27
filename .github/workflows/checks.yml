@@ -24,6 +24,6 @@ jobs:
           version: "0.17.6"
           args: check bench prepare tests scripts
       - name: shell syntax
-        run: for f in start.sh scripts/*.sh bench/*.sh prepare/*.sh; do bash -n "$f"; done
+        run: for f in start.sh scripts/*.sh bench/*.sh prepare/*.sh sandbox/*.sh; do bash -n "$f"; done
       - name: wizard with every default
         run: yes '' | python3 scripts/wizard.py --print
