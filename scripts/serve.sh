@@ -13,6 +13,7 @@
 #   curl http://192.168.1.50:8080/v1/models -H "Authorization: Bearer $API_KEY"
 #
 # Firewall: the port must be open to the LAN.
+#   (8081 too for the speed line, see SPEED_PORT below)
 #   Fedora/RHEL:   sudo firewall-cmd --add-port=8080/tcp --permanent && sudo firewall-cmd --reload
 #   Ubuntu/Debian: sudo ufw allow from 192.168.1.0/24 to any port 8080 proto tcp
 #
@@ -43,9 +44,17 @@ export SERVED_NAME=${SERVED_NAME:-inkling-2-mini}
 # more context. 2 = one chat plus the side request front ends send (titles, tags). Raise it
 # for several users; one request alone is fastest per user.
 export MAX_SEQS=${MAX_SEQS:-2}
-# Longest request in tokens (prompt + answer). auto = as much as the card holds after
-# warmup, printed at boot ("max_model_len"): about 145k headless, 120k with a desktop, at
-# one slot. A number caps it (and the boot fails if it does not fit).
+# Longest request in tokens (prompt + answer). auto = everything the card holds after
+# warmup, so there is nothing to raise: measured at one slot, 145k tokens headless and 120k
+# with a desktop on the card. What the running server took:
+#   curl -s http://127.0.0.1:8080/v1/models | grep -o '"max_model_len":[0-9]*'
+# For 128k with a desktop running (or with more slots), in order of what they cost:
+#   MAX_SEQS=1   one request at a time (not measured how much a second slot takes)
+#   NBT=1024     about 20k tokens more, prefill about 8% slower
+#   ASYNC=0      about 12k tokens more, decode 3-4% slower
+# (the last two were measured on a 3090 Ti, not on this card). A number here instead of
+# auto caps the length, and the boot fails if it does not fit: MAX_LEN=128000 is a way to
+# be told at once when a setting stopped it fitting.
 export MAX_LEN=${MAX_LEN:-auto}
 # Share of the GPU's memory vLLM may use. 0.95 leaves room for a desktop; headless, 0.97
 # gives a little more context (not measured on this card: lower it again if the boot runs
@@ -79,6 +88,16 @@ export NBT=${NBT:-2048}
 # at long context, so refuse to start instead.
 SM75_LIB=${HYPERINKLING_SM75_LIB-venv/hyperinkling_sm75.so}
 
+# --- speed shown in the front end ------------------------------------------------------
+# scripts/speed_proxy.py adds a line under every streamed chat answer:
+#   prefill 8,185 tok in 3.4 s (2,407 tok/s) · decode 512 tok at 84.1 tok/s
+# Point the front end at this port instead of PORT to see it (the plain API stays on
+# PORT). Empty = do not start it.
+SPEED_PORT=${SPEED_PORT-8081}
+# The server reports how much of each prompt its prefix cache already held, which the
+# line above needs to give a true prefill rate.
+export EXTRA_ARGS="${EXTRA_ARGS:-} --enable-prompt-tokens-details"
+
 # --- sanity ----------------------------------------------------------------------------
 # The wizard's .env is skipped so that this file is the whole configuration. Set
 # ENV_FILE=.env to layer it underneath (values here still win).
@@ -102,5 +121,13 @@ else
 fi
 echo "serve: http://${address:-<this machine>}:$PORT/v1  model '$SERVED_NAME'" \
 	"$([ -n "$API_KEY" ] && echo '(API key required)' || echo '(no API key)')"
-echo "serve: ready when  curl -sf http://127.0.0.1:$PORT/health  succeeds (a minute or two)"
-exec ./start.sh
+local_address=$([ "$BIND" = 0.0.0.0 ] && echo 127.0.0.1 || echo "$BIND")
+echo "serve: ready when  curl -sf http://$local_address:$PORT/health  succeeds (a minute or two)"
+if [ -n "$SPEED_PORT" ]; then
+	echo "serve: with the speed line under each answer: http://${address:-<this machine>}:$SPEED_PORT/v1"
+	python3 scripts/speed_proxy.py --bind "$BIND" --port "$SPEED_PORT" \
+		--upstream "http://$local_address:$PORT" &
+	proxy=$!
+	trap 'kill "$proxy" 2> /dev/null || true' EXIT
+fi
+./start.sh
