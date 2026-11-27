@@ -144,6 +144,25 @@ card allows, stop the display manager (`sudo systemctl isolate multi-user.target
 closes the graphical session; `graphical.target` brings it back) or drive the display
 from another GPU.
 
+## 7. INT4 attention and LM head (opt-in)
+
+Off by default. `HYPERINKLING_ATTN_W4=1` puts every attention layer's projections in INT4
+(or a list such as `0-5,18-23`; the others stay INT8), `HYPERINKLING_HEAD_W4=1` the LM head.
+Groups of 64 inputs by default (`HYPERINKLING_{ATTN,HEAD}_W4_GROUP=32|64|128`), round to
+nearest after a clip search. It halves the bytes the decode GEMV reads; on the 3090 Ti,
+round to nearest raised the KL against the original checkpoint (FOLLOWUPS "Tried and
+dropped"), so it stays off until it is measured here.
+
+```bash
+STEPS="system test kernels" bench/attn_w4.sh k1   # no server, ~5 min: per-call INT4 vs INT8
+bench/attn_w4.sh v1                               # + speed at 8k/90k and KL per variant, ~1-1.5 h
+```
+
+Both write `.local/attn-w4-<name>.txt`. Run it headless (a desktop moves ms/step by ~3 ms).
+A variant is kept only if its KL is close to the reference and `bench/quality_battery.sh`
+(`STEPS=quality scripts/turing-report.sh <name>` with the variant's variables exported)
+stays within noise of GSM8K 0.965, tools 0.605, DocVQA 0.936.
+
 ## What is not done
 
 - DSpark in fp16 has not run yet (step 4).

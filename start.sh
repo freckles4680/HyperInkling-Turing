@@ -117,6 +117,12 @@ CPUS=${CPUS:-0-$(( $(nproc) > 1 ? $(nproc) - 2 : 0 ))}   # leave one hardware th
 export HYPERINKLING_ATTN_W8=${HYPERINKLING_ATTN_W8:-1}
 export HYPERINKLING_HEAD_W8=${HYPERINKLING_HEAD_W8:-1}
 export HYPERINKLING_EMBED_W8=${HYPERINKLING_EMBED_W8:-1}
+# INT4 instead (opt-in, off by default; ops/linear_w4_gemv.py, bench/attn_w4.sh measures it):
+# HYPERINKLING_ATTN_W4=1 (every layer) or layer ids/ranges such as 0-5,18-23 (the others
+# keep INT8), HYPERINKLING_HEAD_W4=1; groups of 64 inputs (HYPERINKLING_{ATTN,HEAD}_W4_GROUP=
+# 32|64|128), round to nearest after a clip search (HYPERINKLING_W4_CLIP=0: without).
+export HYPERINKLING_ATTN_W4=${HYPERINKLING_ATTN_W4:-0}
+export HYPERINKLING_HEAD_W4=${HYPERINKLING_HEAD_W4:-0}
 export HYPERINKLING_EMBED_UVA=${HYPERINKLING_EMBED_UVA:-1}
 # Vision tower weights in host RAM, copied in layer by layer per image: ~34k tokens of
 # context, +27 ms per A4 page.
@@ -215,6 +221,10 @@ else verify="by batch size $SPEC_K"; fi
 echo "Speculation: $SPEC$([ "$SPEC" = dspark ] && echo ", $SPEC_DRAFT drafts, verify k $verify, context lookup $HYPERINKLING_LOOKUP")"
 echo "INT8: attention=$HYPERINKLING_ATTN_W8 head=$HYPERINKLING_HEAD_W8" \
 	"embed=$HYPERINKLING_EMBED_W8 (host RAM: $HYPERINKLING_EMBED_UVA)"
+if [ "$HYPERINKLING_ATTN_W4" != 0 ] || [ "$HYPERINKLING_HEAD_W4" != 0 ]; then
+	echo "INT4: attention=$HYPERINKLING_ATTN_W4 (group ${HYPERINKLING_ATTN_W4_GROUP:-64})" \
+		"head=$HYPERINKLING_HEAD_W4 (group ${HYPERINKLING_HEAD_W4_GROUP:-64}), clip search ${HYPERINKLING_W4_CLIP:-1}"
+fi
 [ "$GPU_CC" = 7.5 ] && echo "Turing: fp16, tensor-core attention ${HYPERINKLING_SM75_LIB:-not built (scripts/build-sm75-kernels.sh)}"
 echo "Images: up to $IMAGES/request, ${IMAGE_MAX_W}x${IMAGE_MAX_H} profiled, larger ones scaled to $HYPERINKLING_IMAGE_MAX_CELLS cells, vision tower $([ "$HYPERINKLING_VISION_HOST" = 1 ] && echo 'in host RAM' || echo 'on the GPU')"
 echo "=================================================="

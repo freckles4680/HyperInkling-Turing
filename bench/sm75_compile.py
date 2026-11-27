@@ -150,6 +150,20 @@ def _w8():
             w8.w8_matmul(_r(m, HID), q, s)
 
 
+def _w4g():
+    """INT4 attention / LM head (HYPERINKLING_ATTN_W4, HYPERINKLING_HEAD_W4): every
+    decode tile the defaults pick, the three-input launch and the prefill dequant."""
+    w4g = load("linear_w4_gemv")
+    for group in (32, 64, 128):
+        for n in (2304, 8600, 201024):
+            lin = w4g.W4GLinear(torch.randn(n, HID).half(), group, clip=False)
+            for m in (1, 2, 3, 4, 5, 8, 64, 100):
+                lin(_r(m, HID))
+            if n == 8600:
+                for m in (1, 3, 5):
+                    lin.multi([_r(m, HID)] * 3, [(0, 6552), (6552, 7576), (7576, 8600)])
+
+
 def _k_groups():
     linear = load("linear")
     for t in (1, 6, 16, 48):  # more rows run on cuBLAS on Turing
@@ -294,7 +308,7 @@ def _prologue():
 def main():
     _setup()
     failed = []
-    for step in (_w8, _k_groups, _controllers, _norms, _swiglu, _vision, _attention,
+    for step in (_w8, _w4g, _k_groups, _controllers, _norms, _swiglu, _vision, _attention,
                  _prologue, _short_conv, _dspark):
         try:
             step()

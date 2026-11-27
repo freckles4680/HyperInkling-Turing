@@ -54,6 +54,9 @@ Key mechanisms of the port (spread across several files):
   Online verify length (`HYPERINKLING_SPEC_ADAPTIVE`, default 2,4,7):
   `vllm/v1/spec_decode/dynamic/adaptive_k.py`. Context lookup drafts (`HYPERINKLING_LOOKUP`,
   default on): `ops/lookup.py`.
+- Opt-in INT4 attention / LM head (`ops/linear_w4_gemv.py`, `HYPERINKLING_ATTN_W4=1|<layer
+  ranges>`, `HYPERINKLING_HEAD_W4=1`, group 64): dot-free decode GEMV with magic-number
+  dequant (no int-to-float); `bench/attn_w4.sh` measures speed and KL against INT8.
 - Images over the profiled page are scaled down in `processing.py` (`fit_to_budget`);
   `HYPERINKLING_VISION_HOST=1` streams the vision tower from host RAM per layer (`model.py`).
 - Turing (sm75, a 22 GB 2080 Ti): fp16 activations (`ops.use_fp16`, `ops.act_dtype`;
