@@ -1,0 +1,45 @@
+# Models behind scripts/model_switch.py (scripts/serve-switch.sh). One runs at a time:
+# a request naming another one stops the running server and starts that one.
+#
+# [models.<name>]  the name clients send in "model" (and see in /v1/models)
+#   command        started from the repository root, in its own process group, so
+#                  stopping it stops everything it started
+#   port           where it listens: 127.0.0.1 only, the switcher holds the public port
+#   env            variables for the command, on top of the switcher's environment
+#   health         GET path that answers 200 once it can serve (default /health)
+#   aliases        other names that pick the same model
+#   listed         false = not in /v1/models (a front end would offer it for chat)
+#   paths          path prefixes it answers; anything else is refused before a switch
+#   start_timeout  seconds to wait for health (the first boot compiles kernels: long)
+
+[switch]
+# Stop the running model after this many idle seconds, to free the GPU for something
+# else. 0 = keep it loaded until another model is asked for.
+idle_unload = 0
+# Seconds a server gets to exit on SIGTERM before SIGKILL.
+stop_timeout = 60
+start_timeout = 900
+
+[models.inkling-2-mini]
+description = "Inkling 2 Mini, the chat model (scripts/serve.sh)"
+command = "scripts/serve.sh"
+port = 18080
+aliases = ["local"]
+# The speed line is added in front of the switcher (serve-switch.sh), not per model.
+env = { BIND = "127.0.0.1", PORT = "18080", SPEED_PORT = "", API_KEY = "", VLLM_API_KEY = "" }
+
+[models.clef]
+description = "Cloudflare Clef 27B, a decision model: POST /v1/systemone (docs/clef.md)"
+command = "scripts/clef.sh"
+port = 18090
+listed = false
+paths = ["/v1/systemone", "/v1/models", "/health"]
+env = { BIND = "127.0.0.1", PORT = "18090", API_KEY = "", CLEF_MODEL = "clef" }
+
+[models.clef-flash]
+description = "Cloudflare Clef-Flash 9B, a decision model: POST /v1/systemone (docs/clef.md)"
+command = "scripts/clef.sh"
+port = 18090
+listed = false
+paths = ["/v1/systemone", "/v1/models", "/health"]
+env = { BIND = "127.0.0.1", PORT = "18090", API_KEY = "", CLEF_MODEL = "clef-flash" }

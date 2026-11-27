@@ -82,11 +82,14 @@ scripts/build-vllm.sh                 # build into venv/ (sm86, ~30-60 min; ARCH
 ./start.sh                            # production server, port 8080; every knob is an env var
 scripts/serve.sh                      # Turing: start.sh on the LAN with the 2080 Ti settings, commented;
                                       # scripts/speed_proxy.py (:8081) adds tok/s under each chat answer
+scripts/serve-switch.sh               # Turing: one address, loads the model each request names
+                                      # (scripts/models.toml: Inkling, Clef); one log,
+                                      # .local/model-switch.log; Clef: docs/clef.md, own venv
 PORT=18030 ./start.sh                 # test instance on another port
 PROFILE=<name> ./start.sh             # Nsight Systems; POST /start_profile, /stop_profile
 scripts/serve-try.sh <log> [args]     # short-context eager boot of the original checkpoint, :18030
 
-venv/bin/python -m pytest -q tests/                          # kernel tests (GPU; test_auth.py, test_wizard.py not)
+venv/bin/python -m pytest -q tests/                          # kernel tests (GPU; test_auth.py, test_wizard.py, test_model_switch.py, test_clef_server.py not)
 venv/bin/python -m pytest -q -s tests/test_bgemv.py -k <name>  # one test, with timings
 ruff check bench prepare tests scripts                        # lint: ruff 0.17.6 (as CI), rules in ruff.toml
 ```

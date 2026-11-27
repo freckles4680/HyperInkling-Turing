@@ -173,6 +173,13 @@ client at the base URL above.
 streamed answer giving the prefill and decode speed of that request. Point the front end at
 `:8081/v1` to see it, or at `:8080/v1` for the plain API, and open 8081 in the firewall too.
 
+**Several models on one address.** `scripts/serve-switch.sh` replaces `serve.sh` with the
+same ports. It loads whichever model a request names, one at a time, because only one fits
+on the card. Open WebUI keeps chatting with `inkling-2-mini`. Cloudflare's
+[Clef](https://huggingface.co/Cloudflare/clef), a decision model with no chat (27B in NF4, or
+the 9B Clef-Flash), answers `POST /v1/systemone` on the same address. `docs/clef.md` covers
+the setup, the request format and the single log to send back.
+
 **Sampling:** temperature 1.0 is the model's default. Its card says it can get stuck in long
 reasoning loops, so cap `max_tokens` and the agent's turns.
 
@@ -237,6 +244,8 @@ checkpoint with Inkling 2 Mini's architecture. The steps are in
 | path | what |
 |---|---|
 | `scripts/serve.sh` | the 2080 Ti server on the LAN, every setting commented |
+| `scripts/serve-switch.sh`, `model_switch.py`, `models.toml` | one address, the model each request names (`docs/clef.md`) |
+| `scripts/clef.sh`, `clef_server.py`, `setup-clef.sh` | Cloudflare Clef (decision model) on Turing |
 | `start.sh` | the launcher; every knob is an env var |
 | `kernels/sm75/`, `scripts/build-sm75-kernels.sh` | the Turing tensor-core attention kernel |
 | `patches/` | the vLLM patch and its base commit (`BASE`) |
