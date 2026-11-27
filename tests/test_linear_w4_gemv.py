@@ -49,10 +49,16 @@ def test_pack_roundtrip(group):
     assert packed.dtype == torch.int32 and packed.shape == (N, K // 8)
     codes = unpack_w4g(packed)
     assert codes.min() >= 0 and codes.max() <= 15
-    # Without clipping, every weight is within half a step of its code.
+    # Without clipping, every weight is within half a step of its code, except at the
+    # ends of the code range: the zero point is an integer and the scale is rounded to
+    # bf16, so a group's min or max can land up to about half a step past code 0 or 15
+    # and is clamped there (0.55 steps at most on these weights).
     deq = dequantize_w4g(packed, scale, zero)
     step = scale.float().repeat_interleave(group, 1)
-    assert ((deq - w.float()).abs() <= step * 0.5 + 1e-6 + w.float().abs() * 1e-2).all()
+    err = (deq - w.float()).abs() / step
+    end = (codes == 0) | (codes == 15)
+    assert (err[~end] <= 0.5 + 1e-3).all(), err[~end].max()
+    assert (err[end] <= 1.0).all(), err[end].max()
     # The plane layout: input 16 i + j of a tile is nibble i of word j.
     s = scale.float()[0, 0]
     z = zero.float()[0, 0]
