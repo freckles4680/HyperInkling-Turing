@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "deny": [
+      "Edit(./bench/**)",
+      "Edit(./sandbox/**)",
+      "Edit(./scripts/claude_loop.py)",
+      "Edit(./scripts/server-lib.sh)",
+      "Edit(./models/**)",
+      "Edit(./.env)",
+      "Read(./.env)",
+      "Bash(git push *)",
+      "Bash(git remote *)",
+      "Bash(sudo *)",
+      "Bash(docker *)",
+      "Bash(wget *)",
+      "Bash(pip install *)",
+      "Bash(uv pip install *)",
+      "Bash(hf *)",
+      "WebFetch"
+    ]
+  },
+  "env": {
+    "DISABLE_AUTOUPDATER": "1",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
+  },
+  "cleanupPeriodDays": 30
+}

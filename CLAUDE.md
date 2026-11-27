@@ -89,6 +89,8 @@ scripts/serve-switch.sh               # Turing: one address, loads the model eac
                                       # (scripts/models.toml: Inkling, Clef); one log,
                                       # .local/model-switch.log; Clef: docs/clef.md, own venv
 PORT=18030 ./start.sh                 # test instance on another port
+sandbox/setup.sh                      # Claude Code in a GPU container (docs/claude-sandbox.md);
+                                      # scripts/claude_loop.py: change, measure, keep or reset
 PROFILE=<name> ./start.sh             # Nsight Systems; POST /start_profile, /stop_profile
 scripts/serve-try.sh <log> [args]     # short-context eager boot of the original checkpoint, :18030
 
