@@ -410,7 +410,7 @@ def main():
     p.add_argument("--judge-name", default="manual (chat)", help="import: who graded, for the report")
     p.add_argument("--report", help="import: report to append the summary to"
                    " (default .local/intelligence-<label>.txt when it exists)")
-    args = p.parse_args()
+    args = p.parse_intermixed_args()  # files may come after options (import --label x replies.txt)
     if args.cmd == "download":
         download()
         return
