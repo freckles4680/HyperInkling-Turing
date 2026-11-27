@@ -41,11 +41,19 @@ export CLEF_QUANT=${CLEF_QUANT:-nf4}
 # Clef only looks rows up in both (its decision head reads LM head rows, no logits).
 export CLEF_TABLES=${CLEF_TABLES:-int8}
 # Longest input in tokens (state + questions + images); longer states are cut at the end,
-# as the release does (its default: 16384). auto = at boot, run the longest input that
-# fits (16384, then 12288, 8192, ... 2048) and keep that, so no request can run out of
+# as the release does. Clef's context is 64k (Cloudflare; the backbone's positions go to
+# 262k, the release's own default cut is 16384). auto = at boot, run the longest input that
+# fits (65536, then 49152, 32768, ... 2048) and keep that, so no request can run out of
 # memory later; the log says "FIT: ... up to N tokens", or "DOES NOT FIT" and stops. A
-# number = that length or stop.
+# number = that length or stop. A 64k input is one long prefill: minutes, not seconds.
 export CLEF_MAX_LEN=${CLEF_MAX_LEN:-auto}
+# Every layer runs over at most this many tokens at a time (its activations stop growing
+# with the input: ~10 GB at 64k in one pass). Same answer; 0 = the whole input at once.
+export CLEF_CHUNK=${CLEF_CHUNK:-4096}
+# The fit check's result is kept in .local/clef-fit-<checkpoint>.json and reused while the
+# settings are the same and the card has at least as much free memory as when it passed
+# (a 64k probe takes minutes, and every switch to Clef boots it). probe = always measure.
+export CLEF_FIT=${CLEF_FIT:-cached}
 # GPU memory that must stay free at the longest input (a desktop's windows, a browser).
 export CLEF_HEADROOM_GB=${CLEF_HEADROOM_GB:-1.0}
 # Linear-attention heads computed at once (8 of 48: 2.3 GiB less at 16k than all at once,

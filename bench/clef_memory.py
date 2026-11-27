@@ -96,10 +96,11 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--model", choices=["clef", "clef-flash", "both"], default="both")
     ap.add_argument("--config", help="a checkpoint's config.json instead of the built-in one")
-    ap.add_argument("--lengths", default="4096,8192,16384")
+    ap.add_argument("--lengths", default="16384,32768,65536")
     ap.add_argument("--card", type=float, default=22.0, help="GiB on the card")
     ap.add_argument("--context", type=float, default=0.4, help="GiB of CUDA context")
     ap.add_argument("--delta-heads", type=int, default=8)
+    ap.add_argument("--chunk", type=int, default=4096, help="CLEF_CHUNK (0 = off)")
     args = ap.parse_args()
 
     import transformers.models.qwen3_5.modeling_qwen3_5 as qwen
@@ -114,6 +115,22 @@ def main():
         if isinstance(cls, type) and hasattr(cls, "_update_linear_attn_mask"):
             cls._update_linear_attn_mask = lambda self, mask, *a, **k: None
     clef_server.no_gqa_in_sdpa()
+
+    def grouped_attention(query, key, value, scale):
+        """The memory of clef_server._grouped_causal_sdpa (its lower-right causal mask
+        cannot be built under the meta tracker): each KV head expanded as a copy (the
+        worst case) and the output of the memory-efficient kernel, which keeps no
+        attention matrix."""
+        rep = query.shape[1] // key.shape[1]
+        outs = []
+        for g in range(key.shape[1]):
+            k = key[:, g:g + 1].expand(-1, rep, -1, -1).contiguous()
+            v = value[:, g:g + 1].expand(-1, rep, -1, -1).contiguous()
+            outs.append(torch.empty_like(query[:, g * rep:(g + 1) * rep]))
+            del k, v
+        return torch.cat(outs, dim=1)
+
+    clef_server._grouped_causal_sdpa = grouped_attention
 
     for name in (["clef", "clef-flash"] if args.model == "both" else [args.model]):
         config = build_config(name, args.config)
@@ -154,6 +171,8 @@ def main():
         if args.delta_heads:
             clef_server.split_delta_rule_heads(model, args.delta_heads)
         text = model.model.language_model
+        if args.chunk:
+            clef_server.chunk_layers(text, args.chunk)
         dequant = largest * 2 / GiB  # one weight dequantized to fp16 during a prefill
         print(f"  {'tokens':>8s} {'activations':>12s} {'total':>8s} {'free':>8s}")
         for n in [int(x) for x in args.lengths.split(",")]:

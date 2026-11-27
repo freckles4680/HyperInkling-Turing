@@ -16,11 +16,11 @@ It writes no text, so there is nothing to stream and nothing to parse. Its model
 | extra | vision tower (27 blocks), joint schema head (256 MB) | same |
 | bf16 download | 55 GB | ~19 GB |
 | on the GPU here, before any input | 15.6 GiB | 6.7 GiB |
-| + one 16k-token input | 2.7 GiB (18.2 total, 3.8 free on 22 GiB) | 1.9 GiB |
+| + one 16k / 32k / 64k-token input | 1.3 / 2.4 / 4.6 GiB (64k: 20.1 total, 1.9 free) | 0.9 / 1.9 / 3.6 GiB |
 
 Everything stays on the GPU; nothing is offloaded to host RAM. The figures come from
 `bench/clef_memory.py`, which builds the released module tree (it reproduces the 27B's
-27,356,728,560 parameters) and runs a 16k-token forward on PyTorch's meta device, counting
+27,356,728,560 parameters) and runs a long forward on PyTorch's meta device, counting
 every tensor alive at each step. It assumes 0.4 GiB of CUDA context. The boot fit check
 below measures the real peak on the card.
 
@@ -33,7 +33,13 @@ below measures the real peak on the card.
 | vision tower (fp16) | 0.86 |
 | joint schema head (fp16) | 0.24 |
 | CUDA context (assumed) | 0.40 |
-| activations at 4k / 8k / 16k tokens | 0.8 / 1.4 / 2.7 |
+| activations at 16k / 32k / 64k tokens | 1.3 / 2.4 / 4.6 |
+
+Context: Cloudflare gives Clef a 64k context (the backbone's positions go to 262k; 16384 is
+only the release code's default cut). At 64k the 27B leaves about 1.9 GiB free on a
+headless card, so with a desktop holding more than about 1 GiB the fit check settles on
+48k instead. One 64k input is a long prefill on this card (minutes; the `FIT:` line
+measures it).
 
 The API is Jev/SystemOne (`POST /v1/systemone`), not OpenAI chat. Open WebUI cannot use it
 for chat, so the switcher keeps it out of `/v1/models` and refuses a chat sent to it.
@@ -64,6 +70,14 @@ what the 2080 Ti needs added in `scripts/clef_server.py`:
   in both: the decision head averages LM-head rows of each option's tokens and never
   computes logits. Each row keeps one fp16 scale, and the error is under 0.4% of the row's
   largest value.
+- **Every layer over 4,096 tokens at a time** on long inputs (`CLEF_CHUNK`). In one pass
+  a 64k input would need about 10 GB of activations (4x the 16k one), mostly the MLP's 17,408-wide
+  intermediates and the attention projections. The MLP is per token. The DeltaNet layers
+  carry their conv and recurrent state from chunk to chunk, through the same
+  continuation path Transformers uses with a cache. Full attention computes K/V for every
+  position once, then runs the queries chunk by chunk with a lower-right causal mask, one
+  KV head at a time, so K/V are never repeated to all 24 query heads.
+  `tests/test_clef_memory.py` checks that the chunked model gives the one-pass output.
 - **The DeltaNet layers 8 heads at a time.** These are 48 of the 64 layers. Without fla
   kernels, Transformers' PyTorch path makes about eight float32 copies of q, k and v for all
   48 heads: 4.9 GiB of activations at 16k tokens. The heads are independent, so splitting
@@ -71,7 +85,7 @@ what the 2080 Ti needs added in `scripts/clef_server.py`:
 - **Full attention on the memory-efficient SDPA kernel.** K and V are repeated to the 24
   query heads. With `enable_gqa` instead, sm75 has no flash kernel and PyTorch would fall
   back to the math kernel, which builds the whole 16k x 16k matrix (13 GB).
-- **A fit check at boot.** It runs the longest input once (16384 tokens, then shorter until
+- **A fit check at boot.** It runs the longest input once (65536 tokens, then shorter until
   one fits with `CLEF_HEADROOM_GB`, default 1, still free). That length becomes the server's
   limit, so a request can't run out of memory later. The log says `FIT: clef takes inputs
   up to N tokens on this card`. If even 2048 tokens don't fit, it says `DOES NOT FIT` and
@@ -155,7 +169,10 @@ The three question types are:
 
 `state` can be a string or any JSON. `images` is a list of base64 strings or `data:` URLs.
 Videos are not accepted over HTTP; send frames as images instead. The input is cut at
-`CLEF_MAX_LEN` tokens (16384, the release's default), from the end of the state.
+the length the fit check found (`CLEF_MAX_LEN`, at most 65536), from the end of the state.
+The fit result is kept in `.local/clef-fit-<checkpoint>.json` and reused on later boots
+(every switch to Clef) while the settings match and at least as much GPU memory is free;
+`CLEF_FIT=probe` measures again.
 
 ## What to send back after a first run
 

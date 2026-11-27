@@ -10,12 +10,13 @@ file adds what the 2080 Ti needs and an HTTP server:
   * 4-bit NF4 weights through bitsandbytes (27B in bf16 is 55 GB), vision tower in fp16
   * token embeddings and LM head as INT8 tables (the model only looks rows up in both:
     the decision head reads the LM head's rows, it never computes logits)
-  * the PyTorch Gated DeltaNet run 8 heads at a time (bitwise the same, 2 GB less at 16k)
+  * every layer over 4,096 tokens at a time on long inputs, and the PyTorch Gated
+    DeltaNet 8 heads at a time (the same answer; activations ~10 GB -> 4.6 GB at 64k)
   * at boot, a fit check: the longest input that fits with headroom, or a clear failure
   * --save-quantized: write the NF4 model once, later loads skip the quantization
 
-Memory of the 27B (bench/clef_memory.py): 15.2 GiB of weights, 2.5 GiB of activations at
-16k tokens, on a 22 GiB card.
+Memory of the 27B (bench/clef_memory.py): 15.6 GiB before any input, + 1.3 / 2.4 / 4.6 GiB
+of activations at 16k / 32k / 64k tokens, on a 22 GiB card.
 
     POST /v1/systemone   {"model": "clef", "state": "...", "questions": {...}}
     GET  /v1/models, GET /health
@@ -172,13 +173,15 @@ def split_delta_rule_heads(model, group):
             bound = _sig.bind(*args, **kwargs)
             a = bound.arguments
             heads = a["query"].shape[2]
-            if a.get("initial_state") is not None or heads <= group:
+            if heads <= group:
                 return _fn(*args, **kwargs)
             outs, states = [], []
             for h in range(0, heads, group):
                 part = dict(a)
                 for key in ("query", "key", "value", "g", "beta"):
                     part[key] = a[key][:, :, h:h + group]
+                if a.get("initial_state") is not None:  # [batch, heads, k, v]
+                    part["initial_state"] = a["initial_state"][:, h:h + group]
                 extra = part.pop("kwargs", {})
                 out, state = _fn(**part, **extra)
                 outs.append(out)
@@ -190,6 +193,125 @@ def split_delta_rule_heads(model, group):
         module.chunk_gated_delta_rule = split
         wrapped += 1
     return wrapped
+
+
+class _OneLayerState:
+    """The slice of transformers' cache that a Gated DeltaNet layer reads and writes, so
+    the layer can run over a long input in token chunks (its conv and recurrent state
+    carried from one chunk to the next, as its own chunked-continuation path does)."""
+
+    def __init__(self, layer_idx):
+        self.layers = {layer_idx: type("State", (), {"conv_states": None,
+                                                     "recurrent_states": None})()}
+
+    def has_previous_state(self, layer_idx):
+        return self.layers[layer_idx].recurrent_states is not None
+
+    def update_conv_state(self, state, layer_idx):
+        self.layers[layer_idx].conv_states = state
+
+    def update_recurrent_state(self, state, layer_idx):
+        self.layers[layer_idx].recurrent_states = state
+
+
+def _grouped_causal_sdpa(query, key, value, scale):
+    """Causal attention of `query` (the last Lq positions) over all of `key`/`value`, one
+    KV head at a time: K/V are never repeated to all query heads (805 MB each at 64k) and
+    no full attention matrix is built (enable_gqa sends sm75 to the math kernel)."""
+    import torch
+    import torch.nn.functional as F
+    from torch.nn.attention.bias import causal_lower_right
+
+    lq, lk = query.shape[2], key.shape[2]
+    kv_heads = key.shape[1]
+    rep = query.shape[1] // kv_heads
+    mask = None if lq == lk else causal_lower_right(lq, lk)
+    outs = []
+    for g in range(kv_heads):
+        q = query[:, g * rep:(g + 1) * rep]
+        k = key[:, g:g + 1].expand(-1, rep, -1, -1)
+        v = value[:, g:g + 1].expand(-1, rep, -1, -1)
+        outs.append(F.scaled_dot_product_attention(q, k, v, attn_mask=mask,
+                                                   is_causal=mask is None, scale=scale))
+    return torch.cat(outs, dim=1)
+
+
+def chunk_layers(text_model, tokens):
+    """Run every decoder layer's token mixer and MLP over at most `tokens` positions at a
+    time, so activations stop growing with the input (64k tokens: ~10 GB at once, a few
+    hundred MB per chunk). The MLP is per token; the DeltaNet layers carry their state
+    across chunks; full attention computes K/V for every position once and its queries per
+    chunk. Same math as one pass (tests/test_clef_memory.py compares them)."""
+    import torch
+
+    from transformers.models.qwen3_5 import modeling_qwen3_5 as qwen
+
+    def split_mlp(forward):
+        def run(x):
+            if x.shape[1] <= tokens:
+                return forward(x)
+            return torch.cat([forward(x[:, i:i + tokens]) for i in range(0, x.shape[1], tokens)],
+                             dim=1)
+        return run
+
+    def split_delta(module, forward):
+        def run(hidden_states, cache_params=None, attention_mask=None, **kwargs):
+            if (cache_params is not None or attention_mask is not None
+                    or hidden_states.shape[1] <= tokens):
+                return forward(hidden_states, cache_params=cache_params,
+                               attention_mask=attention_mask, **kwargs)
+            state = _OneLayerState(module.layer_idx)
+            return torch.cat([forward(hidden_states[:, i:i + tokens], cache_params=state,
+                                      attention_mask=None, **kwargs)
+                              for i in range(0, hidden_states.shape[1], tokens)], dim=1)
+        return run
+
+    def split_attention(module, forward):
+        def run(hidden_states, position_embeddings, attention_mask=None,
+                past_key_values=None, **kwargs):
+            length = hidden_states.shape[1]
+            if (past_key_values is not None or attention_mask is not None
+                    or length <= tokens):
+                return forward(hidden_states, position_embeddings, attention_mask,
+                               past_key_values, **kwargs)
+            batch, d = hidden_states.shape[0], module.head_dim
+            cos, sin = position_embeddings
+            key = module.k_norm(module.k_proj(hidden_states).view(batch, length, -1, d))
+            key = key.transpose(1, 2)
+            value = module.v_proj(hidden_states).view(batch, length, -1, d).transpose(1, 2)
+            key = qwen.apply_rotary_pos_emb(key, key, cos, sin)[1]
+            outs = []
+            for i in range(0, length, tokens):
+                h = hidden_states[:, i:i + tokens]
+                n = h.shape[1]
+                query, gate = torch.chunk(module.q_proj(h).view(batch, n, -1, d * 2), 2, dim=-1)
+                gate = gate.reshape(batch, n, -1)
+                query = module.q_norm(query.reshape(batch, n, -1, d)).transpose(1, 2)
+                query = qwen.apply_rotary_pos_emb(query, query, cos[:, i:i + n],
+                                                  sin[:, i:i + n])[0]
+                out = _grouped_causal_sdpa(query, key[:, :, :i + n], value[:, :, :i + n],
+                                           module.scaling)
+                out = out.transpose(1, 2).reshape(batch, n, -1) * torch.sigmoid(gate)
+                outs.append(module.o_proj(out))
+            return torch.cat(outs, dim=1), None
+        return run
+
+    counts = {"mlp": 0, "delta": 0, "attention": 0}
+    for layer in text_model.layers:
+        layer.mlp.forward = split_mlp(layer.mlp.forward)
+        counts["mlp"] += 1
+        if hasattr(layer, "linear_attn"):
+            layer.linear_attn.forward = split_delta(layer.linear_attn, layer.linear_attn.forward)
+            counts["delta"] += 1
+        if hasattr(layer, "self_attn"):
+            layer.self_attn.forward = split_attention(layer.self_attn, layer.self_attn.forward)
+            counts["attention"] += 1
+    return counts
+
+
+def text_model_of(backbone):
+    model = backbone.model
+    return getattr(model, "language_model", model)
 
 
 def headroom_hooks(backbone):
@@ -206,7 +328,8 @@ def headroom_hooks(backbone):
         def hook(module, args, output, i=i):
             out = output[0] if isinstance(output, tuple) else output
             if torch.is_tensor(out):
-                value = out.detach().abs().amax().float().item()
+                low, high = torch.aminmax(out.detach())  # no |x| copy (671 MB at 64k)
+                value = max(-low.float().item(), high.float().item())
                 if not value < seen["max"]:  # also catches nan
                     seen["max"], seen["layer"] = value, i
         layer.register_forward_hook(hook)
@@ -258,6 +381,9 @@ class Clef:
         if args.delta_heads:
             notes.append(f"{split_delta_rule_heads(backbone, args.delta_heads)} DeltaNet "
                          f"layers {args.delta_heads} heads at a time")
+        if args.chunk:
+            chunk_layers(text_model_of(backbone), args.chunk)
+            notes.append(f"layers run {args.chunk:,} tokens at a time")
         if cap_image_pixels(self.processor, args.image_pixels):
             notes.append(f"images scaled to {args.image_pixels:,} px at most")
         if notes:
@@ -279,11 +405,32 @@ class Clef:
     def fit(self, wanted, headroom_gb):
         """Run the longest input once and keep `headroom_gb` free on the card after it, so
         every request this server accepts is known to fit (requests are cut to this
-        length, as the release does). auto = the longest that fits, from 16384 down."""
+        length, as the release does). auto = the longest that fits, from 65536 (the context
+        Cloudflare gives for Clef) down."""
         torch = self.torch
         if not torch.cuda.is_available():
             return 16384 if wanted == "auto" else int(wanted)
-        lengths = [16384, 12288, 8192, 6144, 4096, 2048] if wanted == "auto" else [int(wanted)]
+        lengths = ([65536, 49152, 32768, 24576, 16384, 8192, 4096, 2048] if wanted == "auto"
+                   else [int(wanted)])
+        # A long probe takes minutes, and every switch to Clef boots it again: reuse the
+        # last result while nothing it depends on changed and the card has at least as
+        # much free memory as when it passed. CLEF_FIT=probe always measures.
+        free_before = torch.cuda.mem_get_info()[0] / 2**30
+        key = json.dumps([torch.cuda.get_device_name(), torch.cuda.mem_get_info()[1],
+                          str(Path(self.args.model).resolve()), self.args.quant,
+                          self.args.tables, self.args.dtype, self.args.chunk,
+                          self.args.delta_heads, headroom_gb, wanted, torch.__version__])
+        cache = Path(self.args.fit_cache)
+        try:
+            saved = json.loads(cache.read_text())
+        except (OSError, ValueError):
+            saved = {}
+        if (self.args.fit != "probe" and saved.get("key") == key
+                and free_before >= saved.get("free_before", 1e9) - 0.05):
+            log(f"FIT: {self.args.name} takes inputs up to {saved['tokens']:,} tokens on this "
+                f"card (measured {saved['when']}: {saved['note']}; {free_before:.2f} GiB free "
+                f"now, {saved['free_before']:.2f} then; CLEF_FIT=probe measures again)")
+            return saved["tokens"]
         filler = ("Ticket log line: the payment page timed out for a customer in region "
                   "eu-west, retried, and succeeded on the second attempt. ")
         for n in lengths:
@@ -308,9 +455,16 @@ class Clef:
                     f"(CLEF_HEADROOM_GB={headroom_gb}): too tight")
                 continue
             torch.cuda.empty_cache()
-            log(f"FIT: {self.args.name} takes inputs up to {n:,} tokens on this card: "
-                f"{peak:.2f} GiB used by the server at its peak, {free:.2f} GiB still free; "
-                f"{n:,} tokens in {seconds:.1f} s ({n / seconds:,.0f} tok/s)")
+            note = (f"{peak:.2f} GiB used by the server at its peak, {free:.2f} GiB still "
+                    f"free; {n:,} tokens in {seconds:.1f} s ({n / seconds:,.0f} tok/s)")
+            log(f"FIT: {self.args.name} takes inputs up to {n:,} tokens on this card: {note}")
+            try:
+                cache.parent.mkdir(parents=True, exist_ok=True)
+                cache.write_text(json.dumps({"key": key, "tokens": n, "note": note,
+                                             "free_before": free_before,
+                                             "when": time.strftime("%Y-%m-%d %H:%M")}))
+            except OSError:
+                pass
             return n
         total = torch.cuda.mem_get_info()[1] / 2**30
         raise SystemExit(
@@ -480,6 +634,11 @@ def main():
                     help="token embeddings and LM head")
     ap.add_argument("--delta-heads", type=int, default=int(env("CLEF_DELTA_HEADS", "8")),
                     help="DeltaNet heads per step (0 = all at once)")
+    ap.add_argument("--fit", choices=["cached", "probe"], default=env("CLEF_FIT", "cached"))
+    ap.add_argument("--fit-cache", default=env("CLEF_FIT_CACHE", ""),
+                    help="default: .local/clef-fit-<checkpoint>.json")
+    ap.add_argument("--chunk", type=int, default=int(env("CLEF_CHUNK", "4096")),
+                    help="tokens per layer step on long inputs (0 = the whole input at once)")
     ap.add_argument("--image-pixels", type=int,
                     default=int(env("CLEF_IMAGE_PIXELS", str(1024 * 1024))))
     ap.add_argument("--max-len", default=env("CLEF_MAX_LEN", "auto"),
@@ -494,6 +653,9 @@ def main():
                     help="write the quantized model to this directory and exit")
     args = ap.parse_args()
     names = [n for n in args.name.split(",") if n]
+    if not args.fit_cache:
+        repo = Path(__file__).resolve().parent.parent
+        args.fit_cache = str(repo / f".local/clef-fit-{Path(args.model).resolve().name}.json")
     service = Clef(args)
     if args.save_quantized:
         return 0

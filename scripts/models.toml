@@ -35,6 +35,8 @@ port = 18090
 listed = false
 paths = ["/v1/systemone", "/v1/models", "/health"]
 env = { BIND = "127.0.0.1", PORT = "18090", API_KEY = "", CLEF_MODEL = "clef" }
+# Load plus the boot fit check, which runs one input of up to 64k tokens.
+start_timeout = 2400
 
 [models.clef-flash]
 description = "Cloudflare Clef-Flash 9B, a decision model: POST /v1/systemone (docs/clef.md)"
@@ -43,3 +45,4 @@ port = 18090
 listed = false
 paths = ["/v1/systemone", "/v1/models", "/health"]
 env = { BIND = "127.0.0.1", PORT = "18090", API_KEY = "", CLEF_MODEL = "clef-flash" }
+start_timeout = 2400
