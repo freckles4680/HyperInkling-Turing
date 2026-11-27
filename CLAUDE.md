@@ -80,7 +80,8 @@ Long-running work is pinned to CPUs 0-30 with `taskset`.
 scripts/setup-vllm.sh                 # recreate vllm/ from BASE + patch
 scripts/build-vllm.sh                 # build into venv/ (sm86, ~30-60 min; ARCH=7.5 for Turing)
 ./start.sh                            # production server, port 8080; every knob is an env var
-scripts/serve.sh                      # Turing: start.sh on the LAN with the 2080 Ti settings, commented
+scripts/serve.sh                      # Turing: start.sh on the LAN with the 2080 Ti settings, commented;
+                                      # scripts/speed_proxy.py (:8081) adds tok/s under each chat answer
 PORT=18030 ./start.sh                 # test instance on another port
 PROFILE=<name> ./start.sh             # Nsight Systems; POST /start_profile, /stop_profile
 scripts/serve-try.sh <log> [args]     # short-context eager boot of the original checkpoint, :18030
@@ -120,6 +121,12 @@ Benchmarks and quality (all need a running server):
   `metrics_window.py` alongside. `bench/profile_spec.sh`: kernel time per step under nsys.
 - `bench/quality_battery.py download|run` (`bench/quality_battery.sh <name>` boots its own server): GSM8K, Hermes tool calls, DocVQA as strict JSON,
   on public data (`bench/quality-data/`, not in git); compare two servers at the same settings.
+- `bench/intelligence.sh <name>`: general chatbot intelligence of a server that is already up (8080,
+  not the 8081 proxy): IFEval and MMLU-Pro via lm-evaluation-harness (own venv `.local/eval-venv`),
+  MT-Bench-style chat judged by `JUDGE_MODEL`/`JUDGE_BASE_URL`/`JUDGE_API_KEY` (`bench/mtbench.py`;
+  no judge = flagged SKIPPED and exported to paste into a chat, `mtbench.py import` reads the
+  scores back). `PRESET=quick|standard|full`; one report,
+  `.local/intelligence-<name>.txt`.
 - `bench/extract_bench.py`: document extraction on public data (shared Italian system
   prompt, 1-3 DocVQA pages, JSON or summary), closed loop with `metrics_window.py` alongside.
 - `bench/greedy_ref.py save|compare`, `bench/copy_test.py`: output and acceptance checks.
