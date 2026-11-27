@@ -1,7 +1,7 @@
 #!/bin/bash
 # Build vLLM (checkout in ./vllm) for one GPU arch, into ./venv.
-#   scripts/build-vllm.sh             # sm86 (RTX 3090 / 3090 Ti)
-#   ARCH=7.5 scripts/build-vllm.sh    # sm75 (Turing: RTX 20xx, 2080 Ti 22 GB mods)
+#   scripts/build-vllm.sh             # sm75 (Turing: 2080 Ti 22 GB mods, Titan RTX, Quadro RTX)
+#   ARCH=8.6 scripts/build-vllm.sh    # sm86 (RTX 3090 / 3090 Ti, upstream's target)
 #   CUDA_HOME=/opt/cuda-13.2 ...      # a CUDA 13 toolkit kept beside the system one
 #                                     # (recorded in venv/cuda_home; start.sh uses it)
 # Everything goes into ./venv (uv, its own Python); the host's Python, CUDA toolkit
@@ -19,7 +19,7 @@ source venv/bin/activate
 cd vllm
 uv pip install -r requirements/build/cuda.txt
 uv pip install -r requirements/cuda.txt
-export TORCH_CUDA_ARCH_LIST="${ARCH:-8.6}" MAX_JOBS="${MAX_JOBS:-16}" NVCC_THREADS=2
+export TORCH_CUDA_ARCH_LIST="${ARCH:-7.5}" MAX_JOBS="${MAX_JOBS:-16}" NVCC_THREADS=2
 export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}" PATH="${CUDA_HOME:-/usr/local/cuda}/bin:$PATH"
 "$CUDA_HOME/bin/nvcc" --version | grep -q 'release 13\.' || {
 	echo "$CUDA_HOME/bin/nvcc is not CUDA 13: set CUDA_HOME to a CUDA 13 toolkit" >&2

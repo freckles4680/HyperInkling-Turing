@@ -5,7 +5,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 A port of Inkling 2 Mini (upstream vLLM runs it on Hopper/Blackwell; Ampere is PR #69165, open) to
-one RTX 3090 Ti (sm86, 24 GiB), plus a requantized checkpoint that fits. Three parts: a pinned
+one Turing GPU: a modded RTX 2080 Ti (sm75, 22 GB), the only card it is measured on. It is a
+fork of Pento95/HyperInkling, the port to one RTX 3090 Ti (sm86, 24 GiB), whose code paths
+and requantized checkpoint it keeps; most numbers in NOTES.md are from that 3090 Ti. Three parts: a pinned
 vLLM with one patch, a model-preparation pipeline (`prepare/`), and a server with measured
 defaults (`start.sh`). README.md has the numbers, NOTES.md the reasons behind every choice and
 the gotchas already met, FOLLOWUPS.md what comes next, by phase. Read NOTES.md
@@ -14,8 +16,8 @@ before changing a design decision: most alternatives were already tried and meas
 ## The vLLM checkout and the patch (most important workflow)
 
 `vllm/` is not in git here. It is a clone of vllm-project/vllm at the commit in `patches/BASE`,
-with `patches/vllm-hyperinkling-sm86.patch` applied as **one commit** on branch
-`hyperinkling/sm86` (`scripts/setup-vllm.sh` recreates it). It is an editable install in
+with `patches/vllm-hyperinkling-sm75.patch` applied as **one commit** on branch
+`hyperinkling/sm75` (`scripts/setup-vllm.sh` recreates it). It is an editable install in
 `venv/`, so Python/Triton edits under `vllm/` take effect on the next server start, no rebuild.
 
 All the real model code lives in `vllm/vllm/models/inkling2/nvidia/` (`model.py`, `loop.py`,
@@ -24,7 +26,7 @@ is regenerated. Keep it a single commit:
 
 ```bash
 cd vllm && git add -A && git commit --amend --no-edit   # update the commit message if scope changed
-git format-patch -1 --stdout > ../patches/vllm-hyperinkling-sm86.patch
+git format-patch -1 --stdout > ../patches/vllm-hyperinkling-sm75.patch
 ```
 
 The commit message is the authoritative list of what the port changes; keep it current.
@@ -78,7 +80,8 @@ Long-running work is pinned to CPUs 0-30 with `taskset`.
 
 ```bash
 scripts/setup-vllm.sh                 # recreate vllm/ from BASE + patch
-scripts/build-vllm.sh                 # build into venv/ (sm86, ~30-60 min; ARCH=7.5 for Turing)
+scripts/build-vllm.sh                 # build into venv/ (sm75, ~30-60 min; ARCH=8.6 for a 3090)
+scripts/build-sm75-kernels.sh         # Turing attention kernel -> venv/hyperinkling_sm75.so (~1 min)
 ./start.sh                            # production server, port 8080; every knob is an env var
 scripts/serve.sh                      # Turing: start.sh on the LAN with the 2080 Ti settings, commented;
                                       # scripts/speed_proxy.py (:8081) adds tok/s under each chat answer
@@ -97,7 +100,7 @@ ruff check bench prepare tests scripts                        # lint: ruff 0.17.
 CI (`.github/workflows/checks.yml`, no GPU): the patch applies to BASE, ruff, shell syntax,
 the wizard. Release side: `scripts/wizard.py` (questions -> `.env`, from `docs/memory_matrix.tsv`),
 `Dockerfile` + `docker-compose.yml` + `scripts/build-image.sh` (vLLM's own Dockerfile on
-`./vllm`, sm86 only),
+`./vllm`, sm75 by default, `ARCH=8.6` for a 3090; compose runs `hyperinkling:sm75`),
 `bench/memory_matrix.sh` (longest request per knob combination: one boot each with
 `MAX_LEN=auto`, which vLLM fits after warmup). Benches that boot `start.sh` pass `ENV_FILE=`
 (measure the defaults, not the `.env`) and `WARMUP=0`.
@@ -149,7 +152,7 @@ Machine-specific rules (other engines on the GPU, who runs the server, ...) are 
 CLAUDE.local.md, not in git.
 
 - Servers started from a Claude session die with it: run long-lived ones in tmux.
-- `start.sh` refuses to start if the port is taken. Two engines cannot share the 24 GiB.
+- `start.sh` refuses to start if the port is taken. Two engines cannot share the 22 GB.
 - `--uvicorn-log-level warning` hides "Application startup complete": wait on
   `GET /health` with a deadline. `GET /` is 404 by design.
 - Scripts that boot a server use `scripts/server-lib.sh`: it refuses a busy GPU or port and

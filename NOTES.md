@@ -4,7 +4,11 @@ Facts, gotchas and the reasons behind the choices, so they are not re-derived.
 
 ## Machine
 
-- RTX 3090 Ti (sm86), 24 GiB, undervolted to 350 W; bf16 tensor cores unlocked: 102 TFLOPS
+- This fork: a modded RTX 2080 Ti (sm75), 22 GB, native Linux, 32 GB of RAM, PCIe 3 x16.
+  616 GB/s, fp16 tensor cores only (no bf16, no FP8), 64 KB of shared memory per block.
+  Most measurements below this list (and in NOTES generally) come from upstream's machine
+  and say so where they matter; Turing ones name the 2080 Ti.
+- Upstream's machine: RTX 3090 Ti (sm86), 24 GiB, undervolted to 350 W; bf16 tensor cores unlocked: 102 TFLOPS
   measured on a cuBLAS GEMM (stock ~40), 904 GB/s copy bandwidth. Decode is
   bandwidth-bound; the unlock helps prefill.
 - 16 cores / 32 threads: builds and servers are pinned to CPUs 0-30 (`taskset`).

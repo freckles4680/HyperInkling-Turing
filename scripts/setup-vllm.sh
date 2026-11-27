@@ -1,8 +1,8 @@
 #!/bin/bash
 # Recreate ./vllm: vllm-project/vllm at the commit in patches/BASE (the head of PR
-# #69165, Inkling 2 on SM80/86/89, one commit on main), plus HyperInkling's sm86
-# port (patches/vllm-hyperinkling-sm86.patch) as one commit on branch
-# hyperinkling/sm86. Then build with scripts/build-vllm.sh.
+# #69165, Inkling 2 on SM80/86/89, one commit on main), plus HyperInkling's Turing
+# (sm75) port (patches/vllm-hyperinkling-sm75.patch) as one commit on branch
+# hyperinkling/sm75. Then build with scripts/build-vllm.sh.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 base=$(cat patches/BASE)
@@ -30,6 +30,6 @@ if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
 		exit 1
 	fi
 fi
-git checkout -B hyperinkling/sm86 "$base"
-git am --3way --keep-non-patch ../patches/vllm-hyperinkling-sm86.patch
+git checkout -B hyperinkling/sm75 "$base"
+git am --3way --keep-non-patch ../patches/vllm-hyperinkling-sm75.patch
 git log --oneline -2

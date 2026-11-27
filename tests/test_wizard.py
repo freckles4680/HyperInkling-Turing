@@ -31,3 +31,11 @@ def test_memory_shift():
     # 2 GiB less at 0.95 utilization, 18 KiB per token with DSpark.
     assert wizard.memory_shift(22, 24, "dspark") == -int(2 * 0.95 * 2**20 / 18)
     assert wizard.memory_shift(22, 24, "off") < wizard.memory_shift(22, 24, "dspark")
+
+
+def test_turing_estimate_lands_on_the_measured_length():
+    tables = wizard.load_table()
+    key, gib, measured = wizard.TURING_MEASURED
+    rows, ref = wizard.pick_table(tables, gib)
+    estimate = wizard.expected(rows, *key) + wizard.memory_shift(gib, ref, key[1])
+    assert estimate + wizard.turing_shift(tables) == measured
