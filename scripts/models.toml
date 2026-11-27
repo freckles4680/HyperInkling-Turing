@@ -11,6 +11,8 @@
 #   listed         false = not in /v1/models (a front end would offer it for chat)
 #   paths          path prefixes it answers; anything else is refused before a switch
 #   start_timeout  seconds to wait for health (the first boot compiles kernels: long)
+#   ready_line     output line(s) to wait for after health before sending requests
+#   ready_timeout  seconds to wait for ready_line before serving anyway (default 600)
 
 [switch]
 # Stop the running model after this many idle seconds, to free the GPU for something
@@ -27,6 +29,10 @@ port = 18080
 aliases = ["local"]
 # The speed line is added in front of the switcher (serve-switch.sh), not per model.
 env = { BIND = "127.0.0.1", PORT = "18080", SPEED_PORT = "", API_KEY = "", VLLM_API_KEY = "" }
+# start.sh answers /health, then warms up for a minute or two in the background
+# (scripts/warmup.py). A chat sent meanwhile shares both decode slots with the warm-up
+# and runs at about half speed, so requests wait for its last line (or its failure).
+ready_line = ["warm-up done", "warm-up:"]
 
 [models.clef]
 description = "Cloudflare Clef 27B, a decision model: POST /v1/systemone (docs/clef.md)"

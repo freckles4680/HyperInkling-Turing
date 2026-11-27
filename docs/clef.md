@@ -125,8 +125,12 @@ needs no change and still lists `inkling-2-mini`.
 it waits for the requests in flight to end, then stops the running server (its whole process
 group) and waits for the GPU to be released. Then it starts the requested model, waits for
 `/health`, and forwards the request. Requests that arrive during a switch wait for it.
+For Inkling it also waits for start.sh's background warm-up (`warm-up done` in the log,
+`ready_line` in models.toml): a chat sent during the warm-up shares both decode slots
+with it and runs at about half speed.
 
-- A switch costs one boot: Inkling's minute or two, or Clef's load (not measured yet).
+- A switch costs one boot: Inkling's boot plus its warm-up (about 3.5 min on the card),
+  or Clef's load (65 s measured, with a cached fit check less).
 - Both models run on 127.0.0.1 without a key. `API_KEY` is checked at the switcher.
 - `scripts/models.toml` lists the models and how to start them. Each model's settings stay
   in its own script (`serve.sh`, `clef.sh`). `[switch] idle_unload` frees the GPU after some

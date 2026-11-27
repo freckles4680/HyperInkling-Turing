@@ -76,6 +76,13 @@ class Model:
         self.paths = list(spec.get("paths", []))
         self.start_timeout = float(spec.get("start_timeout", defaults["start_timeout"]))
         self.env = {k: str(v) for k, v in spec.get("env", {}).items()}
+        # Output lines (substrings) that mean the model is ready after /health answers:
+        # Inkling's start.sh warms up in the background after /health, and a request sent
+        # during that warm-up shares the decode slots with it (half the speed). If none is
+        # printed within ready_timeout seconds of /health, requests go through anyway.
+        ready = spec.get("ready_line", [])
+        self.ready_lines = [ready] if isinstance(ready, str) else list(ready)
+        self.ready_timeout = float(spec.get("ready_timeout", 600))
         self.description = spec.get("description", "")
 
     def accepts(self, path):
@@ -185,12 +192,13 @@ class Switcher:
                                "something this switcher did not start")
         self.log("switch", f"starting {model.name}: {model.command}")
         self.tail.clear()
+        self.ready_seen = threading.Event()
         env = {**os.environ, **model.env}
         started = time.monotonic()
         self.process = subprocess.Popen(
             model.command, shell=True, cwd=REPO, env=env, start_new_session=True,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
-        threading.Thread(target=self._pump, args=(model.name, self.process),
+        threading.Thread(target=self._pump, args=(model, self.process, self.ready_seen),
                          daemon=True).start()
         deadline = started + model.start_timeout
         while time.monotonic() < deadline:
@@ -200,19 +208,36 @@ class Switcher:
                 raise RuntimeError(f"{model.name} exited while starting; its last lines:\n"
                                    f"{tail}")
             if http_ok(model.port, model.health):
-                self.log("switch", f"{model.name} ready in "
-                                   f"{time.monotonic() - started:.0f} s")
-                return
+                break
             time.sleep(1)
-        self._stop(model, "start timed out")
-        raise RuntimeError(f"{model.name} did not answer {model.health} within "
-                           f"{model.start_timeout:.0f} s")
+        else:
+            self._stop(model, "start timed out")
+            raise RuntimeError(f"{model.name} did not answer {model.health} within "
+                               f"{model.start_timeout:.0f} s")
+        if model.ready_lines:
+            self.log("switch", f"{model.name} answers {model.health} after "
+                               f"{time.monotonic() - started:.0f} s; waiting for its "
+                               f"warm-up ({' / '.join(model.ready_lines)})")
+            ready_deadline = time.monotonic() + model.ready_timeout
+            while not self.ready_seen.wait(1):
+                if self.process.poll() is not None:
+                    tail = "\n".join(self.tail)
+                    self.process = None
+                    raise RuntimeError(f"{model.name} exited while warming up; its last "
+                                       f"lines:\n{tail}")
+                if time.monotonic() > ready_deadline:
+                    self.log("switch", f"{model.name}: no warm-up line within "
+                                       f"{model.ready_timeout:.0f} s, serving anyway")
+                    break
+        self.log("switch", f"{model.name} ready in {time.monotonic() - started:.0f} s")
 
-    def _pump(self, name, process):
+    def _pump(self, model, process, ready_seen):
         for raw in process.stdout:
             text = raw.decode("utf-8", "replace").rstrip()
             self.tail.append(text)
-            self.log(name, text)
+            self.log(model.name, text)
+            if any(line in text for line in model.ready_lines):
+                ready_seen.set()
 
     def _stop(self, model, reason):
         process, self.process = self.process, None

@@ -143,3 +143,21 @@ def test_failed_start_is_reported(switch, tmp_path):
     status, body = call(port, "POST", "/v1/chat/completions", {"model": "a"})
     assert status == 503 and "broken config" in body["error"]["message"]
     assert call(port, "POST", "/v1/systemone", {"model": "b"})[0] == 200  # still usable
+
+
+def test_waits_for_ready_line_after_health(switch, tmp_path):
+    port, switcher, _, lines = switch
+    warm = tmp_path / "warm.py"
+    a_port = switcher.models["a"].port
+    warm.write_text(FAKE.replace('print(name, "up", flush=True)\n',
+                                 'import threading\n'
+                                 'threading.Timer(1.5, lambda: print("warm-up done in 1.5 s",'
+                                 ' flush=True)).start()\n'))
+    switcher.models["a"].command = f"{sys.executable} {warm} a {a_port} 0.1"
+    switcher.models["a"].ready_lines = ["warm-up done"]
+    t0 = time.monotonic()
+    assert call(port, "POST", "/v1/chat/completions", {"model": "a"})[0] == 200
+    assert time.monotonic() - t0 >= 1.5
+    texts = [t for _, t in lines]
+    assert texts.index("warm-up done in 1.5 s") < next(
+        i for i, t in enumerate(texts) if t.startswith("a ready in"))
