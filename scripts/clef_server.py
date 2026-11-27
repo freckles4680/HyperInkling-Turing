@@ -143,9 +143,12 @@ def cap_image_pixels(processor, max_pixels):
     done = False
     if hasattr(image, "max_pixels"):
         image.max_pixels, done = max_pixels, True
-    size = getattr(image, "size", None)
+    size = getattr(image, "size", None)  # a dict, or transformers 5's SizeDict
     if isinstance(size, dict) and "longest_edge" in size:
         image.size = {**size, "longest_edge": max_pixels}
+        done = True
+    elif getattr(size, "longest_edge", None) is not None:
+        size.longest_edge = max_pixels
         done = True
     return done
 

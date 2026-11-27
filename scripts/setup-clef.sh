@@ -54,17 +54,24 @@ if [ ! -x "$VENV/bin/python" ]; then
 	"$PYTHON" -m venv "$VENV"
 fi
 "$VENV/bin/pip" install -q --upgrade pip
-echo "== torch from ${TORCH_INDEX:-PyPI}"
-"$VENV/bin/pip" install -q torch ${TORCH_INDEX:+--index-url "$TORCH_INDEX"}
+echo "== torch + torchvision from ${TORCH_INDEX:-PyPI}"
+# torchvision in the same install, so pip picks the build that matches torch (the
+# Qwen3-VL image and video processors need it).
+"$VENV/bin/pip" install -q torch torchvision ${TORCH_INDEX:+--index-url "$TORCH_INDEX"}
 echo "== transformers and the rest (the release was tested with transformers 5.10.2)"
 "$VENV/bin/pip" install -q "transformers==5.10.2" accelerate bitsandbytes safetensors \
 	pillow "huggingface_hub>=0.34"
 
 echo "== checks"
 "$VENV/bin/python" - << 'EOF'
-import torch, transformers, bitsandbytes as bnb
-print("torch", torch.__version__, "cuda", torch.version.cuda, "transformers",
-      transformers.__version__, "bitsandbytes", bnb.__version__)
+import torch, torchvision, transformers, bitsandbytes as bnb
+print("torch", torch.__version__, "torchvision", torchvision.__version__, "cuda",
+      torch.version.cuda, "transformers", transformers.__version__, "bitsandbytes",
+      bnb.__version__)
+# What AutoProcessor builds for Clef (after the 55 GB download, it failed there once).
+from transformers import Qwen2VLImageProcessor, Qwen3VLVideoProcessor
+Qwen2VLImageProcessor(), Qwen3VLVideoProcessor()
+print("image and video processors: ok")
 assert torch.cuda.is_available(), "torch sees no GPU"
 cap = torch.cuda.get_device_capability()
 arch = f"sm_{cap[0]}{cap[1]}"
@@ -90,11 +97,14 @@ with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION]):
 print("fp16 memory-efficient SDPA (24 heads, head 256, 4k tokens): ok", tuple(out.shape))
 EOF
 
-if [ ! -f "models/$CLEF_MODEL/joint_schema_model.py" ]; then
-	echo "== download $REPO_ID -> models/$CLEF_MODEL"
-	"$VENV/bin/hf" download "$REPO_ID" --local-dir "models/$CLEF_MODEL"
+# A rerun fetches nothing already complete (hf download checks each file), so an
+# interrupted download resumes and a finished one costs a few seconds. Skipped when the
+# bf16 copy was dropped after its NF4 copy.
+if [ -f "models/$CLEF_MODEL-nf4/joint_schema_model.py" ] && [ ! -d "models/$CLEF_MODEL" ]; then
+	echo "== models/$CLEF_MODEL-nf4 is there (the bf16 download was dropped): no download"
 else
-	echo "== models/$CLEF_MODEL is already there"
+	echo "== download $REPO_ID -> models/$CLEF_MODEL (only what is missing)"
+	"$VENV/bin/hf" download "$REPO_ID" --local-dir "models/$CLEF_MODEL"
 fi
 
 if [ "$QUANTIZE" = 1 ] && [ ! -f "models/$CLEF_MODEL-nf4/joint_schema_model.py" ]; then
