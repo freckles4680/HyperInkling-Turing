@@ -165,6 +165,15 @@ T4. **A 22 GiB memory matrix**: `bench/memory_matrix.sh` on the card replaces th
 
 ## Tried and dropped
 
+- INT4 attention projections and LM head on the 2080 Ti (PR #6, closed; the code is in its
+  history): a dot-free INT4 GEMV (nibble planes, magic-number dequant, clip search, g32-128)
+  against the INT8 one, fixed verify k=4, headless. Decode at 90k: 37.4 ms/step INT8, 42.7
+  head INT4, 44.8 attention INT4, 49.6 both. Per call INT4 wins only at 1 row (1.1-1.25x); at
+  5-8 rows (verify) it ties or loses even at the best searched tile, as both GEMVs are compute
+  bound there (INT8 ~270 GB/s, INT4 ~136, of ~600): fewer bytes buy nothing on this path.
+  KL median against the INT8 server (bench/kl/corpus.json): head 0.0006 (top-1 97.7%),
+  attention 0.0045 (94.6%), both 0.0054. Only gain: context 128k -> 141k (head or attention),
+  153k (both). A faster verify-size GEMV would need tensor cores (wmma), not fewer bits.
 - Fewer bits, KL median (as served 0.0031, round to nearest with clip search): attention INT4
   0.0081 (g32 0.0064, only layers 0-5 and 18-23 0.0048, g32 there 0.0042), INT6 0.0036; LM head
   INT4 0.0042 (g64 0.0039) for ~13k tokens of context and a slower kernel; 3-bit for the 32 / 64
