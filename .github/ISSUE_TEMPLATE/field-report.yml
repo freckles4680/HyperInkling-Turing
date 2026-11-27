@@ -1,12 +1,12 @@
 name: Field report (your numbers)
-description: Speed or quality measured on your RTX 3090 / 3090 Ti, to set next to the README's.
+description: Speed or quality measured on your Turing GPU, to set next to the README's.
 labels: [field report]
 body:
   - type: markdown
     attributes:
       value: |
-        Thanks for measuring. The README's numbers are one RTX 3090 Ti undervolted to 350 W with
-        gpu-unlock; yours tell other owners what to expect. The fields below make two runs
+        Thanks for measuring. The README's numbers are one 22 GB RTX 2080 Ti on native Linux,
+        headless and with a desktop; yours tell other owners what to expect. The fields below make two runs
         comparable. With a running server (default port 8080):
 
         ```bash
@@ -20,13 +20,13 @@ body:
     id: gpu
     attributes:
       label: GPU
-      options: [RTX 3090, RTX 3090 Ti]
+      options: [RTX 2080 Ti 22 GB (modded), Other Turing (Titan RTX, Quadro RTX 6000/8000), RTX 3090 / 3090 Ti]
     validations: {required: true}
   - type: input
     id: power
     attributes:
-      label: Power limit, clocks, gpu-unlock
-      placeholder: "350 W, stock clocks, gpu-unlock off"
+      label: Power limit, clocks, desktop on the card
+      placeholder: "250 W, stock clocks, headless"
     validations: {required: true}
   - type: input
     id: system
@@ -38,7 +38,7 @@ body:
     id: commit
     attributes:
       label: HyperInkling commit or image tag
-      placeholder: "git rev-parse --short HEAD, or ghcr.io/pento95/hyperinkling:0.1.4"
+      placeholder: "git rev-parse --short HEAD, or the image tag (hyperinkling:sm75)"
     validations: {required: true}
   - type: textarea
     id: env

@@ -115,8 +115,9 @@ be free), into one file to share:
 STEPS="system quality" scripts/turing-report.sh quality     # .local/turing-report-quality.txt
 ```
 
-Compare with README "Task accuracy", HyperInkling as served. GSM8K 0.970, tool calls 0.615
-(names 0.710), DocVQA ANLS 0.935 (valid JSON 99.5%). Noise is about 1 to 3 points at
+Compare with the README's quality table. The 22 GB 2080 Ti gave GSM8K 0.965, tool calls
+0.605 (names 0.695), DocVQA ANLS 0.936 (valid JSON 99.0%), against 0.970, 0.615 (0.710) and
+0.935 (99.5%) upstream on a 3090 Ti. Noise is about 1 to 3 points at
 n=200. Inside that, fp16 is good. A clear drop (say GSM8K below 0.93) means fp16 is losing
 precision somewhere: run step 3's check on a failing prompt and send its lines.
 
@@ -154,6 +155,8 @@ measured per request. Open WebUI, Unsloth or any OpenAI client: base URL
 
 ## What is not done
 
-- DSpark in fp16 has not run yet (step 4).
-- The kernels' tiles are the 3090's, shrunk only where Turing's shared memory forced it.
-  They are not tuned for the 2080 Ti's speed.
+- `docs/memory_matrix.tsv` has no 22 GiB rows yet (step 6): the wizard scales the 3090 Ti
+  table and sets it to the one length measured on the 2080 Ti (145k headless, one request).
+- The decode GEMV tiles and the attention kernel's block counts were measured on the 2080
+  Ti. The other Triton tiles are upstream's, shrunk only where Turing's shared memory
+  forced it, and not tuned for the 2080 Ti's speed.
