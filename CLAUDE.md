@@ -83,6 +83,8 @@ scripts/build-vllm.sh                 # build into venv/ (sm86, ~30-60 min; ARCH
 scripts/serve.sh                      # Turing: start.sh on the LAN with the 2080 Ti settings, commented;
                                       # scripts/speed_proxy.py (:8081) adds tok/s under each chat answer
 PORT=18030 ./start.sh                 # test instance on another port
+sandbox/setup.sh                      # Claude Code in a GPU container (docs/claude-sandbox.md);
+                                      # scripts/claude_loop.py: change, measure, keep or reset
 PROFILE=<name> ./start.sh             # Nsight Systems; POST /start_profile, /stop_profile
 scripts/serve-try.sh <log> [args]     # short-context eager boot of the original checkpoint, :18030
 
