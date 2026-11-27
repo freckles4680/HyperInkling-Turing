@@ -1,16 +1,16 @@
 name: Something does not work
-description: A crash, a hang, a wrong answer or numbers far from the README's, on an RTX 3090 / 3090 Ti.
+description: A crash, a hang, a wrong answer or numbers far from the README's, on a Turing GPU (a 22 GB 2080 Ti).
 body:
   - type: markdown
     attributes:
       value: |
-        HyperInkling supports **one RTX 3090 or 3090 Ti** and nothing else. Reports from other
-        GPUs, several GPUs or other models will be closed. A reproduction is what gets a fix.
+        HyperInkling-Turing is tested on **one modded 22 GB RTX 2080 Ti**. Other Turing cards
+        with 22 GB or more should work; one GPU only. A reproduction is what gets a fix.
   - type: dropdown
     id: gpu
     attributes:
       label: GPU
-      options: [RTX 3090, RTX 3090 Ti]
+      options: [RTX 2080 Ti 22 GB (modded), Other Turing (Titan RTX, Quadro RTX 6000/8000), RTX 3090 / 3090 Ti]
     validations: {required: true}
   - type: input
     id: system

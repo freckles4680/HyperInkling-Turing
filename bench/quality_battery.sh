@@ -19,8 +19,8 @@ start_server "$PORT" "$log" PORT=$PORT MAX_LEN=${MAX_LEN:-32768} KV_OFFLOAD_GB=0
 if wait_health "$PORT"; then
 	venv/bin/python bench/quality_battery.py run "$@" --port "$PORT" --n "${N:-200}" \
 		--jobs "${JOBS:-6}" --label "$name"
-	echo "README, HyperInkling as served (3090 Ti): gsm8k 0.970, tools 0.615 (names 0.710)," \
-		"docvqa 0.935 (json 0.995); noise about 1 to 3 points at n=200"
+	echo "README, as served on the 22 GB 2080 Ti: gsm8k 0.965, tools 0.605 (names 0.695)," \
+		"docvqa 0.936 (json 0.990); noise about 1 to 3 points at n=200"
 else
 	echo "server failed: $log"; tail -5 "$log"
 fi

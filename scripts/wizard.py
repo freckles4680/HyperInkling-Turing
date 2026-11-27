@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """HyperInkling launch wizard: a few questions, then the .env (and the command) that serves
-Inkling 2 Mini on one RTX 3090 / 3090 Ti (or a 22 GB 2080 Ti) with those choices.
+Inkling 2 Mini on one Turing GPU (a 22 GB 2080 Ti; a 3090 still works) with those choices.
 
     python3 scripts/wizard.py            # interactive; writes .env next to docker-compose.yml
     python3 scripts/wizard.py --print    # only print, write nothing
     python3 scripts/wizard.py --gpu-gib 22 --compute-cap 7.5   # answer for another GPU
 
 The server fits the longest request to the GPU at boot (MAX_LEN=auto); the context shown
-for each choice comes from docs/memory_matrix.tsv, measured on an RTX 3090 Ti with nothing
-else on the GPU (bench/memory_matrix.sh), KV cache at 8 bits per value. For a GPU with
-other memory (a 22 GB 2080 Ti) the rows measured at that size are used if there are any,
-else the 24 GiB ones minus the KV the missing memory would have held.
+for each choice comes from docs/memory_matrix.tsv, measured upstream on an RTX 3090 Ti with
+nothing else on the GPU (bench/memory_matrix.sh), KV cache at 8 bits per value. For a GPU
+with other memory (a 22 GB 2080 Ti) the rows measured at that size are used if there are
+any, else the 24 GiB ones minus the KV the missing memory would have held. On Turing the
+estimate is then moved onto the context measured on a 22 GB 2080 Ti (TURING_MEASURED):
+the fp16 drafter and the Turing kernels take memory the 3090 rows do not count.
 Standard library only, so it runs wherever Python 3.9+ does (Linux, macOS, Windows).
 """
 
@@ -29,8 +31,15 @@ MAX_CONTEXT = 1_048_576  # the model's own limit
 # Per-token KV of a long request (the 8 full-attention layer visits, 8-bit; the DSpark
 # drafter adds its own full-attention layer), to turn GiB into tokens.
 KIB_PER_TOKEN = {"dspark": 18, "off": 16}
-# Decode tok/s of one request, 8k context, RTX 3090 Ti (README).
+# Decode tok/s of one request, 8k context, RTX 3090 Ti (upstream's README).
 DECODE_1 = {"dspark": 254, "off": 131}
+# The same on a 22 GB 2080 Ti, headless (README): 84 at 8k, 93 at 90k context. Without
+# DSpark it has not been measured on Turing.
+DECODE_1_TURING = "84-93"
+# Longest request measured on a 22 GB 2080 Ti, headless, MAX_LEN=auto (2026-11-26): vision
+# tower on the GPU, DSpark, async on, 1 request, prefill chunk 2048. A desktop on the card
+# took ~25k tokens of it (120k).
+TURING_MEASURED = (("gpu", "dspark", True, 1, 2048), 22, 145_000)
 GPU_UTIL = 0.95  # start.sh's default --gpu-memory-utilization
 REF_GPU_GIB = 24  # the size most of docs/memory_matrix.tsv was measured at
 # Context the adaptive verify length (its CUDA graphs) and the context lookup take.
@@ -74,6 +83,17 @@ def memory_shift(gpu_gib, measured_gib, spec):
     `measured_gib`: the KV pool is what --gpu-memory-utilization leaves after weights and
     activations, which do not change with the card."""
     return int((gpu_gib - measured_gib) * GPU_UTIL * 2**20 / KIB_PER_TOKEN[spec])
+
+
+def turing_shift(tables):
+    """Tokens to add to a scaled estimate on Turing, so that the measured combination of
+    TURING_MEASURED comes out at its measured length (negative: Turing holds less)."""
+    key, gib, measured = TURING_MEASURED
+    rows, ref = pick_table(tables, gib)
+    estimate = expected(rows, *key)
+    if estimate is None:
+        return 0
+    return measured - (estimate + memory_shift(gib, ref, key[1]))
 
 
 def gpu_info():
@@ -192,11 +212,13 @@ def main():
         gpu_gib = ask("   GiB", default=default, cast=float,
                       check=lambda v: 8 <= v <= 96 or print("  8 to 96"))
     rows, measured_gib = pick_table(tables, gpu_gib)
+    shift_turing = turing_shift(tables) if turing else 0
     if turing:
-        print("\nTuring (sm75) runs the model in fp16 (no bf16 tensor cores): ported but not "
-              "yet run on a Turing GPU.\nDSpark runs in fp16 too. Speeds below are 3090 Ti "
-              "numbers.")
-    if round(gpu_gib) != measured_gib:
+        print("\nTuring (sm75) runs the model in fp16 (no bf16 tensor cores), DSpark too; "
+              "measured on a 22 GB 2080 Ti.")
+        print(f"Context below: the 3090 Ti table at {gpu_gib:g} GiB, set to the "
+              f"{fmt_tokens(TURING_MEASURED[2])} measured headless on the 2080 Ti.")
+    elif round(gpu_gib) != measured_gib:
         print(f"\nContext below: measured at {measured_gib} GiB, scaled to {gpu_gib:g} GiB.")
     print()
 
@@ -204,7 +226,8 @@ def main():
         n = expected(rows, vision, spec, *a)
         if n is None:
             return None
-        return max(0, min(MAX_CONTEXT, n + memory_shift(gpu_gib, measured_gib, spec)))
+        return max(0, min(MAX_CONTEXT, n + memory_shift(gpu_gib, measured_gib, spec)
+                          + shift_turing))
 
     def ctx(*a):
         n = fit(*a)
@@ -216,7 +239,9 @@ def main():
     print("      the attention output projections edited), quantized the same way")
     checkpoint = "uncensored" if ask("   choice", "ab", "a") == "b" else "original"
 
-    seqs = ask("\n1) How many requests should run at the same time? (1-64)", default=8,
+    # Turing: one chat plus the side requests front ends send (scripts/serve.sh).
+    seqs = ask("\n1) How many requests should run at the same time? (1-64)",
+               default=2 if turing else 8,
                cast=int, check=lambda v: 1 <= v <= 64 or print("  1 to 64"))
 
     print("\n2) Where should the vision tower (images) run?")
@@ -229,8 +254,13 @@ def main():
     vision = {k: v for k, v, _ in towers}[ask("   choice", "abc", "a")]
 
     print("\n3) Speculative decoding with the bundled DSpark drafter?")
-    print(f"   y) yes: one request decodes ~{DECODE_1['dspark']} tok/s instead of "
-          f"~{DECODE_1['off']} (more on code and structured output, less on free prose); "
+    if turing:
+        speed = (f"one request decodes ~{DECODE_1_TURING} tok/s on a 22 GB 2080 Ti (without "
+                 "it: not measured on Turing)")
+    else:
+        speed = (f"one request decodes ~{DECODE_1['dspark']} tok/s instead of "
+                 f"~{DECODE_1['off']} on a 3090 Ti")
+    print(f"   y) yes: {speed} (more on code and structured output, less on free prose); "
           f"longest request {ctx(vision, 'dspark', True, seqs, 2048)}")
     print(f"   n) no: longest request {ctx(vision, 'off', True, seqs, 2048)}")
     spec = "dspark" if ask("   choice", "yn", "y") == "y" else "off"
@@ -267,7 +297,8 @@ def main():
     print(f"\n6) Async scheduling (two steps in flight): +3-4% decode; off: {gain}.")
     async_ = ask("   enable", "yn", "y") == "y"
 
-    headroom = ask("\n7) GiB of GPU memory to leave free (a display on this GPU: 1)",
+    display = "0.5, measured on a 2080 Ti" if turing else "1"
+    headroom = ask(f"\n7) GiB of GPU memory to leave free (a display on this GPU: {display})",
                    default=0.0, cast=float, check=lambda v: 0 <= v <= 4)
 
     longest = fit(vision, spec, async_, seqs, nbt)
@@ -300,8 +331,9 @@ def main():
     print(f"\n9) Prefix-cache tier in host RAM (/dev/shm): prompts evicted from the GPU come "
           f"back in 0.1 s instead of being recomputed. RAM: "
           f"{'unknown' if ram is None else f'{ram:.0f} GiB'}.")
+    # Turing: off below 64 GiB of RAM, as scripts/serve.sh (the 2080 Ti box has 32).
     tier = ask(f"   GiB, 0 = off, auto = 60% of RAM minus 8, at most 36 (here {auto})",
-               default="auto", cast=lambda v: v if v.lower() == "auto" else int(v),
+               default=0 if turing and (ram is None or ram < 64) else "auto", cast=lambda v: v if v.lower() == "auto" else int(v),
                check=lambda v: v == "auto" or v >= 0 or print("  0 or more, or auto"))
 
     expose = ask("\n10) Reachable from other machines? (needs an API key)", "yn", "n")
@@ -332,8 +364,8 @@ def main():
         env["SHM_GB"] = tier + 12
     if hasattr(os, "getuid"):  # compose's prepare writes ./models as this user
         env["UID"], env["GID"] = os.getuid(), os.getgid()
-    if turing:  # the published image is built for sm86 only
-        env["IMAGE"] = "hyperinkling:sm75"
+    if not turing:  # compose defaults to the Turing image; scripts/build-image.sh builds it
+        env["IMAGE"] = "hyperinkling:sm86"
     if expose == "y":
         env["BIND"] = "0.0.0.0"  # Docker: the published port
         env["HOST"] = "0.0.0.0"  # native start.sh
@@ -354,8 +386,11 @@ def main():
             (REPO / "models").mkdir(exist_ok=True)
             print(f"Written {dest}")
     if turing:
-        print("\nBuild the Turing image once (~1 hour): scripts/setup-vllm.sh && "
-              "ARCH=7.5 scripts/build-image.sh hyperinkling:sm75")
+        print("\nBuild the image once (~1 hour): scripts/setup-vllm.sh && "
+              "scripts/build-image.sh")
+    else:
+        print("\nBuild the image once (~1 hour): scripts/setup-vllm.sh && "
+              "ARCH=8.6 scripts/build-image.sh hyperinkling:sm86")
     print("\nStart it:  docker compose up -d     (logs: docker compose logs -f; the first start"
           " downloads the checkpoint)")
     print(f"Native:    hf download {repo} --local-dir models/{local}   (once)")

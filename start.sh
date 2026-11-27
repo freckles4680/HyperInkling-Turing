@@ -1,6 +1,7 @@
 #!/bin/bash
-# HyperInkling: Inkling 2 Mini on one RTX 3090 / 3090 Ti (sm86), single entry point.
-# Turing (sm75, e.g. a 22 GB 2080 Ti) runs in fp16, untested on hardware: see GPU_CC below.
+# HyperInkling-Turing: Inkling 2 Mini on one Turing GPU (sm75, measured on a 22 GB 2080 Ti),
+# single entry point. Turing runs in fp16: see GPU_CC below. A 3090 (sm86) still works.
+# scripts/serve.sh wraps this with the 2080 Ti settings for the LAN.
 #
 #   ./start.sh                      # runs in the foreground
 #   PORT=18020 KV_OFFLOAD_GB=0 ./start.sh
@@ -92,7 +93,7 @@ NBT=${NBT:-2048}
 # short prompts do not wait for a long prefill. 0 disables.
 LONG_PREFILL=${LONG_PREFILL:-$((NBT / 2))}
 GPU_UTIL=${GPU_UTIL:-0.95}
-KV_DTYPE=${KV_DTYPE:-fp8}        # unit-scale E4M3, emulated on sm86 (ops/e4m3.py)
+KV_DTYPE=${KV_DTYPE:-fp8}        # unit-scale E4M3, emulated in software on sm75/sm86 (ops/e4m3.py)
 # CPU prefix-cache tier in /dev/shm, GiB; 0 disables. auto: 60% of RAM minus 8 GiB, at most
 # 36 and at most what /dev/shm has free (the wizard's default).
 KV_OFFLOAD_GB=${KV_OFFLOAD_GB:-auto}
@@ -113,7 +114,7 @@ CPUS=${CPUS:-0-$(( $(nproc) > 1 ? $(nproc) - 2 : 0 ))}   # leave one hardware th
 
 [ -d "$MODEL" ] || { echo "[start] model not found: $MODEL" >&2; exit 1; }
 
-# HyperInkling load-time conversions (vllm/models/inkling2/nvidia, branch hyperinkling/sm86).
+# HyperInkling load-time conversions (vllm/models/inkling2/nvidia, branch hyperinkling/sm75).
 export HYPERINKLING_ATTN_W8=${HYPERINKLING_ATTN_W8:-1}
 export HYPERINKLING_HEAD_W8=${HYPERINKLING_HEAD_W8:-1}
 export HYPERINKLING_EMBED_W8=${HYPERINKLING_EMBED_W8:-1}
