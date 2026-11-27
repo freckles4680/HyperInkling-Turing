@@ -1,4 +1,4 @@
-From e5ffc1434f01eb3b41784a80668eb01a267d8b2d Mon Sep 17 00:00:00 2001
+From dc0fc55ea30aa0a6459e83ec4fff6996fa58e6ec Mon Sep 17 00:00:00 2001
 From: Pento95 <173375476+Pento95@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 05:39:42 +0100
 Subject: [PATCH] [hyperinkling] Inkling 2 Mini on Ampere (sm86)
@@ -127,16 +127,6 @@ gates PDL/TMA, e4m3 conversions and the native conv/mix kernels below SM90):
 - HYPERINKLING_FP16_CHECK=1: Inkling2LoopModel.forward logs each new record
   of the residual stream's max |value| above 4096, and any non-finite
   value, by layer and pass (fp16 headroom on Turing; run eager).
-- INT4 attention projections and LM head, opt-in (ops/linear_w4_gemv.py,
-  HYPERINKLING_ATTN_W4=1 or layer ids/ranges, HYPERINKLING_HEAD_W4=1, groups
-  HYPERINKLING_{ATTN,HEAD}_W4_GROUP=32|64|128, default 64): asymmetric int4
-  round to nearest after a per-group clip search (HYPERINKLING_W4_CLIP=0:
-  without), eight codes per int32 in nibble planes of 16 consecutive inputs;
-  a dot-free decode GEMV (as _w8_gemv_kernel, the q/k/v three-input launch
-  included) that dequantizes with integer ops and one subtraction from 2^23
-  (no int-to-float conversion), the scale once per group; above 64 rows,
-  8192-row blocks dequantized on a Triton kernel for cuBLAS. W8Linear and
-  W4GLinear expose dequantize(rows), which the DSpark fold reads.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
@@ -147,10 +137,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/envs.py                                  |   6 +
  vllm/models/inkling/nvidia/ops/sconv.py       |  10 +-
  vllm/models/inkling/nvidia/sconv_swa_attn.py  | 147 +++++++-
- vllm/models/inkling2/nvidia/attention.py      |  87 ++++-
- vllm/models/inkling2/nvidia/dspark.py         | 195 ++++++++--
+ vllm/models/inkling2/nvidia/attention.py      |  74 +++-
+ vllm/models/inkling2/nvidia/dspark.py         | 197 ++++++++--
  vllm/models/inkling2/nvidia/loop.py           |  54 ++-
- vllm/models/inkling2/nvidia/model.py          | 128 ++++++-
+ vllm/models/inkling2/nvidia/model.py          | 119 +++++-
  vllm/models/inkling2/nvidia/moe.py            | 110 +++++-
  vllm/models/inkling2/nvidia/ops/__init__.py   |  72 ++++
  vllm/models/inkling2/nvidia/ops/activation.py |  17 +-
@@ -163,8 +153,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/models/inkling2/nvidia/ops/e4m3.py       |  10 +
  vllm/models/inkling2/nvidia/ops/linear.py     |  22 +-
  vllm/models/inkling2/nvidia/ops/linear_w4.py  | 210 +++++++++++
- .../inkling2/nvidia/ops/linear_w4_gemv.py     | 347 +++++++++++++++++
- vllm/models/inkling2/nvidia/ops/linear_w8.py  | 350 ++++++++++++++++++
+ vllm/models/inkling2/nvidia/ops/linear_w8.py  | 346 ++++++++++++++++++
  .../inkling2/nvidia/ops/ll_gemm_sm120.py      |  25 +-
  vllm/models/inkling2/nvidia/ops/lookup.py     | 233 ++++++++++++
  vllm/models/inkling2/nvidia/ops/loop.py       |   5 +-
@@ -184,19 +173,18 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/v1/core/single_type_kv_cache_manager.py  |   4 +
  vllm/v1/engine/core.py                        |  84 +++++
  vllm/v1/spec_decode/dynamic/adaptive_k.py     | 130 +++++++
- vllm/v1/structured_output/backend_xgrammar.py |  41 +-
- 45 files changed, 3375 insertions(+), 193 deletions(-)
+ vllm/v1/structured_output/backend_xgrammar.py |  41 ++-
+ 44 files changed, 3004 insertions(+), 193 deletions(-)
  create mode 100644 vllm/models/inkling2/nvidia/ops/attention_sm75.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/bgemv.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/linear_w4.py
- create mode 100644 vllm/models/inkling2/nvidia/ops/linear_w4_gemv.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/linear_w8.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/lookup.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/moe_marlin.py
  create mode 100644 vllm/v1/spec_decode/dynamic/adaptive_k.py
 
 diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
-index 4ea6278f6..ffb634b5b 100644
+index 4ea6278f6c..ffb634b5b9 100644
 --- a/vllm/config/vllm.py
 +++ b/vllm/config/vllm.py
 @@ -792,8 +792,12 @@ class VllmConfig:
@@ -213,7 +201,7 @@ index 4ea6278f6..ffb634b5b 100644
              speculative_config.num_speculative_tokens_per_batch_size,
              vllm_max_batch_size=max_num_seqs,
 diff --git a/vllm/entrypoints/common/cli_args.py b/vllm/entrypoints/common/cli_args.py
-index 2fc4a478b..ce1f78c08 100644
+index 2fc4a478bb..ce1f78c084 100644
 --- a/vllm/entrypoints/common/cli_args.py
 +++ b/vllm/entrypoints/common/cli_args.py
 @@ -345,11 +345,8 @@ class FrontendArgs(BaseFrontendArgs):
@@ -231,7 +219,7 @@ index 2fc4a478b..ce1f78c08 100644
      for what it does and does not protect."""
      ssl_keyfile: str | None = None
 diff --git a/vllm/entrypoints/openai/chat_completion/serving.py b/vllm/entrypoints/openai/chat_completion/serving.py
-index 175fba316..98127f9fb 100644
+index 175fba3169..98127f9fb2 100644
 --- a/vllm/entrypoints/openai/chat_completion/serving.py
 +++ b/vllm/entrypoints/openai/chat_completion/serving.py
 @@ -759,6 +759,7 @@ class OpenAIServingChat(GenerateBaseServing):
@@ -243,7 +231,7 @@ index 175fba316..98127f9fb 100644
                              continue
                          delta_message = DeltaMessage()
 diff --git a/vllm/entrypoints/serve/middleware/authenticate.py b/vllm/entrypoints/serve/middleware/authenticate.py
-index e105a731f..7021badc4 100644
+index e105a731f0..7021badc4b 100644
 --- a/vllm/entrypoints/serve/middleware/authenticate.py
 +++ b/vllm/entrypoints/serve/middleware/authenticate.py
 @@ -9,7 +9,20 @@ from starlette.datastructures import Headers
@@ -306,7 +294,7 @@ index e105a731f..7021badc4 100644
              return response(scope, receive, send)
          return self.app(scope, receive, send)
 diff --git a/vllm/envs.py b/vllm/envs.py
-index 83f31dcf2..f70a8fbeb 100644
+index 83f31dcf20..f70a8fbeb2 100644
 --- a/vllm/envs.py
 +++ b/vllm/envs.py
 @@ -25,6 +25,7 @@ if TYPE_CHECKING:
@@ -330,7 +318,7 @@ index 83f31dcf2..f70a8fbeb 100644
      # during startup. Default is 600 seconds (10 minutes).
      "VLLM_ENGINE_READY_TIMEOUT_S": lambda: int(
 diff --git a/vllm/models/inkling/nvidia/ops/sconv.py b/vllm/models/inkling/nvidia/ops/sconv.py
-index 28101ec96..d8a27b5ce 100644
+index 28101ec960..d8a27b5ce0 100644
 --- a/vllm/models/inkling/nvidia/ops/sconv.py
 +++ b/vllm/models/inkling/nvidia/ops/sconv.py
 @@ -245,9 +245,12 @@ def _seq_metadata_kernel(
@@ -360,7 +348,7 @@ index 28101ec96..d8a27b5ce 100644
      if num_padded_tokens is None:
          num_padded_tokens = num_actual_tokens
 diff --git a/vllm/models/inkling/nvidia/sconv_swa_attn.py b/vllm/models/inkling/nvidia/sconv_swa_attn.py
-index 47285b112..a4c88286e 100644
+index 47285b1129..a4c88286eb 100644
 --- a/vllm/models/inkling/nvidia/sconv_swa_attn.py
 +++ b/vllm/models/inkling/nvidia/sconv_swa_attn.py
 @@ -16,6 +16,7 @@ is padded up to the uniform attention page by `unify_kv_cache_spec_page_size`.
@@ -551,19 +539,18 @@ index 47285b112..a4c88286e 100644
 +            hit_alignment_tokens=vllm_config.cache_config.block_size,
          )
 diff --git a/vllm/models/inkling2/nvidia/attention.py b/vllm/models/inkling2/nvidia/attention.py
-index d1fdc6136..56936672a 100644
+index d1fdc61364..3b9a708548 100644
 --- a/vllm/models/inkling2/nvidia/attention.py
 +++ b/vllm/models/inkling2/nvidia/attention.py
-@@ -3,6 +3,8 @@
+@@ -3,6 +3,7 @@
  """Inkling2 attention: relative-bias GQA with short-conv K/V, L2-clipped
  q/k/r, gated output and per-token attention sinks."""
  
 +import os
-+import re
  from dataclasses import dataclass, field
  from functools import partial
  from typing import cast
-@@ -26,7 +28,6 @@ from vllm.model_executor.layers.linear import (
+@@ -26,7 +27,6 @@ from vllm.model_executor.layers.linear import (
  from vllm.model_executor.utils import set_weight_attrs
  from vllm.models.inkling.nvidia.ops.fa4_rel_attention import bucket_max_seqlen_q
  from vllm.models.inkling.nvidia.sconv_swa_attn import InklingConvState
@@ -571,7 +558,7 @@ index d1fdc6136..56936672a 100644
  from vllm.utils.torch_utils import (
      canonicalize_singleton_dim_strides,
      kv_cache_dtype_str_to_dtype,
-@@ -50,7 +51,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayerConfig
+@@ -50,7 +50,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayerConfig
  
  from ..configs import Inkling2ModelConfig
  from .lora import add_linear_lora
@@ -580,16 +567,15 @@ index d1fdc6136..56936672a 100644
  from .ops.attention import (
      _INKLING2_FA4_REL_ATTENTION_KERNEL,
      gate_sink,
-@@ -60,6 +61,8 @@ from .ops.attention import (
+@@ -60,6 +60,7 @@ from .ops.attention import (
  )
  from .ops.attention_sm90 import MODE_OUT_LSE, rel_attention
  from .ops.linear import linear
-+from .ops.linear_w4_gemv import W4GLinear, w4_clip, w4_group, w4_layer_selected
 +from .ops.linear_w8 import W8Linear
  from .ops.ll_gemm_sm120 import qkv_bmm, use_qkv_bmm
  from .ops.sconv import attention_prologue, shift_rel_proj
  from .sconv import K_STREAM, V_STREAM, Inkling2ShortConv, conv_metadata
-@@ -292,7 +295,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
+@@ -292,7 +293,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
          self.max_decode_query_len = max_decode_query_len(vllm_config)
          cache_dtype = vllm_config.cache_config.cache_dtype
          supported: tuple[str, ...] = ("auto", "bfloat16")
@@ -598,44 +584,33 @@ index d1fdc6136..56936672a 100644
              supported += ("float16", "fp8", "fp8_e4m3")
          if cache_dtype not in supported:
              raise ValueError(f"Inkling2 KV cache dtype must be one of {supported}")
-@@ -300,6 +303,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
+@@ -300,6 +301,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
          if cache_dtype == "float16" and vllm_config.speculative_config is not None:
              raise ValueError("Inkling2 FP16 KV requires speculative decoding disabled")
          self.kv_cache = torch.tensor([])
-+        self.w8: dict[str, W8Linear | W4GLinear] | None = None  # process_weights_after_loading
++        self.w8: dict[str, W8Linear] | None = None  # process_weights_after_loading
          forward_context = vllm_config.compilation_config.static_forward_context
          if prefix in forward_context:
              raise ValueError(f"Duplicate layer name: {prefix}")
-@@ -309,6 +313,28 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
+@@ -309,6 +311,17 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
  
      def process_weights_after_loading(self) -> None:
          self.rel_proj_shifted = shift_rel_proj(self.rel_logits_proj, self.is_local)
 +        # HyperInkling: int8 W8A16 projections (`ops.linear_w8`); the bf16
 +        # weights are then dropped.
-+        # HYPERINKLING_ATTN_W4 (opt-in): int4 for the layers it names instead
-+        # (`ops.linear_w4_gemv`, same calls; `self.w8` holds either kind).
-+        self.w8: dict[str, W8Linear | W4GLinear] | None = None
-+        layer = re.search(r"layers\.(\d+)\.", self.prefix)
-+        layer_id = int(layer.group(1)) if layer else None
-+        used = sum(self.split_sizes[:6])  # without the alignment pad rows
-+        if w4_layer_selected(os.environ.get("HYPERINKLING_ATTN_W4"), layer_id):
-+            group, clip = w4_group("HYPERINKLING_ATTN_W4_GROUP"), w4_clip()
-+            self.w8 = {
-+                "qkvr": W4GLinear(self.qkvr.weight.data[:used], group, clip),
-+                "wo": W4GLinear(self.wo_ud.weight.data, group, clip),
-+            }
-+        elif os.environ.get("HYPERINKLING_ATTN_W8") == "1":
++        self.w8: dict[str, W8Linear] | None = None
++        if os.environ.get("HYPERINKLING_ATTN_W8") == "1":
++            used = sum(self.split_sizes[:6])  # without the alignment pad rows
 +            self.w8 = {
 +                "qkvr": W8Linear(self.qkvr.weight.data[:used]),
 +                "wo": W8Linear(self.wo_ud.weight.data),
 +            }
-+        if self.w8 is not None:
-+            for linear_layer in (self.qkvr, self.wo_ud):
-+                linear_layer.weight.data = linear_layer.weight.data.new_empty((0,))
++            for layer in (self.qkvr, self.wo_ud):
++                layer.weight.data = layer.weight.data.new_empty((0,))
  
      def get_attn_backend(self) -> type[AttentionBackend]:
          return Inkling2AttentionBackend
-@@ -331,6 +357,8 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
+@@ -331,6 +344,8 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
      def _project(
          self, x_q: torch.Tensor, x_k: torch.Tensor, x_v: torch.Tensor
      ) -> list[torch.Tensor]:
@@ -644,7 +619,7 @@ index d1fdc6136..56936672a 100644
          # ``linear`` on the weight bypasses the layer (and a LoRA wrapper's
          # forward), so the LoRA deltas are added here (no-op without LoRA).
          weight = self.qkvr.weight
-@@ -355,12 +383,32 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
+@@ -355,12 +370,32 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
          add_linear_lora(self.qkvr, v, x_v, [5])
          return [*projected.split(self.q_side_splits, dim=-1)[:4], k, v]
  
@@ -678,7 +653,7 @@ index d1fdc6136..56936672a 100644
          key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_dim, dim=-1)
          return (
              canonicalize_singleton_dim_strides(key_cache),
-@@ -403,6 +451,8 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
+@@ -403,6 +438,8 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
              output,
              pass_idx,
          )
@@ -687,7 +662,7 @@ index d1fdc6136..56936672a 100644
          out = linear(output, self.wo_ud.weight, out)
          add_linear_lora(self.wo_ud, out, output)
          return out
-@@ -615,6 +665,35 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
+@@ -615,6 +652,35 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
          if num_decodes:
              cu_seqlens_q = cu_seqlens_q - num_decode_tokens
          key_cache, value_cache = self._split_kv_cache(kv_cache)
@@ -724,7 +699,7 @@ index d1fdc6136..56936672a 100644
              rel_attention(
                  q[:nt],
 diff --git a/vllm/models/inkling2/nvidia/dspark.py b/vllm/models/inkling2/nvidia/dspark.py
-index 6e1755a18..f768e4784 100644
+index 6e1755a18b..c22c7edcce 100644
 --- a/vllm/models/inkling2/nvidia/dspark.py
 +++ b/vllm/models/inkling2/nvidia/dspark.py
 @@ -5,6 +5,7 @@ through a small dense transformer over DFlare-mixed target-feature K/V, then a
@@ -924,7 +899,7 @@ index 6e1755a18..f768e4784 100644
          self.rnn_bias: torch.Tensor | None = None
  
      @torch.no_grad()
-@@ -350,15 +406,36 @@ class Inkling2MarkovHead(nn.Module):
+@@ -350,15 +406,38 @@ class Inkling2MarkovHead(nn.Module):
          calls refill the same tensors, which CUDA graphs keep pointing at."""
          projection = self.hidden_out.weight.double()
          bias = self.hidden_out.bias.double()
@@ -944,7 +919,9 @@ index 6e1755a18..f768e4784 100644
 -            self.fold_weight[rows].copy_(head @ projection)
 -            self.fold_bias[rows].copy_(head @ bias)
 +            if w8 is not None:
-+                head = w8.dequantize(rows).double()
++                from .ops.linear_w8 import dequantize_int8
++
++                head = dequantize_int8(w8.q[rows], w8.scale[rows]).double()
 +            else:
 +                head = lm_head_weight[rows].double()
 +            fold, fold_bias = head @ projection, head @ bias
@@ -966,7 +943,7 @@ index 6e1755a18..f768e4784 100644
  
      def context(self, hidden: torch.Tensor, f_rnn: torch.Tensor) -> torch.Tensor:
          """fp32 `rnn_proj` bias plus its `[hidden, f_rnn]` term for the
-@@ -377,18 +454,19 @@ class Inkling2MarkovHead(nn.Module):
+@@ -377,18 +456,19 @@ class Inkling2MarkovHead(nn.Module):
          self, state: torch.Tensor, prev_tokens: torch.Tensor, context: torch.Tensor
      ) -> tuple[torch.Tensor, torch.Tensor]:
          """One recurrence step; returns the new state and the TP-local bias."""
@@ -990,7 +967,7 @@ index 6e1755a18..f768e4784 100644
          super().__init__()
          self.config = config
          hidden = config.hidden_size
-@@ -406,13 +484,10 @@ class Inkling2DSparkDecoder(nn.Module):
+@@ -406,13 +486,10 @@ class Inkling2DSparkDecoder(nn.Module):
          )
          self.mask_embed = nn.Parameter(torch.zeros(hidden), requires_grad=False)
          self.register_buffer("fuse_alpha", torch.empty_like(self.fuse_weight))
@@ -1008,7 +985,7 @@ index 6e1755a18..f768e4784 100644
          # Shared with the target model (see Inkling2DSparkModel.attach_target).
          self.embed_tokens: nn.Module | None = None
          self.embed_norm: nn.Module | None = None
-@@ -434,7 +509,7 @@ class Inkling2DSparkDecoder(nn.Module):
+@@ -434,7 +511,7 @@ class Inkling2DSparkDecoder(nn.Module):
          x = self.embed_block(input_ids)
          residual = None
          for layer in self.layers:
@@ -1017,7 +994,7 @@ index 6e1755a18..f768e4784 100644
          assert residual is not None
          return all_reduce_add_rmsnorm(x, residual, self.norm)
  
-@@ -477,9 +552,7 @@ class Inkling2DSparkModel(nn.Module):
+@@ -477,9 +554,7 @@ class Inkling2DSparkModel(nn.Module):
                  "to at most that"
              )
          self.config = config
@@ -1028,7 +1005,7 @@ index 6e1755a18..f768e4784 100644
          self.lm_head: nn.Module | None = None
  
      @torch.no_grad()
-@@ -487,7 +560,7 @@ class Inkling2DSparkModel(nn.Module):
+@@ -487,7 +562,7 @@ class Inkling2DSparkModel(nn.Module):
          """Finish sharing the target's normalized embeddings and LM head (its
          `embed_tokens` and `lm_head` are aliased by `load_dspark_model`)
          and derive the weights that depend on them."""
@@ -1037,7 +1014,7 @@ index 6e1755a18..f768e4784 100644
          self.model.embed_norm = target_model.model.embed_norm
          head = self.model.markov_head
          head.rnn_bias = torch.empty_like(head.rnn_proj.bias, dtype=torch.float32)
-@@ -501,7 +574,11 @@ class Inkling2DSparkModel(nn.Module):
+@@ -501,7 +576,11 @@ class Inkling2DSparkModel(nn.Module):
          assert self.lm_head is not None
          head = self.model.markov_head
          assert head.rnn_bias is not None
@@ -1050,7 +1027,7 @@ index 6e1755a18..f768e4784 100644
          head.rnn_bias.copy_(head.rnn_proj.bias)
          self.model.fuse_alpha.copy_(
              torch.softmax(self.model.fuse_weight.float(), dim=-1)
-@@ -525,7 +602,7 @@ class Inkling2DSparkModel(nn.Module):
+@@ -525,7 +604,7 @@ class Inkling2DSparkModel(nn.Module):
              layer.self_attn.store_context_kv(
                  context,
                  context_positions,
@@ -1059,7 +1036,7 @@ index 6e1755a18..f768e4784 100644
                  None if context_slot_mappings is None else context_slot_mappings[i],
              )
  
-@@ -542,8 +619,12 @@ class Inkling2DSparkModel(nn.Module):
+@@ -542,8 +621,12 @@ class Inkling2DSparkModel(nn.Module):
          return self.model(input_ids, positions)
  
      def compute_base_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1073,7 +1050,7 @@ index 6e1755a18..f768e4784 100644
          return linear(hidden_states, self.lm_head.weight)
  
      def markov_step(
-@@ -579,6 +660,17 @@ class Inkling2DSparkModel(nn.Module):
+@@ -579,6 +662,17 @@ class Inkling2DSparkModel(nn.Module):
                      name, shard = name.replace(old, new), shard_id
                      break
              param = params[name]
@@ -1091,7 +1068,7 @@ index 6e1755a18..f768e4784 100644
              if weight.dtype != param.dtype:
                  raise ValueError(f"{name}: expected {param.dtype}, got {weight.dtype}")
              if shard is None:
-@@ -586,4 +678,33 @@ class Inkling2DSparkModel(nn.Module):
+@@ -586,4 +680,33 @@ class Inkling2DSparkModel(nn.Module):
              else:
                  param.weight_loader(param, weight, shard)
              loaded.add(name)
@@ -1126,7 +1103,7 @@ index 6e1755a18..f768e4784 100644
 +            )
 +        torch.cuda.empty_cache()
 diff --git a/vllm/models/inkling2/nvidia/loop.py b/vllm/models/inkling2/nvidia/loop.py
-index bee805835..ca9563bbd 100644
+index bee8058353..ca9563bbd4 100644
 --- a/vllm/models/inkling2/nvidia/loop.py
 +++ b/vllm/models/inkling2/nvidia/loop.py
 @@ -12,12 +12,15 @@ controller. Each sublayer's short conv runs fused with the next AttnRes mix
@@ -1244,7 +1221,7 @@ index bee805835..ca9563bbd 100644
          out = inputs[0]
          if self.aux_hidden_state_layers:
 diff --git a/vllm/models/inkling2/nvidia/model.py b/vllm/models/inkling2/nvidia/model.py
-index db9a9bc16..35fba66fe 100644
+index db9a9bc16b..3b8677c3da 100644
 --- a/vllm/models/inkling2/nvidia/model.py
 +++ b/vllm/models/inkling2/nvidia/model.py
 @@ -25,6 +25,7 @@ from vllm.distributed import (
@@ -1350,7 +1327,7 @@ index db9a9bc16..35fba66fe 100644
              if param.dtype != weight.dtype:
                  if ".mlp.experts." in name and weight.dtype == torch.bfloat16:
                      raise ValueError(
-@@ -811,9 +851,91 @@ class Inkling2ForConditionalGeneration(
+@@ -811,9 +851,82 @@ class Inkling2ForConditionalGeneration(
                  loaded.add(name)
          if self.visual is not None:
              loaded |= {f"visual.{n}" for n in self.visual.load_weights(visual_weights)}
@@ -1396,9 +1373,8 @@ index db9a9bc16..35fba66fe 100644
 +    def _hyperinkling_int8_heads(self) -> None:
 +        """HyperInkling: INT8 (group 128) token embeddings and LM head, from
 +        the bf16 checkpoint tensors, behind HYPERINKLING_EMBED_W8 /
-+        HYPERINKLING_HEAD_W8 (the head in INT4 with HYPERINKLING_HEAD_W4=1). The
-+        embedding module keeps its identity (DSpark aliases it) and only its
-+        forward changes."""
++        HYPERINKLING_HEAD_W8. The embedding module keeps its identity (DSpark
++        aliases it) and only its forward changes."""
 +        import os
 +        import types
 +
@@ -1426,15 +1402,7 @@ index db9a9bc16..35fba66fe 100644
 +                return dequantize_int8(q[ids], scale[ids]).to(act_dtype())
 +
 +            embed.forward = types.MethodType(forward, embed)
-+        if os.environ.get("HYPERINKLING_HEAD_W4") == "1":
-+            # Opt-in INT4 head (`ops.linear_w4_gemv`): the same calls as W8Linear.
-+            from .ops.linear_w4_gemv import W4GLinear, w4_clip, w4_group
-+
-+            self.lm_head.hyperinkling_w8 = W4GLinear(
-+                self.lm_head.weight.data, w4_group("HYPERINKLING_HEAD_W4_GROUP"), w4_clip()
-+            )
-+            self.lm_head.weight.data = self.lm_head.weight.data.new_empty((0,))
-+        elif os.environ.get("HYPERINKLING_HEAD_W8") == "1":
++        if os.environ.get("HYPERINKLING_HEAD_W8") == "1":
 +            self.lm_head.hyperinkling_w8 = W8Linear(self.lm_head.weight.data)
 +            # DSpark shares this head: its base logits and Markov fold read
 +            # `hyperinkling_w8` too, so the bf16 rows can go.
@@ -1443,7 +1411,7 @@ index db9a9bc16..35fba66fe 100644
  
  __all__ = ["Inkling2ForConditionalGeneration"]
 diff --git a/vllm/models/inkling2/nvidia/moe.py b/vllm/models/inkling2/nvidia/moe.py
-index 93fe44c4a..65226f47a 100644
+index 93fe44c4a3..65226f47a4 100644
 --- a/vllm/models/inkling2/nvidia/moe.py
 +++ b/vllm/models/inkling2/nvidia/moe.py
 @@ -7,6 +7,7 @@ rank returns the full all-reduced bf16 output. Checkpoint names under
@@ -1661,7 +1629,7 @@ index 93fe44c4a..65226f47a 100644
          plan = experts.plan(x.shape[0])
          routing, quantized = route(
 diff --git a/vllm/models/inkling2/nvidia/ops/__init__.py b/vllm/models/inkling2/nvidia/ops/__init__.py
-index bc0f45f00..878d9f6bf 100644
+index bc0f45f003..878d9f6bfe 100644
 --- a/vllm/models/inkling2/nvidia/ops/__init__.py
 +++ b/vllm/models/inkling2/nvidia/ops/__init__.py
 @@ -39,3 +39,75 @@ def use_native_e4m3() -> bool:
@@ -1741,7 +1709,7 @@ index bc0f45f00..878d9f6bf 100644
 +    batched Triton GEMVs for the loop controllers."""
 +    return is_sm8x() or is_sm75()
 diff --git a/vllm/models/inkling2/nvidia/ops/activation.py b/vllm/models/inkling2/nvidia/ops/activation.py
-index 9c78f1fa4..c8f8ad192 100644
+index 9c78f1fa49..c8f8ad1928 100644
 --- a/vllm/models/inkling2/nvidia/ops/activation.py
 +++ b/vllm/models/inkling2/nvidia/ops/activation.py
 @@ -64,8 +64,9 @@ def _softcap(x, CAP: tl.constexpr):
@@ -1779,7 +1747,7 @@ index 9c78f1fa4..c8f8ad192 100644
  
  @triton.jit
 diff --git a/vllm/models/inkling2/nvidia/ops/attention.py b/vllm/models/inkling2/nvidia/ops/attention.py
-index c8bc21328..640502e87 100644
+index c8bc213285..640502e870 100644
 --- a/vllm/models/inkling2/nvidia/ops/attention.py
 +++ b/vllm/models/inkling2/nvidia/ops/attention.py
 @@ -20,8 +20,9 @@ from vllm.triton_utils import gl, gluon, tl, tldevice, triton
@@ -1868,7 +1836,7 @@ index c8bc21328..640502e87 100644
      )
 diff --git a/vllm/models/inkling2/nvidia/ops/attention_sm75.py b/vllm/models/inkling2/nvidia/ops/attention_sm75.py
 new file mode 100644
-index 000000000..f3f6b5470
+index 0000000000..f3f6b5470a
 --- /dev/null
 +++ b/vllm/models/inkling2/nvidia/ops/attention_sm75.py
 @@ -0,0 +1,322 @@
@@ -2195,7 +2163,7 @@ index 000000000..f3f6b5470
 +        hint = " (launch out of resources: see prefill_warps)" if error == 701 else ""
 +        raise RuntimeError(f"hi_sm75_rel_attention: CUDA error {error}{hint}")
 diff --git a/vllm/models/inkling2/nvidia/ops/attention_sm90.py b/vllm/models/inkling2/nvidia/ops/attention_sm90.py
-index 3cac9b960..fa6dc9168 100644
+index 3cac9b9605..fa6dc91683 100644
 --- a/vllm/models/inkling2/nvidia/ops/attention_sm90.py
 +++ b/vllm/models/inkling2/nvidia/ops/attention_sm90.py
 @@ -18,7 +18,11 @@ import torch
@@ -2279,7 +2247,7 @@ index 3cac9b960..fa6dc9168 100644
      )
 diff --git a/vllm/models/inkling2/nvidia/ops/bgemv.py b/vllm/models/inkling2/nvidia/ops/bgemv.py
 new file mode 100644
-index 000000000..daa621c40
+index 0000000000..daa621c400
 --- /dev/null
 +++ b/vllm/models/inkling2/nvidia/ops/bgemv.py
 @@ -0,0 +1,183 @@
@@ -2467,7 +2435,7 @@ index 000000000..daa621c40
 +    )  # fmt: skip
 +    return out
 diff --git a/vllm/models/inkling2/nvidia/ops/conv_mix.py b/vllm/models/inkling2/nvidia/ops/conv_mix.py
-index 5899d5e99..f43c86d88 100644
+index 5899d5e99f..f43c86d88c 100644
 --- a/vllm/models/inkling2/nvidia/ops/conv_mix.py
 +++ b/vllm/models/inkling2/nvidia/ops/conv_mix.py
 @@ -53,7 +53,7 @@ def conv_mix(
@@ -2480,7 +2448,7 @@ index 5899d5e99..f43c86d88 100644
          assert t is None or (t.is_contiguous() and t.shape == conv_out.shape)
      assert residual is None or addend is not None
 diff --git a/vllm/models/inkling2/nvidia/ops/dspark.py b/vllm/models/inkling2/nvidia/ops/dspark.py
-index 293c39f63..eccd4edc7 100644
+index 293c39f635..eccd4edc71 100644
 --- a/vllm/models/inkling2/nvidia/ops/dspark.py
 +++ b/vllm/models/inkling2/nvidia/ops/dspark.py
 @@ -64,12 +64,49 @@ def mix_rmsnorm(
@@ -2668,7 +2636,7 @@ index 293c39f63..eccd4edc7 100644
  
  def markov_gate(
 diff --git a/vllm/models/inkling2/nvidia/ops/e4m3.py b/vllm/models/inkling2/nvidia/ops/e4m3.py
-index 11465fa90..152349eee 100644
+index 11465fa902..152349eeea 100644
 --- a/vllm/models/inkling2/nvidia/ops/e4m3.py
 +++ b/vllm/models/inkling2/nvidia/ops/e4m3.py
 @@ -94,3 +94,13 @@ def cast_store(x, dtype: tl.constexpr):
@@ -2686,7 +2654,7 @@ index 11465fa90..152349eee 100644
 +    bits = ((x & 0x7F) << 7) | ((x & 0x80) << 8)
 +    return bits.to(tl.uint16).to(tl.float16, bitcast=True)
 diff --git a/vllm/models/inkling2/nvidia/ops/linear.py b/vllm/models/inkling2/nvidia/ops/linear.py
-index 57aa7937d..8835df413 100644
+index 57aa7937d2..8835df413b 100644
 --- a/vllm/models/inkling2/nvidia/ops/linear.py
 +++ b/vllm/models/inkling2/nvidia/ops/linear.py
 @@ -9,7 +9,8 @@ from vllm.platforms import current_platform
@@ -2734,7 +2702,7 @@ index 57aa7937d..8835df413 100644
      block_m = 16 if tokens <= 128 else 64
 diff --git a/vllm/models/inkling2/nvidia/ops/linear_w4.py b/vllm/models/inkling2/nvidia/ops/linear_w4.py
 new file mode 100644
-index 000000000..8bcd77f4d
+index 0000000000..8bcd77f4da
 --- /dev/null
 +++ b/vllm/models/inkling2/nvidia/ops/linear_w4.py
 @@ -0,0 +1,210 @@
@@ -2948,365 +2916,12 @@ index 000000000..8bcd77f4d
 +        self, x: torch.Tensor, out: torch.Tensor | None = None
 +    ) -> torch.Tensor:
 +        return w4_matmul(x.contiguous(), self.packed, self.scale, self.zero, out)
-diff --git a/vllm/models/inkling2/nvidia/ops/linear_w4_gemv.py b/vllm/models/inkling2/nvidia/ops/linear_w4_gemv.py
-new file mode 100644
-index 000000000..4addc8993
---- /dev/null
-+++ b/vllm/models/inkling2/nvidia/ops/linear_w4_gemv.py
-@@ -0,0 +1,347 @@
-+# SPDX-License-Identifier: Apache-2.0
-+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-+"""HyperInkling W4A16 linears for decode on GPUs without a fast `tl.dot`
-+(Turing: Triton emits no tensor-core MMA for sm75), as a drop-in for
-+`linear_w8.W8Linear`: attention projections and the LM head, behind
-+HYPERINKLING_ATTN_W4 / HYPERINKLING_HEAD_W4 (opt-in, off by default).
-+
-+Weights are quantized at load time: asymmetric int4, one bf16 scale and one
-+uint8 zero point per GROUP (32, 64 or 128) inputs of each output channel,
-+round to nearest after a per-group clip search (the range shrink with the
-+least squared error). Half the bytes of INT8, which is what a decode GEMV
-+pays for.
-+
-+Packing: eight codes per int32 along K. Within each 128-input tile of a
-+row, word j (0-15) holds inputs `16 * i + j` in its nibble i (bits 4i..4i+3).
-+So nibble plane i of a tile's 16 words is 16 consecutive inputs: the kernel
-+shifts one plane out of every word at once and multiplies it by 16
-+contiguous activations, with no shuffle. Rows stay contiguous, so slicing
-+output channels is free, as for W8Linear.
-+
-+Dequantization is two integer ops and one float subtraction per weight: a
-+code ORed into the mantissa of 2^23 is the float `2^23 + q` exactly, and
-+subtracting `2^23 + zero` (built the same way) gives `q - zero` exactly.
-+Turing converts integers to floats at a quarter of the FMA rate; this path
-+uses no conversion. The scale is applied once per group to the group's
-+partial sums.
-+
-+Decode-size rows (<= SM75_GEMV_MAX_M) run `_w4g_gemv_kernel` (the dot-free 3D
-+tile of `linear_w8._w8_gemv_kernel`); more rows (prefill) dequantize blocks of
-+output channels with `_w4g_dequant_kernel` and run them on cuBLAS.
-+"""
-+
-+import os
-+
-+import torch
-+
-+from vllm.triton_utils import tl, triton
-+
-+from .linear_w8 import SM75_GEMV_MAX_M
-+
-+TILE_K = 128  # inputs per packing tile: 16 int32 words of 8 codes
-+WORDS = TILE_K // 8
-+GROUPS = (32, 64, 128)
-+# Clip search: the group range times each factor from 1 down to CLIP_MIN.
-+CLIP_STEPS = 20
-+CLIP_MIN = 0.70
-+_MAGIC = 0x4B000000  # the bits of 2^23 as fp32
-+
-+
-+def quantize_w4g(
-+    weight: torch.Tensor, group: int = 128, clip: bool = True
-+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-+    """bf16/fp16 `[N, K]` -> packed int32 codes `[N, K / 8]`, bf16 scales and
-+    uint8 zero points `[N, K / group]`.
-+
-+    With `clip`, each group's range [min, max] is scaled by the factor in
-+    [CLIP_MIN, 1] with the least squared reconstruction error (the scale is
-+    evaluated at the bf16 precision it is stored in). In chunks of rows: an LM
-+    head (201k x 2304) in fp32 at once would not fit next to the model."""
-+    n, k = weight.shape
-+    assert group in GROUPS and k % TILE_K == 0, (group, k)
-+    packed = torch.empty((n, k // 8), dtype=torch.int32, device=weight.device)
-+    scale = torch.empty((n, k // group), dtype=torch.bfloat16, device=weight.device)
-+    zero = torch.empty((n, k // group), dtype=torch.uint8, device=weight.device)
-+    factors = torch.linspace(1.0, CLIP_MIN, CLIP_STEPS).tolist() if clip else [1.0]
-+    shifts = torch.arange(0, 32, 4, device=weight.device, dtype=torch.int64)
-+    for start in range(0, n, 2048):
-+        rows = slice(start, start + 2048)
-+        g = weight[rows].float().unflatten(1, (-1, group))  # [r, K / group, group]
-+        lo, hi = g.amin(-1), g.amax(-1)
-+        best_err = best_s = best_z = None
-+        for f in factors:
-+            s = ((hi - lo) * f / 15.0).clamp_min(1e-10).to(torch.bfloat16).float()
-+            z = (-lo * f / s).round().clamp(0, 15)
-+            q = ((g / s[..., None]).round() + z[..., None]).clamp(0, 15)
-+            err = ((q - z[..., None]) * s[..., None] - g).square().sum(-1)
-+            if best_err is None:
-+                best_err, best_s, best_z = err, s, z
-+            else:
-+                better = err < best_err
-+                best_err = torch.where(better, err, best_err)
-+                best_s = torch.where(better, s, best_s)
-+                best_z = torch.where(better, z, best_z)
-+        q = ((g / best_s[..., None]).round() + best_z[..., None]).clamp(0, 15)
-+        codes = q.flatten(1).to(torch.int64)  # [r, K]
-+        # [r, tiles, plane i, word j] -> word j = sum_i code(16 i + j) << 4 i
-+        planes = codes.unflatten(1, (-1, 8, WORDS))
-+        words = (planes << shifts[None, None, :, None]).sum(2)  # [r, tiles, 16]
-+        words = words - ((words >> 31) << 32)  # as signed 32-bit, exactly
-+        packed[rows] = words.flatten(1).to(torch.int32)
-+        scale[rows] = best_s.to(torch.bfloat16)
-+        zero[rows] = best_z.to(torch.uint8)
-+    return packed, scale, zero
-+
-+
-+def unpack_w4g(packed: torch.Tensor) -> torch.Tensor:
-+    """Packed int32 `[N, K / 8]` -> the codes `[N, K]` (int64, 0-15)."""
-+    words = packed.to(torch.int64).unflatten(1, (-1, WORDS))  # [N, tiles, 16]
-+    shifts = torch.arange(0, 32, 4, device=packed.device, dtype=torch.int64)
-+    planes = (words[:, :, None, :] >> shifts[None, None, :, None]) & 15  # [N, tiles, 8, 16]
-+    return planes.flatten(1)
-+
-+
-+def dequantize_w4g(
-+    packed: torch.Tensor, scale: torch.Tensor, zero: torch.Tensor
-+) -> torch.Tensor:
-+    """The fp32 weight `[N, K]` the codes stand for (reference, tests, DSpark fold)."""
-+    codes = unpack_w4g(packed).float()
-+    group = codes.shape[1] // scale.shape[1]
-+    g = codes.unflatten(1, (-1, group)) - zero.float()[..., None]
-+    return (g * scale.float()[..., None]).flatten(1)
-+
-+
-+@triton.jit
-+def _w4g_gemv_kernel(
-+    X, W, S, Z, Y, M, N, K, SX, SW, SS, SY, C1, C2,
-+    BM: tl.constexpr, BN: tl.constexpr, G: tl.constexpr,
-+):  # fmt: skip
-+    """`Y [M, N] = X [M, K] @ dequant(W).T` as plain FMAs on a 3D
-+    `[BM, BN, 16]` tile (axis 2: the 16 words of a packing tile). Columns from
-+    C1 and from C2 on take the second and third M rows of X (one launch for a
-+    full layer's q side, k and v, as `linear_w8.gemv3_sm75`)."""
-+    pid_n = tl.program_id(0)
-+    pid_m = tl.program_id(1)
-+    first_col = pid_n * BN
-+    segment = (first_col >= C1).to(tl.int64) + (first_col >= C2).to(tl.int64)
-+    X += segment * M * SX
-+    rows = pid_m * BM + tl.arange(0, BM)
-+    cols = pid_n * BN + tl.arange(0, BN)
-+    r3 = rows[:, None, None]
-+    c3 = cols[None, :, None]
-+    j3 = tl.arange(0, 16)[None, None, :]
-+    row_ok = r3 < M
-+    col_ok = c3 < N
-+    w_ptr = W + c3.to(tl.int64) * SW + j3
-+    x_ptr = X + r3.to(tl.int64) * SX + j3
-+    s_ptr = S + c3.to(tl.int64) * SS
-+    z_ptr = Z + c3.to(tl.int64) * SS
-+    acc = tl.zeros((BM, BN, 16), tl.float32)
-+    for t in range(0, K // 128):
-+        w = tl.load(w_ptr + t * 16, col_ok, other=0)
-+        for gs in tl.static_range(128 // G):
-+            gi = t * (128 // G) + gs
-+            s = tl.load(s_ptr + gi, col_ok, other=0).to(tl.float32)
-+            z = tl.load(z_ptr + gi, col_ok, other=0).to(tl.int32)
-+            zf = (z | 0x4B000000).to(tl.float32, bitcast=True)
-+            part = tl.zeros((BM, BN, 16), tl.float32)
-+            for ii in tl.static_range(G // 16):
-+                i = gs * (G // 16) + ii
-+                qf = (((w >> (4 * i)) & 15) | 0x4B000000).to(tl.float32, bitcast=True)
-+                x = tl.load(x_ptr + t * 128 + i * 16, row_ok, other=0).to(tl.float32)
-+                part += x * (qf - zf)
-+            acc += part * s
-+    out = tl.sum(acc, axis=2)
-+    rows2 = pid_m * BM + tl.arange(0, BM)
-+    cols2 = pid_n * BN + tl.arange(0, BN)
-+    tl.store(
-+        Y + rows2[:, None].to(tl.int64) * SY + cols2[None, :],
-+        out.to(Y.dtype.element_ty),
-+        (rows2[:, None] < M) & (cols2[None, :] < N),
-+    )
-+
-+
-+@triton.jit
-+def _w4g_dequant_kernel(
-+    W, S, Z, Y, N, K, SW, SS, SY,
-+    BR: tl.constexpr, G: tl.constexpr,
-+):  # fmt: skip
-+    """`Y [N, K]` (the activation dtype) = the weight of rows [BR] x one
-+    packing tile per program."""
-+    pid_r = tl.program_id(0)
-+    t = tl.program_id(1)
-+    rows = pid_r * BR + tl.arange(0, BR)
-+    ok = rows[:, None] < N
-+    j = tl.arange(0, 16)[None, :]
-+    w = tl.load(W + rows[:, None].to(tl.int64) * SW + t * 16 + j, ok, other=0)
-+    for i in tl.static_range(8):
-+        gi = t * (128 // G) + (i * 16) // G
-+        s = tl.load(S + rows[:, None].to(tl.int64) * SS + gi, ok, other=0).to(tl.float32)
-+        z = tl.load(Z + rows[:, None].to(tl.int64) * SS + gi, ok, other=0).to(tl.float32)
-+        q = ((w >> (4 * i)) & 15).to(tl.float32)
-+        tl.store(
-+            Y + rows[:, None].to(tl.int64) * SY + t * 128 + i * 16 + j,
-+            ((q - z) * s).to(Y.dtype.element_ty),
-+            ok,
-+        )
-+
-+
-+def dequant_w4g_rows(packed, scale, zero, dtype) -> torch.Tensor:
-+    """The weight of these rows `[N, K]` in `dtype`, on the GPU kernel."""
-+    n, k = packed.shape[0], packed.shape[1] * 8
-+    group = k // scale.shape[1]
-+    out = torch.empty((n, k), dtype=dtype, device=packed.device)
-+    br = 32
-+    _w4g_dequant_kernel[(triton.cdiv(n, br), k // TILE_K)](
-+        packed, scale, zero, out, n, k,
-+        packed.stride(0), scale.stride(0), out.stride(0),
-+        BR=br, G=group, num_warps=4,
-+    )  # fmt: skip
-+    return out
-+
-+
-+def _env_tile() -> tuple[int, int, int] | None:
-+    """HYPERINKLING_W4G_TILE=bm,bn,warps forces one tile (for bench/sm75_w4_gemv.py
-+    results to be tried in a server without a code change)."""
-+    v = os.environ.get("HYPERINKLING_W4G_TILE")
-+    if not v:
-+        return None
-+    bm, bn, warps = (int(p) for p in v.split(","))
-+    return bm, bn, warps
-+
-+
-+_ENV_TILE = _env_tile()
-+
-+
-+def sm75_w4_tile(m: int, n: int) -> tuple[int, int, int]:
-+    """(BM, BN, warps) of `_w4g_gemv_kernel`. A first guess from the W8 tiles
-+    (`linear_w8.sm75_gemv_tile`: few accumulators, many blocks) at the same
-+    weight bytes per block; bench/sm75_w4_gemv.py searches them on the card."""
-+    if _ENV_TILE is not None:
-+        return _ENV_TILE
-+    if m == 1:
-+        return 1, 16, 2
-+    if m == 2:
-+        return 2, 8, 1
-+    if m <= 4:
-+        return 4, 8, 1
-+    return 8, 4, 1
-+
-+
-+_NO_SEGMENT = 1 << 30
-+
-+
-+def w4g_gemv(x, packed, scale, zero, out, tile, c1=_NO_SEGMENT, c2=_NO_SEGMENT):
-+    """`out [M, N] = x @ dequant.T` on `_w4g_gemv_kernel`; with c1/c2, x is three
-+    stacked `[M, K]` inputs for the column ranges [0, c1), [c1, c2), [c2, N)."""
-+    k = x.shape[1]
-+    m = x.shape[0] if c1 == _NO_SEGMENT else x.shape[0] // 3
-+    n = packed.shape[0]
-+    group = k // scale.shape[1]
-+    bm, bn, warps = tile
-+    assert k % TILE_K == 0 and packed.shape[1] * 8 == k
-+    assert x.stride(1) == 1 and packed.stride(1) == 1 and scale.stride(0) == zero.stride(0)
-+    grid = (triton.cdiv(n, bn), triton.cdiv(m, bm))
-+    _w4g_gemv_kernel[grid](
-+        x, packed, scale, zero, out, m, n, k,
-+        x.stride(0), packed.stride(0), scale.stride(0), out.stride(0), c1, c2,
-+        BM=bm, BN=bn, G=group, num_warps=warps, num_stages=1,
-+    )  # fmt: skip
-+    return out
-+
-+
-+def w4g_matmul(x, packed, scale, zero, out=None):
-+    """`x [M, K] fp16/bf16 @ dequant(packed, scale, zero).T` -> `[M, N]` of
-+    `x`'s dtype (or `out`'s: fp32 for the LM head)."""
-+    m, k = x.shape
-+    n = packed.shape[0]
-+    assert packed.shape[1] * 8 == k and x.stride(1) == 1
-+    if out is None:
-+        out = torch.empty((m, n), dtype=x.dtype, device=x.device)
-+    if m == 0:
-+        return out
-+    if m <= SM75_GEMV_MAX_M:
-+        return w4g_gemv(x, packed, scale, zero, out, sm75_w4_tile(m, n))
-+    for start in range(0, n, 8192):
-+        rows = slice(start, start + 8192)
-+        w = dequant_w4g_rows(packed[rows], scale[rows], zero[rows], x.dtype)
-+        out[:, rows] = x @ w.T
-+    return out
-+
-+
-+class W4GLinear:
-+    """`x @ weight.T` for a bf16/fp16 `weight [N, K]`, as int4 W4A16 (group
-+    32/64/128); the same calls as `linear_w8.W8Linear`."""
-+
-+    def __init__(self, weight: torch.Tensor, group: int = 128, clip: bool = True) -> None:
-+        self.size_n, self.size_k = weight.shape
-+        self.group = group
-+        self.packed, self.scale, self.zero = quantize_w4g(weight, group, clip)
-+
-+    def __call__(self, x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
-+        return w4g_matmul(x.contiguous(), self.packed, self.scale, self.zero, out)
-+
-+    def dequantize(self, rows: slice) -> torch.Tensor:
-+        """fp32 weight rows (DSpark folds the LM head it shares)."""
-+        return dequantize_w4g(self.packed[rows], self.scale[rows], self.zero[rows])
-+
-+    def multi(
-+        self, inputs: list[torch.Tensor], col_ranges: list[tuple[int, int]]
-+    ) -> list[torch.Tensor]:
-+        """`inputs[i] @ weight[col_ranges[i]].T` for each i: one launch over the
-+        whole weight when there are three decode-size inputs of the same rows
-+        for consecutive column ranges from 0 (a full layer's q side, k, v)."""
-+        rows = [x.shape[0] for x in inputs]
-+        if (
-+            len(rows) == 3
-+            and rows[0] == rows[1] == rows[2]
-+            and 0 < rows[0] <= SM75_GEMV_MAX_M
-+            and col_ranges[0][0] == 0
-+            and col_ranges[0][1] == col_ranges[1][0]
-+            and col_ranges[1][1] == col_ranges[2][0]
-+            and col_ranges[2][1] <= self.size_n
-+        ):
-+            m = rows[0]
-+            bm, bn, warps = sm75_w4_tile(m, self.size_n)
-+            c1, c2 = col_ranges[1][0], col_ranges[2][0]
-+            while bn > 1 and (c1 % bn or c2 % bn):
-+                bn //= 2  # a column tile may not straddle two inputs
-+            x3 = torch.cat(inputs)
-+            y = torch.empty((m, self.size_n), dtype=x3.dtype, device=x3.device)
-+            w4g_gemv(x3, self.packed, self.scale, self.zero, y, (bm, bn, warps), c1, c2)
-+            return [y[:, lo:hi] for lo, hi in col_ranges]
-+        return [
-+            w4g_matmul(x.contiguous(), self.packed[lo:hi], self.scale[lo:hi], self.zero[lo:hi])
-+            for x, (lo, hi) in zip(inputs, col_ranges)
-+        ]
-+
-+
-+def w4_layer_selected(spec: str | None, layer: int | None) -> bool:
-+    """HYPERINKLING_ATTN_W4: empty or 0 for none, 1 or all for every layer,
-+    else layer ids and inclusive ranges, `0-5,18-23` (a layer outside them
-+    keeps INT8 with HYPERINKLING_ATTN_W8=1)."""
-+    spec = (spec or "").strip()
-+    if spec in ("", "0"):
-+        return False
-+    if spec in ("1", "all"):
-+        return True
-+    if layer is None:
-+        return False
-+    for part in spec.split(","):
-+        lo, _, hi = part.strip().partition("-")
-+        if int(lo) <= layer <= int(hi or lo):
-+            return True
-+    return False
-+
-+
-+def w4_group(var: str, default: int = 64) -> int:
-+    """The group size from `var` (32, 64 or 128)."""
-+    group = int(os.environ.get(var) or default)
-+    if group not in GROUPS:
-+        raise ValueError(f"{var} must be one of {GROUPS}, not {group}")
-+    return group
-+
-+
-+def w4_clip() -> bool:
-+    """HYPERINKLING_W4_CLIP=0: plain min/max round to nearest, no clip search."""
-+    return os.environ.get("HYPERINKLING_W4_CLIP") != "0"
 diff --git a/vllm/models/inkling2/nvidia/ops/linear_w8.py b/vllm/models/inkling2/nvidia/ops/linear_w8.py
 new file mode 100644
-index 000000000..1546fee2b
+index 0000000000..be3807872e
 --- /dev/null
 +++ b/vllm/models/inkling2/nvidia/ops/linear_w8.py
-@@ -0,0 +1,350 @@
+@@ -0,0 +1,346 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""HyperInkling W8A16 linears: bf16 weights quantized at load time to int8
@@ -3613,10 +3228,6 @@ index 000000000..1546fee2b
 +    ) -> torch.Tensor:
 +        return w8_matmul(x.contiguous(), self.q, self.scale, out)
 +
-+    def dequantize(self, rows: slice) -> torch.Tensor:
-+        """fp32 weight rows (DSpark folds the LM head it shares)."""
-+        return dequantize_int8(self.q[rows], self.scale[rows])
-+
 +    def _one_launch(self, rows: list[int], col_ranges: list[tuple[int, int]]) -> bool:
 +        """Three inputs of the same decode-size row count over column ranges
 +        that follow each other from 0 (`gemv3_sm75`)."""
@@ -3658,7 +3269,7 @@ index 000000000..1546fee2b
 +            for x, (lo, hi) in zip(inputs, col_ranges)
 +        ]
 diff --git a/vllm/models/inkling2/nvidia/ops/ll_gemm_sm120.py b/vllm/models/inkling2/nvidia/ops/ll_gemm_sm120.py
-index 9c5fe9ce3..f6551a7e9 100644
+index 9c5fe9ce3c..f6551a7e9e 100644
 --- a/vllm/models/inkling2/nvidia/ops/ll_gemm_sm120.py
 +++ b/vllm/models/inkling2/nvidia/ops/ll_gemm_sm120.py
 @@ -1,18 +1,21 @@
@@ -3758,7 +3369,7 @@ index 9c5fe9ce3..f6551a7e9 100644
      )
 diff --git a/vllm/models/inkling2/nvidia/ops/lookup.py b/vllm/models/inkling2/nvidia/ops/lookup.py
 new file mode 100644
-index 000000000..9103f9b74
+index 0000000000..9103f9b745
 --- /dev/null
 +++ b/vllm/models/inkling2/nvidia/ops/lookup.py
 @@ -0,0 +1,233 @@
@@ -3996,7 +3607,7 @@ index 000000000..9103f9b74
 +                num_warps=4,
 +            )
 diff --git a/vllm/models/inkling2/nvidia/ops/loop.py b/vllm/models/inkling2/nvidia/ops/loop.py
-index 3df661741..51385aef2 100644
+index 3df661741e..51385aef23 100644
 --- a/vllm/models/inkling2/nvidia/ops/loop.py
 +++ b/vllm/models/inkling2/nvidia/ops/loop.py
 @@ -12,6 +12,7 @@ import torch
@@ -4027,7 +3638,7 @@ index 3df661741..51385aef2 100644
              dest,
 diff --git a/vllm/models/inkling2/nvidia/ops/moe_marlin.py b/vllm/models/inkling2/nvidia/ops/moe_marlin.py
 new file mode 100644
-index 000000000..b8dd7f685
+index 0000000000..b8dd7f6851
 --- /dev/null
 +++ b/vllm/models/inkling2/nvidia/ops/moe_marlin.py
 @@ -0,0 +1,274 @@
@@ -4306,7 +3917,7 @@ index 000000000..b8dd7f685
 +            topk_weights, block_m, 1, rows, self.hidden_size, self.intermediate_size,
 +        )  # fmt: skip
 diff --git a/vllm/models/inkling2/nvidia/ops/moe_sm120.py b/vllm/models/inkling2/nvidia/ops/moe_sm120.py
-index 8a438dd37..6b5c51a0f 100644
+index 8a438dd37a..6b5c51a0f4 100644
 --- a/vllm/models/inkling2/nvidia/ops/moe_sm120.py
 +++ b/vllm/models/inkling2/nvidia/ops/moe_sm120.py
 @@ -10,7 +10,9 @@ import torch
@@ -4338,7 +3949,7 @@ index 8a438dd37..6b5c51a0f 100644
          return out
      assert weight.dtype == torch.uint8
 diff --git a/vllm/models/inkling2/nvidia/ops/moe_sm90.py b/vllm/models/inkling2/nvidia/ops/moe_sm90.py
-index 53417df4c..2444bb1ba 100644
+index 53417df4c3..2444bb1ba3 100644
 --- a/vllm/models/inkling2/nvidia/ops/moe_sm90.py
 +++ b/vllm/models/inkling2/nvidia/ops/moe_sm90.py
 @@ -119,14 +119,17 @@ def _swiglu_kernel(
@@ -4378,7 +3989,7 @@ index 53417df4c..2444bb1ba 100644
          gate_up,
          weights,
 diff --git a/vllm/models/inkling2/nvidia/ops/sconv.py b/vllm/models/inkling2/nvidia/ops/sconv.py
-index 67a3607a3..d2df98d28 100644
+index 67a3607a3e..d2df98d288 100644
 --- a/vllm/models/inkling2/nvidia/ops/sconv.py
 +++ b/vllm/models/inkling2/nvidia/ops/sconv.py
 @@ -264,7 +264,8 @@ def _conv(
@@ -4392,7 +4003,7 @@ index 67a3607a3..d2df98d28 100644
      tap_args = (
          x_ptr,
 diff --git a/vllm/models/inkling2/nvidia/ops/vision.py b/vllm/models/inkling2/nvidia/ops/vision.py
-index 662b429a9..6533918cf 100644
+index 662b429a9a..6533918cfc 100644
 --- a/vllm/models/inkling2/nvidia/ops/vision.py
 +++ b/vllm/models/inkling2/nvidia/ops/vision.py
 @@ -5,7 +5,8 @@
@@ -4501,7 +4112,7 @@ index 662b429a9..6533918cf 100644
      if HAS_NORM:
          normed = _layer_norm(hidden, ln_w_ptr, ln_b_ptr, dim, mask, DIM, eps)
 diff --git a/vllm/models/inkling2/nvidia/sconv.py b/vllm/models/inkling2/nvidia/sconv.py
-index e87a03312..3bdaea36a 100644
+index e87a03312d..3bdaea36a2 100644
 --- a/vllm/models/inkling2/nvidia/sconv.py
 +++ b/vllm/models/inkling2/nvidia/sconv.py
 @@ -21,6 +21,7 @@ from vllm.models.inkling.nvidia.sconv_swa_attn import (
@@ -4522,7 +4133,7 @@ index e87a03312..3bdaea36a 100644
          )
          return metadata, cache, owner.block_size
 diff --git a/vllm/models/inkling2/nvidia/vision.py b/vllm/models/inkling2/nvidia/vision.py
-index a83dc5039..b9c02f82b 100644
+index a83dc50398..b9c02f82b6 100644
 --- a/vllm/models/inkling2/nvidia/vision.py
 +++ b/vllm/models/inkling2/nvidia/vision.py
 @@ -17,7 +17,7 @@ import torch.nn.functional as F
@@ -4633,7 +4244,7 @@ index a83dc5039..b9c02f82b 100644
          self.layers = nn.ModuleList(
              Inkling2VisionLayer(config) for _ in range(config["num_hidden_layers"])
 diff --git a/vllm/models/inkling2/processing.py b/vllm/models/inkling2/processing.py
-index 1413a5a6d..d1383cf41 100644
+index 1413a5a6d1..d1383cf419 100644
 --- a/vllm/models/inkling2/processing.py
 +++ b/vllm/models/inkling2/processing.py
 @@ -11,6 +11,7 @@ from __future__ import annotations
@@ -4719,7 +4330,7 @@ index 1413a5a6d..d1383cf41 100644
          }
  
 diff --git a/vllm/models/inkling2/quant_config.py b/vllm/models/inkling2/quant_config.py
-index af504ebc6..64894431f 100644
+index af504ebc6a..64894431fd 100644
 --- a/vllm/models/inkling2/quant_config.py
 +++ b/vllm/models/inkling2/quant_config.py
 @@ -2,7 +2,8 @@
@@ -4783,7 +4394,7 @@ index af504ebc6..64894431f 100644
 +            return "int4"
 +        return "mxfp8" if self.is_mxfp8_layer(layer_id) else "nvfp4"
 diff --git a/vllm/models/inkling2/speculator.py b/vllm/models/inkling2/speculator.py
-index 6beae2b0d..37bfafbbf 100644
+index 6beae2b0d5..37bfafbbf5 100644
 --- a/vllm/models/inkling2/speculator.py
 +++ b/vllm/models/inkling2/speculator.py
 @@ -3,6 +3,8 @@
@@ -4836,7 +4447,7 @@ index 6beae2b0d..37bfafbbf 100644
 +                None if self.draft_logits is None else self.draft_logits.values,
 +            )
 diff --git a/vllm/models/inkling2/speculator_config.py b/vllm/models/inkling2/speculator_config.py
-index 0d367f830..96d9922b0 100644
+index 0d367f8309..96d9922b0f 100644
 --- a/vllm/models/inkling2/speculator_config.py
 +++ b/vllm/models/inkling2/speculator_config.py
 @@ -1,8 +1,8 @@
@@ -4878,7 +4489,7 @@ index 0d367f830..96d9922b0 100644
 +                    "Inkling2 DSpark on SM12 requires 16-bit draft KV"
 +                )
 diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
-index 91f9e26ff..4a3a61bca 100644
+index 91f9e26ffd..4a3a61bca3 100644
 --- a/vllm/v1/core/kv_cache_manager.py
 +++ b/vllm/v1/core/kv_cache_manager.py
 @@ -501,6 +501,9 @@ class KVCacheManager:
@@ -4892,7 +4503,7 @@ index 91f9e26ff..4a3a61bca 100644
              new_computed_block_list = new_computed_blocks.blocks
              if self.retained_hit_group_ids:
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
-index 0373c6477..34caff71d 100644
+index 0373c64773..34caff71d1 100644
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
 @@ -84,6 +84,10 @@ from vllm.v1.metrics.stats import (
@@ -4976,7 +4587,7 @@ index 0373c6477..34caff71d 100644
                  # scheduling, num_output_placeholders, which covers the spec
                  # tokens). A stale rejection count predates the preemption
 diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
-index 84dfa53f1..e3921fc6d 100644
+index 84dfa53f19..e3921fc6db 100644
 --- a/vllm/v1/core/single_type_kv_cache_manager.py
 +++ b/vllm/v1/core/single_type_kv_cache_manager.py
 @@ -277,6 +277,10 @@ class SingleTypeKVCacheManager(ABC):
@@ -4991,7 +4602,7 @@ index 84dfa53f1..e3921fc6d 100644
          """Return a reservation, or None to use the allocation-based admission check."""
          return None
 diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
-index 6c83d46bb..099aa36f2 100644
+index 6c83d46bb1..099aa36f27 100644
 --- a/vllm/v1/engine/core.py
 +++ b/vllm/v1/engine/core.py
 @@ -127,6 +127,70 @@ HANDSHAKE_TIMEOUT_MINS = 5
@@ -5101,7 +4712,7 @@ index 6c83d46bb..099aa36f2 100644
          # (e.g. WAITING_FOR_REMOTE_KVS or delayed KV connector frees), yield
 diff --git a/vllm/v1/spec_decode/dynamic/adaptive_k.py b/vllm/v1/spec_decode/dynamic/adaptive_k.py
 new file mode 100644
-index 000000000..4cd88f259
+index 0000000000..4cd88f259e
 --- /dev/null
 +++ b/vllm/v1/spec_decode/dynamic/adaptive_k.py
 @@ -0,0 +1,130 @@
@@ -5236,7 +4847,7 @@ index 000000000..4cd88f259
 +        else:
 +            self.cost[key] = (old[0] + _COST_EMA * (ms - old[0]), old[1] + 1)
 diff --git a/vllm/v1/structured_output/backend_xgrammar.py b/vllm/v1/structured_output/backend_xgrammar.py
-index d5c2ec4ec..9d2620836 100644
+index d5c2ec4ecc..9d2620836e 100644
 --- a/vllm/v1/structured_output/backend_xgrammar.py
 +++ b/vllm/v1/structured_output/backend_xgrammar.py
 @@ -161,7 +161,13 @@ class XgrammarBackend(StructuredOutputBackend):
