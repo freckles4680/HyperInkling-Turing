@@ -6,6 +6,9 @@ answered by the model, then scored 1 to 10 per turn by a separate judge model.
     python bench/mtbench.py judge --label <name>          # judge saved answers again (or later)
     python bench/mtbench.py export --label <name> [--batch 10]   # files to grade in a chat
     python bench/mtbench.py import --label <name> replies.txt    # read the chat's scores back
+    python bench/mtbench.py redo  --label <name> [--max-tokens 65536]   # answer again the
+                              # questions cut by max_tokens (or empty), keep the other scores
+    python bench/mtbench.py import --label <name> --merge redo-replies.txt  # grades of the redo
 
 Questions and reference answers (for math, reasoning and coding) are lm-sys FastChat's MT-Bench
 files (Apache-2.0), downloaded once into bench/quality-data/mt_bench/. The judge prompts follow
@@ -29,6 +32,13 @@ Files (under bench/quality-data/mt_bench/):
     answers-<label>.jsonl     one line per question, both turns (tail -f it to follow a run)
     judgments-<label>.jsonl   one line per judged turn, the judge's full explanation included
     result-<label>.json       the summary that is printed at the end
+    answers-<label>.before-redo-<time>.jsonl   the answers a `redo` replaced
+
+`redo` answers both turns of every question that has a turn cut by max_tokens, empty, or a
+request error again (turn 2 is asked after turn 1, so a new turn 1 means a new turn 2),
+replaces them in answers-<label>.jsonl and drops their old scores. With JUDGE_MODEL it judges
+them and prints the merged summary; without it, it exports only those questions to
+export/<label>-redo/ and `import --merge` adds their grades to the scores already saved.
 """
 
 import argparse
@@ -157,11 +167,12 @@ def load_questions(limit):
 
 
 # --- answer ----------------------------------------------------------------------------------
-def answer_all(args, qs, path):
+def answer_all(args, qs, path, append=False):
     base = f"http://{args.host}:{args.port}/v1"
     key = os.environ.get("API_KEY", "")
     lock, done = threading.Lock(), [0]
-    path.unlink(missing_ok=True)
+    if not append:
+        path.unlink(missing_ok=True)
 
     def one(q):
         msgs, turns, finish, t0 = [], [], [], time.time()
@@ -330,7 +341,7 @@ q<id> t2: <score>
 """
 
 
-def export_chat(args, qs, answers, batch):
+def export_chat(args, qs, answers, batch, then=None):
     byid = {q["question_id"]: q for q in qs}
     answers = sorted(answers, key=lambda a: a["question_id"])
     chunks = [answers[i:i + batch] for i in range(0, len(answers), batch)]
@@ -361,12 +372,88 @@ def export_chat(args, qs, answers, batch):
     for path in paths:
         print(f"  {path}  ({path.stat().st_size // 4000}k tokens, roughly)")
     print("Paste or attach them one by one in ONE chat, save every reply (in order) into one text file, then:")
-    print(f"  python3 bench/mtbench.py import --label {args.label} <that file> [--judge-name 'Opus 4.x chat']")
+    print(then or f"  python3 bench/mtbench.py import --label {args.label} <that file>"
+          " [--judge-name 'Opus 4.x chat']")
     return paths
+
+
+def needs_redo(a):
+    """A question whose answer was cut by max_tokens, came back empty, or failed."""
+    return any(not t for t in a["turns"]) or any(
+        f == "length" or str(f).startswith("error") for f in a["finish_reason"])
+
+
+def saved_scores(label, skip=()):
+    """(question_id, turn) -> score from judgments-<label>.jsonl, leaving out `skip` ids."""
+    path = DATA / f"judgments-{label}.jsonl"
+    if not path.exists():
+        return {}, None
+    out, judge = {}, None
+    for line in open(path):
+        if line.strip():
+            r = json.loads(line)
+            if r.get("score") is not None and r["question_id"] not in skip:
+                out[(r["question_id"], r["turn"])] = r["score"]
+                judge = judge or r.get("judge")
+    return out, judge
+
+
+def redo(args, qs, answers, apath):
+    todo = sorted(a["question_id"] for a in answers if needs_redo(a))
+    if not todo:
+        print("nothing to redo: no answer was cut by max_tokens, empty, or an error")
+        return
+    print(f"redo: {len(todo)} questions with a turn cut by max_tokens, empty or failed, "
+          f"answered again with max_tokens {args.max_tokens}: {' '.join(f'q{i}' for i in todo)}",
+          flush=True)
+    backup = apath.with_name(f"answers-{args.label}.before-redo-{time.strftime('%Y%m%d-%H%M%S')}.jsonl")
+    backup.write_text(apath.read_text())
+    tmp = apath.with_name(f"answers-{args.label}.redo.jsonl")
+    byid = {q["question_id"]: q for q in qs}
+    new = {a["question_id"]: a for a in answer_all(args, [byid[i] for i in todo], tmp)}
+    tmp.unlink(missing_ok=True)
+    answers = [new.get(a["question_id"], a) for a in answers]
+    with open(apath, "w") as f:
+        for a in answers:
+            f.write(json.dumps(a) + "\n")
+    still = [f"q{i}" for i in todo if needs_redo(new[i])]
+    print(f"replaced {len(todo)} answers in {apath} (old file: {backup.name})")
+    if still:
+        print(f"STILL cut, empty or failed: {' '.join(still)} (redo again with a larger --max-tokens)")
+    # The old scores of the redone questions are void; keep everyone else's.
+    jpath = DATA / f"judgments-{args.label}.jsonl"
+    kept = []
+    if jpath.exists():
+        kept = [json.loads(line) for line in open(jpath) if line.strip()]
+        kept = [r for r in kept if r["question_id"] not in new]
+        with open(jpath, "w") as f:
+            for r in kept:
+                f.write(json.dumps(r) + "\n")
+    redone = [new[i] for i in todo]
+    rqs = [byid[i] for i in todo]
+    if os.environ.get("JUDGE_MODEL"):
+        tmpj = DATA / f"judgments-{args.label}.redo.jsonl"
+        judged, skipped = judge_all(args, rqs, redone, tmpj)
+        tmpj.unlink(missing_ok=True)
+        if not skipped:
+            with open(jpath, "a") as f:
+                for r in judged:
+                    f.write(json.dumps(r) + "\n")
+            summarize(args, answers, kept + judged, None)
+            return
+        print(f"judging the redo failed: {skipped}; grade it by hand instead")
+    sub = argparse.Namespace(**{**vars(args), "label": f"{args.label}-redo"})
+    export_chat(sub, rqs, redone, args.batch,
+                then=f"  python3 bench/mtbench.py import --label {args.label} --merge <that file>"
+                     " [--judge-name 'Opus chat']\n"
+                     "(--merge keeps the saved scores of the other questions; these ones are re-graded)")
 
 
 def import_chat(args, qs, answers, files):
     scores = {}
+    if args.merge:  # start from the scores already saved, the pasted ones win
+        scores, _ = saved_scores(args.label)
+        print(f"merge: {len(scores)} saved scores from judgments-{args.label}.jsonl")
     for f in files:
         for qid, turn, score in SCORE_LINE.findall(Path(f).read_text(errors="replace")):
             scores[(int(qid), int(turn))] = min(10.0, max(1.0, float(score)))
@@ -380,11 +467,18 @@ def import_chat(args, qs, answers, files):
                 rec["error"] = "no score in the pasted replies"
                 missing.append(f"q{a['question_id']} t{t}")
             judged.append(rec)
+    if missing and not args.merge:  # don't wipe saved scores the replies do not cover
+        saved, _ = saved_scores(args.label)
+        lost = [m for m in missing if (int(m[1:].split()[0]), int(m[-1])) in saved]
+        if lost:
+            sys.exit(f"{len(lost)} turns missing from the replies have saved scores in "
+                     f"judgments-{args.label}.jsonl (after a redo, say): add --merge to keep "
+                     "them, nothing was written")
     extra = sorted({q for q, _ in scores} - {a["question_id"] for a in answers})
     with open(DATA / f"judgments-{args.label}.jsonl", "w") as f:
         for rec in judged:
             f.write(json.dumps(rec) + "\n")
-    print(f"imported {len(scores)} scores from {len(files)} file(s)")
+    print(f"{len(scores)} scores in all after reading {len(files)} file(s)")
     if missing:
         print(f"MISSING {len(missing)} turns (not counted; paste those batches again): {' '.join(missing)}")
     if extra:
@@ -396,7 +490,7 @@ def import_chat(args, qs, answers, files):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("cmd", choices=["run", "judge", "export", "import", "download"])
+    p.add_argument("cmd", choices=["run", "judge", "export", "import", "redo", "download"])
     p.add_argument("files", nargs="*", help="import: text file(s) holding the chat's replies")
     p.add_argument("--label", default="run", help="names the output files")
     p.add_argument("--host", default="127.0.0.1")
@@ -405,12 +499,15 @@ def main():
     p.add_argument("--limit", type=int, default=10, help="questions per category (10 = all 80)")
     p.add_argument("--jobs", type=int, default=2, help="requests at once to the model")
     p.add_argument("--judge-jobs", type=int, default=4, help="requests at once to the judge")
-    p.add_argument("--max-tokens", type=int, default=8192, help="per answer, reasoning included")
+    p.add_argument("--max-tokens", type=int, default=32768,
+                   help="per answer, reasoning included (an answer that spends it all thinking is empty)")
     p.add_argument("--batch", type=int, default=10, help="export: questions per file to paste")
     p.add_argument("--judge-name", default="manual (chat)", help="import: who graded, for the report")
+    p.add_argument("--merge", action="store_true",
+                   help="import: keep the saved scores of the turns the replies do not grade (after redo)")
     p.add_argument("--report", help="import: report to append the summary to"
                    " (default .local/intelligence-<label>.txt when it exists)")
-    args = p.parse_args()
+    args = p.parse_intermixed_args()  # files may come after options (import --label x replies.txt)
     if args.cmd == "download":
         download()
         return
@@ -428,6 +525,9 @@ def main():
         qs = [q for q in qs if q["question_id"] in ids]
     if args.cmd == "export":
         export_chat(args, qs, answers, args.batch)
+        return
+    if args.cmd == "redo":
+        redo(args, qs, answers, apath)
         return
     if args.cmd == "import":
         if not args.files:

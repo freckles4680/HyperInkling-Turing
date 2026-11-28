@@ -19,6 +19,10 @@
 #             bench/quality-data/mt_bench/export/<name>/batch-NN.md
 #           Save the chat's replies into one text file, then put the scores in the report:
 #             python3 bench/mtbench.py import --label <name> replies.txt --judge-name "Opus chat"
+#           Answers cut by max_tokens (empty) can be answered again on their own, with a
+#           larger budget, and graded alone; the other scores are kept:
+#             python3 bench/mtbench.py redo --label <name> --max-tokens 65536
+#             python3 bench/mtbench.py import --label <name> --merge redo-replies.txt
 #
 # lm-evaluation-harness goes into its own venv (.local/eval-venv, ~300 MB, no torch), so the
 # server's venv/ is never touched. The machine needs internet for the first run: Hugging
@@ -61,6 +65,8 @@ JOBS=${JOBS:-2}
 # Token budget per answer, reasoning included. An answer that spends it all thinking comes
 # back empty and scores 0, so keep it generous ("cut by max_tokens" in the report).
 MAX_TOKENS=${MAX_TOKENS:-8192}
+# MT-Bench's own budget: open questions think longer, and 8192 left 15 of 160 turns empty.
+MTBENCH_MAX_TOKENS=${MTBENCH_MAX_TOKENS:-32768}
 # Extra request fields for lm-eval, space separated key=value, e.g.
 #   GEN_EXTRA='chat_template_kwargs={"enable_thinking":False}'   (Python literal syntax)
 GEN_EXTRA=${GEN_EXTRA:-}
@@ -140,7 +146,7 @@ run_lm_eval() {
 	echo "intelligence $name, $(date -Is), preset $PRESET"
 	section setup
 	git log --oneline -1
-	echo "server $base, model $MODEL, jobs $JOBS, max_tokens $MAX_TOKENS${GEN_EXTRA:+, extra $GEN_EXTRA}"
+	echo "server $base, model $MODEL, jobs $JOBS, max_tokens $MAX_TOKENS (mtbench $MTBENCH_MAX_TOKENS)${GEN_EXTRA:+, extra $GEN_EXTRA}"
 	echo "limits: ifeval $IFEVAL_LIMIT, mmlu_pro $MMLU_PRO_LIMIT per subject, mtbench $MTBENCH_LIMIT per category (0 = all)"
 	echo "judge: ${JUDGE_MODEL:-NONE (MT-Bench judging SKIPPED: answers exported for grading in a chat)}${JUDGE_MODEL:+ at $JUDGE_BASE_URL}"
 	[ "$PORT" = 8081 ] && echo "WARNING: port 8081 is the speed-display proxy: its extra line is scored. Use 8080."
@@ -166,7 +172,7 @@ run_lm_eval() {
 			t0=$SECONDS
 			API_KEY=$API_KEY python3 bench/mtbench.py run --label "$name" --host "$HOST" --port "$PORT" \
 				--model "$MODEL" --limit "$MTBENCH_LIMIT" --jobs "$JOBS" --judge-jobs "$JUDGE_JOBS" \
-				--max-tokens "$MAX_TOKENS" --batch "$MTBENCH_BATCH" > "$raw/mtbench.log" 2>&1
+				--max-tokens "$MTBENCH_MAX_TOKENS" --batch "$MTBENCH_BATCH" > "$raw/mtbench.log" 2>&1
 			echo "mtbench exit $?, $(((SECONDS - t0) / 60)) min; log: $raw/mtbench.log"
 			# The summary (everything after the per-answer progress lines).
 			sed -n '/^MT-Bench (/,$p' "$raw/mtbench.log"
