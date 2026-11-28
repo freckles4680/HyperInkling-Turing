@@ -35,10 +35,14 @@ export SWITCH_LOG=${SWITCH_LOG:-.local/model-switch.log}
 
 mkdir -p "$(dirname "$SWITCH_LOG")"
 if [ -f "$SWITCH_LOG" ]; then mv -f "$SWITCH_LOG" "$SWITCH_LOG.1"; fi
-if ss -ltn 2> /dev/null | awk '{print $4}' | grep -qE "[:.]$PORT$"; then
-	echo "serve-switch: port $PORT is already in use (scripts/serve.sh still running?)" >&2
-	exit 1
-fi
+port_taken() { ss -ltn 2> /dev/null | awk '{print $4}' | grep -qE "[:.]$1$"; }
+for p in $PORT $SPEED_PORT; do
+	if port_taken "$p"; then
+		echo "serve-switch: port $p is already in use (scripts/serve.sh or an old" \
+			"speed proxy still running? ss -ltnp | grep :$p)" >&2
+		exit 1
+	fi
+done
 if [ "$BIND" = 0.0.0.0 ]; then
 	address=$(hostname -I 2> /dev/null | awk '{print $1}')
 	local_address=127.0.0.1
@@ -50,10 +54,19 @@ echo "serve-switch: http://${address:-<this machine>}:$PORT/v1" \
 	"$([ -n "$API_KEY" ] && echo '(API key required)' || echo '(no API key)')"
 if [ -n "$SPEED_PORT" ]; then
 	echo "serve-switch: with the speed line: http://${address:-<this machine>}:$SPEED_PORT/v1"
-	python3 scripts/speed_proxy.py --bind "$BIND" --port "$SPEED_PORT" \
-		--upstream "http://$local_address:$PORT" &
+	# Its lines go into the same log as the switcher's, prefixed [speed].
+	python3 -u scripts/speed_proxy.py --bind "$BIND" --port "$SPEED_PORT" \
+		--upstream "http://$local_address:$PORT" \
+		> >(while IFS= read -r line; do
+			echo "$(date '+%F %T') [speed] $line" | tee -a "$SWITCH_LOG"
+		done) 2>&1 &
 	proxy=$!
 	trap 'kill "$proxy" 2> /dev/null || true' EXIT
+	sleep 1
+	if ! kill -0 "$proxy" 2> /dev/null; then
+		echo "serve-switch: the speed proxy on :$SPEED_PORT did not start (above)" >&2
+		exit 1
+	fi
 fi
 python3 scripts/model_switch.py --config "$CONFIG" --bind "$BIND" --port "$PORT" \
 	--log "$SWITCH_LOG"
