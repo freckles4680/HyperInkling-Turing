@@ -1,20 +1,20 @@
 #!/bin/bash
 # Build the HyperInkling container image: vLLM's own Dockerfile on our patched checkout
-# (./vllm, from scripts/setup-vllm.sh) for one GPU arch (ARCH, default 8.6; 7.5 for Turing),
+# (./vllm, from scripts/setup-vllm.sh) for one GPU arch (ARCH, default 7.5 = Turing; 8.6 for a 3090),
 # then the launcher layer on top.
 #
-#   scripts/build-image.sh [tag]            # default tag hyperinkling:latest
+#   scripts/build-image.sh [tag]            # default tag hyperinkling:sm75 (the compose default)
 #
 # A tag already on its registry is refused (published images never move: bump the version).
 # The built image runs scripts/verify-image.py on the GPU (the compiled ops work on it).
-# Env: ARCH (CUDA arch, default 8.6), MAX_JOBS (compile jobs, default: nproc - 1),
+# Env: ARCH (CUDA arch, default 7.5), MAX_JOBS (compile jobs, default: nproc - 1),
 # NVCC_THREADS (2), DOCKER (docker),
 # BUILD_ARGS (more flags for the vLLM build, e.g. "--build-arg FINAL_BASE_IMAGE=...").
 set -euo pipefail
 cd "$(dirname "$0")/.."
-TAG=${1:-hyperinkling:latest}
+TAG=${1:-hyperinkling:sm75}
 DOCKER=${DOCKER:-docker}
-ARCH=${ARCH:-8.6}
+ARCH=${ARCH:-7.5}
 SM=sm${ARCH//./}
 JOBS=${MAX_JOBS:-$(( $(nproc) > 1 ? $(nproc) - 1 : 1 ))}
 [ -d vllm/.git ] || { echo "no ./vllm checkout: run scripts/setup-vllm.sh first" >&2; exit 1; }

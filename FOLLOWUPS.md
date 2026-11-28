@@ -6,12 +6,13 @@ fetched with `hf download --include` only when chosen.
 
 | phase | items |
 |---|---|
-| T, Turing (sm75) | T1, T2, T3, T4 (fp16 and shared memory in code) |
+| T, Turing (sm75) | T4 (T1-T3 done on the 2080 Ti, 2026-11-26) |
 | 2, the checkpoint (new files on HF) | 33 |
 | 3, context (best effort) | 18, 13, 55 |
 | 4, speed and upstream | 10, 7, 21, 22, 32 |
 
-Released: `ghcr.io/pento95/hyperinkling:0.1.4` (compose default) and two HF checkpoints, the
+Released upstream: `ghcr.io/pento95/hyperinkling:0.1.4` (sm86 only; this fork's compose
+runs a locally built `hyperinkling:sm75`) and two HF checkpoints, the
 original (README = docs/MODEL_CARD.md) and the uncensored one (README =
 docs/MODEL_CARD_UNCENSORED.md): re-upload a card when it changes. A new image goes with a new
 tag (`scripts/build-image.sh` refuses a published one) and the compose default.
@@ -45,8 +46,15 @@ GGUFs run the same drafter on RTX 20xx in F16/F32 math. `tests/test_fp16.py` che
 also ran in Triton's CPU interpreter). Shared memory (64 KB per block on Turing against
 Ampere's ~100 KB) is checked offline by `bench/sm75_compile.py`: the attention tiles
 (72-96 KB) and the W8 prefill tile (128 KB) were over and are smaller on sm75 (attention
-BLOCK_M <= 64 and BLOCK_N 64/32, W8 BN <= 128); every kernel now fits. Nothing has run on a
-Turing GPU yet. The bring-up on the card, step by step, is `docs/turing-bringup.md`. Left:
+BLOCK_M <= 64 and BLOCK_N 64/32, W8 BN <= 128); every kernel now fits. The bring-up on the
+card, step by step, is `docs/turing-bringup.md`.
+
+**Status on the 22 GB 2080 Ti (2026-11-26):** T1 done: GSM8K 0.965, tool calls 0.605, DocVQA
+0.936, within noise of the 3090 Ti, and no fp16 overflow. T2 done: targets met, 90k decode
+93 tok/s headless (36.5 ms a step at 4 drafts) and 83-85 with a desktop, prefill 1,154 /
+1,071 tok/s; 8k 84 tok/s and 2,445 prefill; ~145k context headless, ~120k with a desktop
+(README). T3 done: DSpark gives 2.7-3.6 tokens a step; acceptance per kind of text
+(`bench/spec_bench.py`) is not measured on the card yet. Left: T4. The history of each:
 
 T1. **fp16 on the card**: there is no bf16 GPU to compare against, so the check is fp16's
     own range and the published scores. `HYPERINKLING_FP16_CHECK=1` (eager) logs each new

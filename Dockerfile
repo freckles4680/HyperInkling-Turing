@@ -1,16 +1,16 @@
-# HyperInkling: Inkling 2 Mini on one RTX 3090 / 3090 Ti (or Turing, in progress), as a container.
+# HyperInkling-Turing: Inkling 2 Mini on one Turing GPU (a 22 GB 2080 Ti), as a container.
 #
 # The vLLM layer is vLLM's own docker/Dockerfile built from our patched checkout for one
-# arch, sm86 by default (scripts/build-image.sh does both steps, ARCH=7.5 for Turing); this
+# arch, sm75 by default (scripts/build-image.sh does both steps, ARCH=8.6 for a 3090); this
 # file adds the launcher on top.
 #
 #   scripts/build-image.sh                 # ~1 h the first time, then cached
 #   docker compose up -d                   # see docker-compose.yml and scripts/wizard.py
-ARG VLLM_IMAGE=hyperinkling-vllm:sm86
+ARG VLLM_IMAGE=hyperinkling-vllm:sm75
 FROM ${VLLM_IMAGE}
 
-LABEL org.opencontainers.image.source=https://github.com/Pento95/HyperInkling \
-      org.opencontainers.image.description="Inkling 2 Mini on one RTX 3090 / 3090 Ti (vLLM, sm86)" \
+LABEL org.opencontainers.image.source=https://github.com/freckles4680/HyperInkling-Turing \
+      org.opencontainers.image.description="Inkling 2 Mini on one Turing GPU, 22 GB 2080 Ti (vLLM, sm75)" \
       org.opencontainers.image.licenses=Apache-2.0
 WORKDIR /app
 # bench/quality_battery.py and bench/extract_bench.py read parquet.

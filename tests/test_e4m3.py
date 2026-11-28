@@ -1,4 +1,4 @@
-"""Software E4M3 of `ops/e4m3.py` (the SM8x KV store and load) against PyTorch's
+"""Software E4M3 of `ops/e4m3.py` (the KV store and load on SM75 and SM8x, which have no FP8) against PyTorch's
 float8_e4m3fn conversion on the CPU, bit for bit.
 
     venv/bin/python -m pytest -q tests/test_e4m3.py

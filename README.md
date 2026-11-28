@@ -113,7 +113,7 @@ At 8k with a desktop running, a step takes ~28-31 ms here and, from upstream's f
 The checkpoint is the same as upstream's
 ([Pentium95/Inkling-2-Mini-W4A16-g128-gptq](https://huggingface.co/Pentium95/Inkling-2-Mini-W4A16-g128-gptq)).
 The INT8 parts are made from it when the server loads. The patch's commit message
-(`patches/vllm-hyperinkling-sm86.patch`) lists every change, NOTES.md has the reasons and the
+(`patches/vllm-hyperinkling-sm75.patch`) lists every change, NOTES.md has the reasons and the
 measurements, and FOLLOWUPS.md what comes next.
 
 ## Setup (native Linux)
@@ -168,22 +168,32 @@ Open the port in the firewall for the LAN (`sudo firewall-cmd --add-port=8080/tc
 && sudo firewall-cmd --reload` on Fedora). Point Open WebUI, Unsloth Studio or any OpenAI
 client at the base URL above.
 
-**Speed shown in the chat** (in review, PR #3). `serve.sh` also starts
+**Speed shown in the chat.** `serve.sh` also starts
 `scripts/speed_proxy.py` on port **8081**. It is the same API, with one line under each
 streamed answer giving the prefill and decode speed of that request. Point the front end at
 `:8081/v1` to see it, or at `:8080/v1` for the plain API, and open 8081 in the firewall too.
+
+**Several models on one address.** `scripts/serve-switch.sh` replaces `serve.sh` with the
+same ports. It loads whichever model a request names, one at a time, because only one fits
+on the card. Open WebUI keeps chatting with `inkling-2-mini`. Cloudflare's
+[Clef](https://huggingface.co/Cloudflare/clef), a decision model with no chat, answers
+`POST /v1/systemone` on the same address. The 27B takes 15.6 GiB plus 4.6 GiB at its 64k
+context, all on the GPU, and a fit check at boot confirms it; the 9B Clef-Flash is the
+smaller option. `docs/clef.md` covers
+the setup, the request format and the single log to send back.
 
 **Sampling:** temperature 1.0 is the model's default. Its card says it can get stuck in long
 reasoning loops, so cap `max_tokens` and the agent's turns.
 
 ### Docker
 
-The published image is built for sm86. On Turing, build an sm75 image once (about an hour):
+Build the image once (about an hour). It compiles vLLM for sm75, and compose runs it as
+`hyperinkling:sm75`. Upstream's published image is sm86 only and does not run on Turing.
 
 ```bash
 scripts/setup-vllm.sh
-ARCH=7.5 scripts/build-image.sh hyperinkling:sm75
-python3 scripts/wizard.py              # questions -> .env; on Turing it sets IMAGE=hyperinkling:sm75
+scripts/build-image.sh                 # hyperinkling:sm75 (ARCH=8.6 ... hyperinkling:sm86 for a 3090)
+python3 scripts/wizard.py              # questions -> .env, with the 2080 Ti's defaults
 docker compose up -d
 ```
 
@@ -205,7 +215,7 @@ python3 bench/sm75_compile.py                              # every Turing kernel
 
 To compare two builds, fix the verify length (`HYPERINKLING_SPEC_ADAPTIVE=`, so 4 drafts a
 step) and compare milliseconds a step. Tokens per second moves with acceptance from run to
-run. `bench/intelligence.sh` (in review, PR #4) adds IFEval, MMLU-Pro and a judged MT-Bench
+run. `bench/intelligence.sh` adds IFEval, MMLU-Pro and a judged MT-Bench
 in one report.
 
 ## Quality against the original checkpoint
@@ -237,6 +247,8 @@ checkpoint with Inkling 2 Mini's architecture. The steps are in
 | path | what |
 |---|---|
 | `scripts/serve.sh` | the 2080 Ti server on the LAN, every setting commented |
+| `scripts/serve-switch.sh`, `model_switch.py`, `models.toml` | one address, the model each request names (`docs/clef.md`) |
+| `scripts/clef.sh`, `clef_server.py`, `setup-clef.sh` | Cloudflare Clef (decision model) on Turing |
 | `start.sh` | the launcher; every knob is an env var |
 | `kernels/sm75/`, `scripts/build-sm75-kernels.sh` | the Turing tensor-core attention kernel |
 | `patches/` | the vLLM patch and its base commit (`BASE`) |

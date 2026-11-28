@@ -1,0 +1,124 @@
+#!/bin/bash
+# Once, before scripts/clef.sh: a venv of its own for Clef, the checkpoint, and an NF4
+# copy of it that loads without quantizing. Everything it prints also goes to
+# .local/setup-clef.log (send that file back if a step fails).
+#
+#   scripts/setup-clef.sh                       # Clef 27B: 55 GB download, 19 GB NF4 copy
+#   CLEF_MODEL=clef-flash scripts/setup-clef.sh # Clef-Flash 9B: ~19 GB download
+#   QUANTIZE=0 scripts/setup-clef.sh            # venv + download only
+#   DROP_ORIGINAL=1 scripts/setup-clef.sh       # delete the bf16 download after the NF4 copy
+#
+# Its own venv (.local/clef-venv) because the release needs transformers 5.10 and the
+# vLLM venv pins its own versions; the two never share a process.
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+mkdir -p .local models
+exec > >(tee .local/setup-clef.log) 2>&1
+
+CLEF_MODEL=${CLEF_MODEL:-clef}
+case "$CLEF_MODEL" in
+	clef) REPO_ID=Cloudflare/clef ;;
+	clef-flash) REPO_ID=Cloudflare/clef-flash ;;
+	*) echo "CLEF_MODEL must be clef or clef-flash" >&2; exit 1 ;;
+esac
+VENV=${VENV:-.local/clef-venv}
+PYTHON=${PYTHON:-python3}
+# PyTorch from PyPI: its CUDA wheels include Turing (sm_75; checked below). Another build:
+# TORCH_INDEX=https://download.pytorch.org/whl/cu126
+TORCH_INDEX=${TORCH_INDEX:-}
+QUANTIZE=${QUANTIZE:-1}
+DROP_ORIGINAL=${DROP_ORIGINAL:-0}
+
+echo "== setup-clef $(date -Is): $CLEF_MODEL ($REPO_ID)"
+nvidia-smi --query-gpu=name,compute_cap,memory.total,memory.used,driver_version --format=csv || true
+df -h models | tail -1
+
+# Will it fit? Served sizes from bench/clef_memory.py: 27B 15.6 GiB before any input,
+# +0.8 GiB at 4k tokens, +1 GiB kept free; 9B 6.7 GiB. Checked before the download.
+case "$CLEF_MODEL" in
+	clef) need_mib=17800 ;;
+	clef-flash) need_mib=8700 ;;
+esac
+total_mib=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2> /dev/null \
+	| head -1 | tr -d ' ' || true)
+if [ -n "$total_mib" ] && [ "$total_mib" -lt "$need_mib" ]; then
+	echo "DOES NOT FIT: $CLEF_MODEL needs about $need_mib MiB on the GPU and this card has" \
+		"$total_mib MiB. CLEF_MODEL=clef-flash scripts/setup-clef.sh sets up the 9B." >&2
+	exit 1
+fi
+echo "fits: $CLEF_MODEL needs about $need_mib MiB of the card's ${total_mib:-?} MiB" \
+	"(the server's boot fit check measures it)"
+
+if [ ! -x "$VENV/bin/python" ]; then
+	echo "== venv $VENV"
+	"$PYTHON" -m venv "$VENV"
+fi
+"$VENV/bin/pip" install -q --upgrade pip
+echo "== torch + torchvision from ${TORCH_INDEX:-PyPI}"
+# torchvision in the same install, so pip picks the build that matches torch (the
+# Qwen3-VL image and video processors need it).
+"$VENV/bin/pip" install -q torch torchvision ${TORCH_INDEX:+--index-url "$TORCH_INDEX"}
+echo "== transformers and the rest (the release was tested with transformers 5.10.2)"
+"$VENV/bin/pip" install -q "transformers==5.10.2" accelerate bitsandbytes safetensors \
+	pillow "huggingface_hub>=0.34"
+
+echo "== checks"
+"$VENV/bin/python" - << 'EOF'
+import torch, torchvision, transformers, bitsandbytes as bnb
+print("torch", torch.__version__, "torchvision", torchvision.__version__, "cuda",
+      torch.version.cuda, "transformers", transformers.__version__, "bitsandbytes",
+      bnb.__version__)
+# What AutoProcessor builds for Clef (after the 55 GB download, it failed there once).
+from transformers import Qwen2VLImageProcessor, Qwen3VLVideoProcessor
+Qwen2VLImageProcessor(), Qwen3VLVideoProcessor()
+print("image and video processors: ok")
+assert torch.cuda.is_available(), "torch sees no GPU"
+cap = torch.cuda.get_device_capability()
+arch = f"sm_{cap[0]}{cap[1]}"
+print("GPU", torch.cuda.get_device_name(), arch, "wheel archs", torch.cuda.get_arch_list())
+assert arch in torch.cuda.get_arch_list(), (
+    f"this torch wheel has no {arch} kernels: rerun with "
+    "TORCH_INDEX=https://download.pytorch.org/whl/cu126")
+assert torch.cuda.get_device_properties(0).total_memory > 0
+from transformers import Qwen3_5ForConditionalGeneration  # noqa: F401 (the release's class)
+layer = bnb.nn.Linear4bit(5120, 5120, compute_dtype=torch.float16, quant_type="nf4").cuda()
+x = torch.randn(8, 5120, device="cuda", dtype=torch.float16)
+y = layer(x)
+w = bnb.functional.dequantize_4bit(layer.weight.data, layer.weight.quant_state)
+ref = x.float() @ w.float().t()
+print("bitsandbytes NF4 on the GPU: ok, relative error",
+      float((y.float() - ref).norm() / ref.norm()))
+# Clef's full attention as clef_server.py runs it: K/V repeated to 24 heads, head 256, on
+# the memory-efficient kernel only (the math fallback would build a 13 GB matrix at 16k).
+from torch.nn.attention import SDPBackend, sdpa_kernel
+q = torch.randn(1, 24, 4096, 256, device="cuda", dtype=torch.float16)
+with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION]):
+    out = torch.nn.functional.scaled_dot_product_attention(q, q, q, is_causal=True)
+print("fp16 memory-efficient SDPA (24 heads, head 256, 4k tokens): ok", tuple(out.shape))
+EOF
+
+# A rerun fetches nothing already complete (hf download checks each file), so an
+# interrupted download resumes and a finished one costs a few seconds. Skipped when the
+# bf16 copy was dropped after its NF4 copy.
+if [ -f "models/$CLEF_MODEL-nf4/joint_schema_model.py" ] && [ ! -d "models/$CLEF_MODEL" ]; then
+	echo "== models/$CLEF_MODEL-nf4 is there (the bf16 download was dropped): no download"
+else
+	echo "== download $REPO_ID -> models/$CLEF_MODEL (only what is missing)"
+	"$VENV/bin/hf" download "$REPO_ID" --local-dir "models/$CLEF_MODEL"
+fi
+
+if [ "$QUANTIZE" = 1 ] && [ ! -f "models/$CLEF_MODEL-nf4/joint_schema_model.py" ]; then
+	echo "== NF4 copy -> models/$CLEF_MODEL-nf4 (quantizes on the GPU, a few minutes)"
+	if nvidia-smi --query-compute-apps=pid --format=csv,noheader 2> /dev/null | grep -q .; then
+		echo "the GPU is in use (an Inkling server?): stop it first, then rerun" >&2
+		exit 1
+	fi
+	CLEF_PATH=models/$CLEF_MODEL CLEF_QUANT=nf4 HF_HUB_OFFLINE=1 \
+		"$VENV/bin/python" scripts/clef_server.py --save-quantized "models/$CLEF_MODEL-nf4"
+	if [ "$DROP_ORIGINAL" = 1 ]; then
+		echo "== removing the bf16 download models/$CLEF_MODEL"
+		rm -rf "models/$CLEF_MODEL"
+	fi
+fi
+du -sh models/"$CLEF_MODEL"* 2> /dev/null || true
+echo "== done: CLEF_MODEL=$CLEF_MODEL scripts/clef.sh  (or scripts/serve-switch.sh)"

@@ -1,0 +1,75 @@
+# Claude Code sandbox with the GPU. sandbox/setup.sh writes sandbox/.env (the paths below)
+# and builds the image; docs/claude-sandbox.md has the steps.
+#
+#   docker compose -f sandbox/compose.yml up -d     # or: sandbox/agent.sh up
+#   sandbox/agent.sh                                # a shell in it, as the agent user
+#
+# What the container can reach:
+#   files    the project (read-write) at its host path, models/ and hf-cache/ read-only, uv's
+#            Python and the CUDA toolkit read-only. Nothing else of the host: no home, no
+#            ~/.ssh, no git credentials, no Docker socket.
+#   network  loopback, DNS, HTTPS to Anthropic (init-firewall.sh). No port is published, so
+#            the test servers it starts are reachable from inside only, and do not clash
+#            with a server on the host's 8080.
+#   GPU      the one card, through the NVIDIA container toolkit.
+name: hyperinkling-sandbox
+
+services:
+  claude:
+    build:
+      context: .
+      args:
+        BASE: ${BASE:-ubuntu:24.04}
+        UID: ${UID:-1000}
+        GID: ${GID:-1000}
+        EXTRA_PACKAGES: ${EXTRA_PACKAGES:-}
+    image: hyperinkling-sandbox:latest
+    hostname: sandbox
+    init: true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    # Root in here gets only what the firewall needs (and what dropping to the agent user
+    # needs); the entrypoint then drops all of it.
+    cap_drop: [ALL]
+    cap_add: [NET_ADMIN, NET_RAW, SETUID, SETGID, SETPCAP]
+    security_opt:
+      - no-new-privileges:true
+    # 32 GB machine: leave the host some room. The checkpoint loads through the page cache,
+    # which counts here; lower MEM_LIMIT if the desktop gets tight, raise it if a boot is
+    # killed (dmesg says oom-kill).
+    mem_limit: ${MEM_LIMIT:-26g}
+    pids_limit: 4096
+    shm_size: ${SHM_SIZE:-8g}
+    ipc: private
+    env_file:
+      - path: ${SECRETS_FILE:-/dev/null}
+        required: false
+    environment:
+      ALLOW_DOMAINS: ${ALLOW_DOMAINS:-}
+      PATH: ${NSYS_BIN:-/usr/local/bin}:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
+      GIT_AUTHOR_NAME: Claude (sandbox)
+      GIT_AUTHOR_EMAIL: claude-sandbox@localhost
+      GIT_COMMITTER_NAME: Claude (sandbox)
+      GIT_COMMITTER_EMAIL: claude-sandbox@localhost
+      # git refuses a repository owned by another uid; the agent has yours, this is in case.
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: safe.directory
+      GIT_CONFIG_VALUE_0: "*"
+    working_dir: ${PROJECT:?run sandbox/setup.sh first}
+    volumes:
+      - ${PROJECT}:${PROJECT}
+      - ${PROJECT}/models:${PROJECT}/models:ro
+      - ${HF_CACHE:-${PROJECT}/hf-cache}:${HF_CACHE:-${PROJECT}/hf-cache}:ro
+      - ${UV_PYTHON}:${UV_PYTHON}:ro
+      - ${CUDA_SRC}:${CUDA_DIR}:ro
+      - ${NSYS_SRC:-./.empty}:${NSYS_DST:-/opt/no-nsys}:ro
+      # Claude's login and session history, Triton/FlashInfer/vLLM compile caches.
+      - claude-home:/home/agent
+
+volumes:
+  claude-home:

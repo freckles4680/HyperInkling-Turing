@@ -1,6 +1,7 @@
 # HyperInkling with Docker Compose. Settings go in .env (scripts/wizard.py writes it; every
 # variable of start.sh works there). One GPU serves one engine at a time.
 #
+#   scripts/setup-vllm.sh && scripts/build-image.sh   # once, ~1 hour: builds hyperinkling:sm75
 #   python3 scripts/wizard.py      # or write .env by hand
 #   docker compose up -d           # the first start downloads the checkpoint (~16 GB)
 #   docker compose logs -f hyperinkling
@@ -20,7 +21,7 @@ x-gpu: &gpu
 
 services:
   prepare:
-    image: ${IMAGE:-ghcr.io/pento95/hyperinkling:0.1.4}
+    image: ${IMAGE:-hyperinkling:sm75}
     # The checkpoint in ./models belongs to the host user (the wizard writes UID/GID).
     user: "${UID:-1000}:${GID:-1000}"
     environment:
@@ -35,7 +36,7 @@ services:
       - ./models:/app/models
 
   hyperinkling:
-    image: ${IMAGE:-ghcr.io/pento95/hyperinkling:0.1.4}
+    image: ${IMAGE:-hyperinkling:sm75}
     <<: *gpu
     depends_on:
       prepare:
