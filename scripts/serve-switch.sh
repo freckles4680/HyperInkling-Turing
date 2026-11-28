@@ -5,7 +5,8 @@
 # Clef about as long to load (docs/clef.md).
 #
 #   scripts/serve-switch.sh                       # foreground; run it inside tmux
-#   PRELOAD=inkling-2-mini scripts/serve-switch.sh   # boot Inkling now, not on the first request
+#   PRELOAD=none scripts/serve-switch.sh          # boot nothing until a request names a model
+#                                                 # (default: models.toml's home, Inkling)
 #   API_KEY=secret BIND=127.0.0.1 scripts/serve-switch.sh
 #
 # Point Open WebUI at  http://<this machine>:8081/v1  (with the speed line) or :8080/v1,
@@ -27,7 +28,7 @@ export PORT=${PORT:-8080}
 export API_KEY=${API_KEY:-}
 # Which models and how to start them.
 CONFIG=${CONFIG:-scripts/models.toml}
-# A model to start at once (empty = on the first request that names one).
+# A model to start at once (empty = models.toml's [switch] home; none = wait for a request).
 export PRELOAD=${PRELOAD:-}
 # The speed line under each chat answer (scripts/speed_proxy.py); empty = off.
 SPEED_PORT=${SPEED_PORT-8081}

@@ -18,6 +18,12 @@
 # Stop the running model after this many idle seconds, to free the GPU for something
 # else. 0 = keep it loaded until another model is asked for.
 idle_unload = 0
+# The model to keep warm: started with the switcher (PRELOAD=none = wait for a request),
+# and started again once another model (Clef) has been idle home_after seconds, so that
+# the next chat does not wait for Inkling's boot and warm-up. "" = off. Ignored while
+# idle_unload is on.
+home = "inkling-2-mini"
+home_after = 120
 # Seconds a server gets to exit on SIGTERM before SIGKILL.
 stop_timeout = 60
 start_timeout = 900

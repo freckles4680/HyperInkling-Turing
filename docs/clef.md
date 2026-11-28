@@ -131,6 +131,9 @@ with it and runs at about half speed.
 
 - A switch costs one boot: Inkling's boot plus its warm-up (about 3.5 min on the card),
   or Clef's load (65 s measured, with a cached fit check less).
+- Inkling is the home model (`[switch] home` in models.toml): it boots with the switcher,
+  and the switcher goes back to it once Clef has been idle `home_after` seconds (120), so
+  a chat after a Clef call finds it booted and warm. `PRELOAD=none` starts nothing.
 - Both models run on 127.0.0.1 without a key. `API_KEY` is checked at the switcher.
 - `scripts/models.toml` lists the models and how to start them. Each model's settings stay
   in its own script (`serve.sh`, `clef.sh`). `[switch] idle_unload` frees the GPU after some
