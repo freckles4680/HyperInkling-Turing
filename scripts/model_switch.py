@@ -91,10 +91,15 @@ class Model:
 
 class Switcher:
     def __init__(self, config, log):
-        defaults = {"start_timeout": 900, "stop_timeout": 60, "idle_unload": 0}
+        defaults = {"start_timeout": 900, "stop_timeout": 60, "idle_unload": 0,
+                    "home": "", "home_after": 120}
         defaults.update(config.get("switch", {}))
         self.stop_timeout = float(defaults["stop_timeout"])
         self.idle_unload = float(defaults["idle_unload"])
+        # The model to go back to once another one has been idle home_after seconds (and
+        # to start with), so that it is booted and warm when the next chat comes.
+        self.home_name = str(defaults["home"])
+        self.home_after = float(defaults["home_after"])
         self.models = {}
         self.names = {}
         for name, spec in config.get("models", {}).items():
@@ -106,6 +111,9 @@ class Switcher:
                 self.names[key] = model
         if not self.models:
             raise SystemExit("the config has no [models.<name>] entry")
+        self.home = self.names.get(self.home_name) if self.home_name else None
+        if self.home_name and self.home is None:
+            raise SystemExit(f"[switch] home = {self.home_name!r}: no such model")
         self.log = log
         self.cond = threading.Condition()
         self.active = None       # Model whose server is up
@@ -272,6 +280,19 @@ class Switcher:
                         and time.monotonic() - self.last_used > self.idle_unload)
             if idle:
                 self.unload(f"idle for {self.idle_unload:.0f} s")
+
+    def home_loop(self):
+        """Back to the home model once another one has been idle home_after seconds."""
+        while self.home is not None:
+            time.sleep(min(10, max(self.home_after, 1)))
+            with self.cond:
+                away = (self.active is not None and self.active is not self.home
+                        and self.target is None and not self.inflight
+                        and time.monotonic() - self.last_used > self.home_after)
+            if away:
+                self.log("switch", f"{self.active.name} idle for {self.home_after:.0f} s: "
+                                   f"back to {self.home.name}")
+                _preload(self, self.home)
 
     def shutdown(self):
         if self.active is not None or self.process is not None:
@@ -484,10 +505,15 @@ def main():
                   f"log {args.log}" + (" (API key required)" if Handler.api_key else ""))
     if switcher.idle_unload > 0:
         threading.Thread(target=switcher.idle_loop, daemon=True).start()
-    if args.preload:
-        model = switcher.resolve(args.preload)
+    if switcher.home is not None:
+        threading.Thread(target=switcher.home_loop, daemon=True).start()
+    preload = args.preload or (switcher.home.name if switcher.home else "")
+    if preload == "none":
+        preload = ""
+    if preload:
+        model = switcher.resolve(preload)
         if model is None:
-            raise SystemExit(f"PRELOAD={args.preload}: no such model in the config")
+            raise SystemExit(f"PRELOAD={preload}: no such model in the config")
         threading.Thread(target=lambda: _preload(switcher, model), daemon=True).start()
     try:
         server.serve_forever()

@@ -92,7 +92,7 @@ SM75_LIB=${HYPERINKLING_SM75_LIB-venv/hyperinkling_sm75.so}
 
 # --- speed shown in the front end ------------------------------------------------------
 # scripts/speed_proxy.py adds a line under every streamed chat answer:
-#   prefill 8,185 tok in 3.4 s (2,407 tok/s) · decode 512 tok at 84.1 tok/s
+#   TTFT 3.4 s · prefill 8,185 tok (2,407 tok/s) · decode 512 tok at 84.1 tok/s
 # Point the front end at this port instead of PORT to see it (the plain API stays on
 # PORT). Empty = do not start it.
 SPEED_PORT=${SPEED_PORT-8081}

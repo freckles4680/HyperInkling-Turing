@@ -161,3 +161,15 @@ def test_waits_for_ready_line_after_health(switch, tmp_path):
     texts = [t for _, t in lines]
     assert texts.index("warm-up done in 1.5 s") < next(
         i for i, t in enumerate(texts) if t.startswith("a ready in"))
+
+
+def test_goes_back_home_after_idle(switch):
+    port, switcher, _, lines = switch
+    switcher.home, switcher.home_after = switcher.models["a"], 1
+    threading.Thread(target=switcher.home_loop, daemon=True).start()
+    assert call(port, "POST", "/v1/systemone", {"model": "b"})[0] == 200
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline and switcher.status()["active"] != "a":
+        time.sleep(0.2)
+    assert switcher.status()["active"] == "a"
+    assert any("back to a" in t for _, t in lines)
