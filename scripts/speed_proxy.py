@@ -5,7 +5,7 @@ A small pass-through in front of the server: the front end (Open WebUI, Unsloth,
 OpenAI client) talks to this port instead of the server's, and each streamed chat
 answer ends with one line such as
 
-    ⚡ prefill 8,185 tok in 3.4 s (2,407 tok/s) · decode 512 tok at 84.1 tok/s
+    ⚡ TTFT 3.4 s · prefill 8,185 tok (2,407 tok/s) · decode 512 tok at 84.1 tok/s
 
     scripts/speed_proxy.py                       # listens on 0.0.0.0:8081, server on :8080
     scripts/speed_proxy.py --port 9001 --upstream http://127.0.0.1:8080 --bind 127.0.0.1
@@ -15,6 +15,8 @@ any: headers pass through). Everything else (/v1/models, /health, /metrics) is f
 unchanged, so nothing else needs to know about it.
 
 What the numbers are:
+  TTFT     time to first token: from the request reaching this proxy to the first token
+           of the answer (reasoning included), queue time and prefill together.
   prefill  the prompt tokens the server had to compute (prompt minus the ones its prefix
            cache already held, shown as "cached"), over the time to the first token. A
            follow-up turn of a chat is mostly cached, so its rate says little: judge
@@ -56,18 +58,19 @@ def stats_line(usage, started, first, now):
     done = usage.get("completion_tokens") or 0
     cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
     wait = max(first - started, 1e-6)
+    ttft = f"TTFT {wait:.1f} s"
     if cached is None:  # the server does not report its prefix-cache hits
-        prefill = f"prompt {prompt:,} tok, first token after {wait:.1f} s"
+        prefill = f"prompt {prompt:,} tok"
     else:
         fresh = max(prompt - cached, 0)
-        prefill = f"prefill {fresh:,} tok in {wait:.1f} s ({fresh / wait:,.0f} tok/s)"
+        prefill = f"prefill {fresh:,} tok ({fresh / wait:,.0f} tok/s)"
         if cached:
             prefill += f", {cached:,} cached"
     span = now - first
     decode = f"decode {done:,} tok"
     if done > 1 and span > 0:
         decode += f" at {done / span:.1f} tok/s"
-    return f"{prefill} · {decode}"
+    return f"{ttft} · {prefill} · {decode}"
 
 
 class Proxy(BaseHTTPRequestHandler):
