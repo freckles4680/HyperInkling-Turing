@@ -27,10 +27,33 @@ nvidia-smi > /dev/null 2>&1 || die "nvidia-smi fails on the host"
 # --- the paths the venv needs at the same place ------------------------------------------
 [ -x "$project/venv/bin/python" ] || die "no $project/venv: build it on the host first (scripts/build-vllm.sh)"
 py=$(readlink -f "$project/venv/bin/python")
-uv_python=$(dirname "$(dirname "$py")")   # .../cpython-3.14.x-linux-x86_64-gnu
+# Every hop of venv/bin/python's symlink chain (and pyvenv.cfg's home) must exist in the
+# container. uv links through a minor-version directory (cpython-3.14-...) to the real
+# one (cpython-3.14.x-...), so mount the directory that holds all of them.
+uv_python=$(python3 - "$project" <<-'PY'
+	import os, sys
+	project = os.path.realpath(sys.argv[1])
+	path, hops = os.path.join(project, "venv", "bin", "python"), []
+	for _ in range(40):
+	    hops.append(path)
+	    if not os.path.islink(path):
+	        break
+	    path = os.path.join(os.path.dirname(path), os.readlink(path))
+	hops.append(os.path.realpath(path))
+	cfg = os.path.join(project, "venv", "pyvenv.cfg")
+	for line in open(cfg) if os.path.exists(cfg) else ():
+	    key, _, value = line.partition("=")
+	    if key.strip() == "home":
+	        hops.append(os.path.join(value.strip(), "python"))
+	outside = [os.path.dirname(os.path.dirname(os.path.abspath(h))) for h in hops
+	           if not os.path.abspath(h).startswith(project + os.sep)]
+	print(os.path.commonpath(outside) if outside else "")
+	PY
+)
+[ -n "$uv_python" ] || die "venv/bin/python does not lead outside the project ($py): not a uv venv?"
 case "$uv_python" in
-	"$project"/*) die "venv/bin/python resolves inside the project ($py): not a uv venv?" ;;
-	/usr | /usr/local) die "venv/ uses the system Python ($py); the sandbox expects uv's (scripts/build-vllm.sh)" ;;
+	/usr | /usr/local | /usr/*) die "venv/ uses the system Python ($py); the sandbox expects uv's (scripts/build-vllm.sh)" ;;
+	/ | /home | "$HOME") die "venv/bin/python's links spread over $uv_python, too much to mount: send the output of 'namei -l venv/bin/python'" ;;
 esac
 cuda_dir=$(cat "$project/venv/cuda_home" 2> /dev/null || echo /usr/local/cuda)
 cuda_src=$(readlink -f "$cuda_dir")

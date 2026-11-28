@@ -51,7 +51,10 @@ RUN set -eux; \
     claude --version
 
 # Rules the agent cannot override (managed settings rank above every other settings file).
+# Modes set after the copy: COPY --chmod also applies to the directory, and a directory
+# without x cannot be entered (Claude Code then silently runs without these rules).
 COPY managed-settings.json /etc/claude-code/managed-settings.json
+RUN chmod 0755 /etc/claude-code && chmod 0644 /etc/claude-code/managed-settings.json
 COPY init-firewall.sh entrypoint.sh /usr/local/sbin/
 RUN chmod 0755 /usr/local/sbin/init-firewall.sh /usr/local/sbin/entrypoint.sh
 
@@ -60,7 +63,7 @@ ENV HOME=/home/agent \
     NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility \
     DISABLE_AUTOUPDATER=1 \
-    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+    DISABLE_TELEMETRY=1 DISABLE_ERROR_REPORTING=1 \
     VLLM_NO_USAGE_STATS=1 DO_NOT_TRACK=1 \
     HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 

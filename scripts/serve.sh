@@ -44,18 +44,20 @@ export SERVED_NAME=${SERVED_NAME:-inkling-2-mini}
 # more context. 2 = one chat plus the side request front ends send (titles, tags). Raise it
 # for several users; one request alone is fastest per user.
 export MAX_SEQS=${MAX_SEQS:-2}
-# Longest request in tokens (prompt + answer). auto = everything the card holds after
-# warmup, so there is nothing to raise: measured at one slot, 145k tokens headless and 120k
-# with a desktop on the card. What the running server took:
+# Longest request in tokens (prompt + answer): 128k (131072). The boot fails at once if it
+# does not fit, rather than serving less. Measured with auto (everything the card holds
+# after warmup) at one slot: 145k tokens headless, 120k with a desktop on the card, so with
+# a desktop add NBT=1024 below (about 20k more). MAX_LEN=auto takes whatever fits.
+# What the running server took:
 #   curl -s http://127.0.0.1:8080/v1/models | grep -o '"max_model_len":[0-9]*'
 # For 128k with a desktop running (or with more slots), in order of what they cost:
 #   MAX_SEQS=1   one request at a time (not measured how much a second slot takes)
 #   NBT=1024     about 20k tokens more, prefill about 8% slower
 #   ASYNC=0      about 12k tokens more, decode 3-4% slower
 # (the last two were measured on a 3090 Ti, not on this card). A number here instead of
-# auto caps the length, and the boot fails if it does not fit: MAX_LEN=128000 is a way to
-# be told at once when a setting stopped it fitting.
-export MAX_LEN=${MAX_LEN:-auto}
+# auto caps the length, and the boot fails if it does not fit: the way to be told at once
+# when a setting stopped it fitting.
+export MAX_LEN=${MAX_LEN:-131072}
 # Share of the GPU's memory vLLM may use. 0.95 leaves room for a desktop; headless, 0.97
 # gives a little more context (not measured on this card: lower it again if the boot runs
 # out of memory).

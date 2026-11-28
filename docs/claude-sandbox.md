@@ -213,6 +213,25 @@ measurement works too, as any command plus a regex with one group:
   Triton/FlashInfer caches) is kept. `docker volume rm hyperinkling-sandbox_claude-home`
   removes it.
 
+### Link it to the Claude app (Remote Control)
+
+`claude remote-control` in the sandbox makes the session show up in the Claude app, where a
+project can hand it work. It needs a full `/login`: the `claude setup-token` token does not
+do Remote Control, and takes precedence over `/login`, so remove `CLAUDE_CODE_OAUTH_TOKEN`
+from the secrets file first.
+
+```bash
+sandbox/agent.sh down && sandbox/agent.sh up     # after editing the secrets file
+sandbox/agent.sh claude                          # /login, paste the code, /exit
+tmux new -s rc
+sandbox/agent.sh claude remote-control
+```
+
+The sandbox leaves `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` unset for this, because
+Remote Control refuses to run with it. It sets `DISABLE_TELEMETRY` and
+`DISABLE_ERROR_REPORTING` instead. If it cannot connect, the firewall is missing a host:
+add it with `ALLOW_DOMAINS` and run `sandbox/setup.sh` again.
+
 ## Costs and limits
 
 An unattended loop spends tokens without you watching. Each iteration is a fresh
