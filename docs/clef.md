@@ -134,10 +134,11 @@ with it and runs at about half speed.
 - Inkling is the home model (`[switch] home` in models.toml): it boots with the switcher,
   and the switcher goes back to it once Clef has been idle `home_after` seconds (120), so
   a chat after a Clef call finds it booted and warm. `PRELOAD=none` starts nothing.
+  `idle_unload` (14400 s, 4 hours) frees the GPU after that long without a request.
 - Both models run on 127.0.0.1 without a key. `API_KEY` is checked at the switcher.
 - `scripts/models.toml` lists the models and how to start them. Each model's settings stay
   in its own script (`serve.sh`, `clef.sh`). `[switch] idle_unload` frees the GPU after some
-  idle time (off by default).
+  idle time (4 hours here).
 
 ```bash
 curl -s http://127.0.0.1:8080/switch/status                 # what runs, what is starting

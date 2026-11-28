@@ -505,7 +505,7 @@ def main():
                   f"log {args.log}" + (" (API key required)" if Handler.api_key else ""))
     if switcher.idle_unload > 0:
         threading.Thread(target=switcher.idle_loop, daemon=True).start()
-    if switcher.home is not None and switcher.idle_unload <= 0:
+    if switcher.home is not None:
         threading.Thread(target=switcher.home_loop, daemon=True).start()
     preload = args.preload or (switcher.home.name if switcher.home else "")
     if preload == "none":
